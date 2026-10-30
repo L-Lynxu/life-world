@@ -1,0 +1,11 @@
+.DS_Store
+node_modules/
+*.log
+index.ts.bak-*
+start-tui.sh.bak-*
+worlds/
+.timer.lock
+qq-bridge.json
+qq-bridge-state.json
+qq-bridge.log
+*.zip

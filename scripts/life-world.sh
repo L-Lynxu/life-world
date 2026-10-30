@@ -1,0 +1,124 @@
+#!/bin/bash
+# life-world 总开关
+#
+#   life-world.sh status   看当前状态
+#   life-world.sh on       打开：注入、工具、定时器全恢复
+#   life-world.sh off      关闭：完全退回原生 opencode（世界数据原地不动）
+#
+# 开关记在 world.json 的 enabled 字段；没有这个字段=开启（老世界文件照常工作）。
+# 两种切换都会重启共享服务与常驻 TUI —— 工具列表和定时器是进程启动时建的，
+# 不重启的话看上去「改了但没生效」。
+
+set -uo pipefail
+export PATH="$HOME/.opencode/bin:$PATH"
+
+WORLD="$HOME/.local/share/life-world/worlds/default/world.json"
+START_TUI="$HOME/.local/share/life-world/bin/start-tui.sh"
+BRIDGE_STATE="$HOME/.local/share/life-world/qq-bridge-state.json"
+
+read_state() {
+  node -e '
+    const fs = require("fs")
+    const p = process.argv[1]
+    let s = {}
+    try { s = JSON.parse(fs.readFileSync(p, "utf8")) } catch {}
+    process.stdout.write(JSON.stringify({
+      enabled: s.enabled !== false,
+      explicit: typeof s.enabled === "boolean",
+      running: s.running !== false,
+      home: s.homeSessionId ?? null,
+      alarms: Array.isArray(s.alarms) ? s.alarms.length : 0,
+      lastReview: s.lastReview ?? null,
+      lastWake: s.lastWake ?? null,
+    }))
+  ' "$WORLD"
+}
+
+write_enabled() { # $1 = true | false
+  node -e '
+    const fs = require("fs"), path = require("path")
+    const p = process.argv[1], on = process.argv[2] === "true"
+    let s = {}
+    try { s = JSON.parse(fs.readFileSync(p, "utf8")) } catch {}
+    s.enabled = on
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    const tmp = p + ".tmp"
+    fs.writeFileSync(tmp, JSON.stringify(s, null, 2))
+    fs.renameSync(tmp, p)
+  ' "$WORLD" "$1"
+}
+
+restart_service() {
+  if command -v opencode >/dev/null 2>&1; then
+    if opencode service restart >/dev/null 2>&1; then
+      echo "  服务已重启"
+    else
+      echo "  ⚠ 服务重启失败：opencode service status 看一眼"
+    fi
+  else
+    echo "  ⚠ PATH 里没有 opencode"
+  fi
+  sleep 2
+}
+
+tui_quiet() { # 不自报家门：插件不加载，就是原生 opencode
+  tmux kill-session -t home 2>/dev/null
+  pkill -f "^opencode$" 2>/dev/null
+  sleep 1
+  tmux new-session -d -s home "export PATH=\$HOME/.opencode/bin:\$PATH; cd \$HOME; opencode"
+  echo "  TUI 已重启（安静模式：不发开场消息）"
+}
+
+tui_active() {
+  if [ -x "$START_TUI" ]; then
+    "$START_TUI"
+  else
+    tui_quiet
+  fi
+}
+
+status() {
+  local s
+  s="$(read_state)"
+  node -e '
+    const fs = require("fs")
+    const s = JSON.parse(process.argv[1])
+    const bridgeFile = process.argv[2]
+    let bridge = "未运行"
+    try {
+      const b = JSON.parse(fs.readFileSync(bridgeFile, "utf8"))
+      const seen = b.lastSeen ? Date.parse(b.lastSeen) : 0
+      bridge = (Number.isFinite(seen) && Date.now() - seen < 90000) ? "在线" : "未运行"
+    } catch {}
+    console.log(`总开关：${s.enabled ? "开启" : "关闭"}${s.explicit ? "" : "（未显式设置，默认开启）"}`)
+    console.log(`回顾/闹钟(running)：${s.running ? "开" : "关"}`)
+    console.log(`家会话：${s.home ?? "（无）"}`)
+    console.log(`排着的闹钟：${s.alarms} 个`)
+    console.log(`最近回顾：${s.lastReview ?? "—"}   最近叫醒：${s.lastWake ?? "—"}`)
+    console.log(`QQ 桥接：${bridge}（独立进程，不跟着开关走）`)
+  ' "$s" "$BRIDGE_STATE"
+}
+
+case "${1:-status}" in
+  on)
+    write_enabled true
+    echo "life-world：打开"
+    restart_service
+    tui_active
+    echo "  插件会在 TUI 发出第一句话后加载（注入、6 个工具、定时器）"
+    ;;
+  off)
+    write_enabled false
+    echo "life-world：关闭 —— 回到原生 opencode"
+    echo "  世界数据（日记/计划/记忆/心情/闹钟）原地保留，开回来直接接上"
+    restart_service
+    tui_quiet
+    ;;
+  status)
+    status
+    ;;
+  *)
+    echo "用法：life-world.sh status | on | off"
+    exit 1
+    ;;
+esac
