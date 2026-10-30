@@ -1,0 +1,10 @@
+{
+  "package": "kaomoji-collection",
+  "version": "1.0.0",
+  "source": "https://registry.npmjs.org/kaomoji-collection/-/kaomoji-collection-1.0.0.tgz",
+  "license": "MIT (kaomojiya.org)",
+  "updated": "2026-10-29T14:59:00.000Z",
+  "categories": 496,
+  "entries": 18753,
+  "filter": "去假名 / 解码 HTML 实体 / 长度≤40 / 分类内去重"
+}
