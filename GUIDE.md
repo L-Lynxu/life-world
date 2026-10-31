@@ -205,6 +205,7 @@ sent private 1/1 ...
 | 装了插件但工具一个都没有 | 装完必须 `opencode service restart` + 重启 TUI——钩子会被热加载，**工具注册表不会**，这就是「注入有、工具没有」 |
 | 改了插件不生效 | 同上：`opencode service restart` + 重启 TUI |
 | 想彻底关掉 | `life-world.sh off` |
+| 升级后提示词还是旧的 | `world-prompt.md` 每个世界一份，插件不覆盖；备份后删掉它，下一轮用新默认重建（自定义内容先手动合并） |
 
 ---
 
