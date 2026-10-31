@@ -1,8 +1,8 @@
 # life-world 使用指引
 
-> 这份文件是给**你（AI）**读的：装好之后，用它向用户介绍这个插件能做什么、怎么用，以及帮他完成初次配置。
+> 这份文件是**给人看的操作手册**：安装、QQ 配置、排查。插件不会自动把它读进上下文。
 > 路径：`~/.config/opencode/plugins/life-world/GUIDE.md`
-> 世界提示词现在只是一份目录；具体行为规则按主题在插件目录的 `modules/`。本 GUIDE 负责安装、配置、排查。
+> 世界提示词只是一份目录；角色实际读的行为规则在插件目录的 `modules/`（初次引导走 `modules/first-meeting.md`）。
 
 ---
 
@@ -43,10 +43,10 @@
 ~/.local/share/life-world/bin/life-world.sh off      # 关掉
 ```
 
-- **关掉 = 完全退回原生 opencode**：不注入时间/记忆/心情、不挂 6 个工具、定时器不动。
+- **关掉 = 上下文完全退回原生 opencode**：不注入时间/记忆/心情、不挂 6 个工具、定时器不动、压缩也交回宿主；后台归档仍继续（只写文件，不进上下文），历史不断。
 - **数据原地保留**：日记、计划、记忆、心情、闹钟都还在，`on` 回来无缝接上。
 - **开关只认人手**：你没有开/关它的工具，也别自己改配置；开关在 `~/.local/share/life-world/life-world.json` 的 `world.enabled`。
-- **QQ 桥接是独立进程**，不跟开关走；要一起停得单独停桥接（见 §5.5）。
+- **QQ 桥接是独立进程**，不跟开关走；要一起停得单独停桥接（见 §4）。
 
 ---
 
@@ -148,12 +148,15 @@ return await tools.kaomoji({ scene: "害羞", count: 3 })
 ### 4.3 写配置
 
 ```bash
-cp ~/.config/opencode/plugins/life-world/life-world.example.json ~/.local/share/life-world/life-world.json
-chmod 600 ~/.local/share/life-world/life-world.json
+# life-world.json 由插件首次启动时自动生成（并从旧 world.json / qq-bridge.json 迁移）。
+# 不要用示例去覆盖它：老部署覆盖会截断迁移，enabled / localModel / QQ 凭据会丢。
+# 只有全新安装、文件确实不存在时，才手动 cp 示例过去。
+chmod 600 ~/.local/share/life-world/life-world.json 2>/dev/null || true
 ```
 
-然后把 `enabled` 改成 `true`、`ownerQQ` 填他的号、`napcat.wsUrl` / `napcat.token` 按实际填、`location` 填他常用的工作目录。
-**不要动 `group.bannedWords` 之外的东西**，也不要把真实 token 写进任何文档或仓库。
+然后改 `bridge` 段：`bridge.enabled` 改成 `true`、`bridge.ownerQQ` 填他的号、`bridge.wsUrl` / `bridge.token` 按实际填、`bridge.location` 填他常用的工作目录。
+**不要改别的东西**，也不要把真实 token 写进任何文档或仓库。
+（旧的 `~/.config/opencode/qq-bridge.json` 只在 `life-world.json` 没有 `bridge` 段时兜底，新装不要再往那儿写。）
 
 ### 4.4 起桥接（脱离 tmux，别放进 tmux 里）
 

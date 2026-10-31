@@ -5,7 +5,7 @@
 #   ./install.sh --service  装完顺手重启共享服务并拉起常驻 TUI
 #
 # 给 AI 代理用：把本仓库 clone 下来，直接跑 ./install.sh 即可。
-# 只要 opencode / node 20+ / tmux 都在 PATH 里，没有任何别的依赖。
+# 只要 opencode / node 22.13+ / tmux 都在 PATH 里，没有任何别的依赖。
 
 set -euo pipefail
 
@@ -21,15 +21,21 @@ if ! command -v opencode >/dev/null 2>&1 && [ -x "$HOME/.opencode/bin/opencode" 
 fi
 missing=0
 command -v opencode >/dev/null 2>&1 || { echo "  ✗ 找不到 opencode（先把它加进 PATH）"; missing=1; }
-command -v node >/dev/null 2>&1 || { echo "  ✗ 找不到 node（需要 20 以上）"; missing=1; }
+command -v node >/dev/null 2>&1 || { echo "  ✗ 找不到 node（需要 22.13 以上）"; missing=1; }
 command -v tmux >/dev/null 2>&1 || { echo "  ✗ 找不到 tmux（常驻 TUI 要用）"; missing=1; }
 if [ "$missing" != "0" ]; then
   echo
   echo "依赖不齐，装好再来一遍。"
   exit 1
 fi
-if ! node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 20 ? 0 : 1)'; then
-  echo "  ✗ node 版本太低：$(node -v)，需要 20 以上"
+# 插件用 node:sqlite（22.13 起免 flag），桥接用全局 WebSocket（22 起）。
+# Node 20 装完会「看起来成功」，但插件 import 直接失败。
+if ! node -e '
+  const [a, b] = process.versions.node.split(".").map(Number)
+  const ok = a > 23 || (a === 23 && b >= 4) || (a === 22 && b >= 13)
+  process.exit(ok ? 0 : 1)
+'; then
+  echo "  ✗ node 版本太低：$(node -v)，需要 22.13+（推荐 24 LTS）"
   exit 1
 fi
 echo "  ✓ opencode / node $(node -v) / tmux"
@@ -42,10 +48,14 @@ cp "$SRC/README.md" "$PLUGIN_DIR/README.md"
 cp "$SRC/GUIDE.md" "$PLUGIN_DIR/GUIDE.md"
 cp "$SRC/life-world.example.json" "$PLUGIN_DIR/life-world.example.json"
 cp "$SRC/data/kaomoji.json" "$PLUGIN_DIR/data/kaomoji.json"
+[ -f "$SRC/data/kaomoji.meta.json" ] && cp "$SRC/data/kaomoji.meta.json" "$PLUGIN_DIR/data/kaomoji.meta.json"
 mkdir -p "$PLUGIN_DIR/modules"
 cp -a "$SRC/modules/." "$PLUGIN_DIR/modules/"
 CONFIG_FILE="$HOME/.local/share/life-world/life-world.json"
-if [ ! -f "$CONFIG_FILE" ] && [ ! -f "$CONFIG_DIR/life-world.json" ] && [ ! -f "$CONFIG_DIR/qq-bridge.json" ]; then
+# 老版本的设置放在 world.json 里：存在时不要抢先写示例配置，
+# 否则 ensureConfig 看到新文件就不再迁移，enabled/localModel 等旧设置会丢。
+if [ ! -f "$CONFIG_FILE" ] && [ ! -f "$CONFIG_DIR/life-world.json" ] && [ ! -f "$CONFIG_DIR/qq-bridge.json" ] \
+   && [ ! -f "$HOME/.local/share/life-world/worlds/default/world.json" ]; then
   mkdir -p "$(dirname "$CONFIG_FILE")"
   cp "$SRC/life-world.example.json" "$CONFIG_FILE"
   chmod 600 "$CONFIG_FILE"
@@ -85,6 +95,6 @@ if [ "${1:-}" != "--service" ]; then
   echo
 fi
 echo "可选："
-echo "  QQ 桥接：cp qq-bridge.example.json ~/.config/opencode/qq-bridge.json"
-echo "           chmod 600 ~/.config/opencode/qq-bridge.json，再填 ownerQQ / napcat.wsUrl"
+echo "  QQ 桥接：等插件首次启动生成 $CONFIG_FILE 后，编辑里面的 bridge 段"
+echo "           填 bridge.ownerQQ、bridge.wsUrl / token / location，把 bridge.enabled 改成 true"
 echo "  总开关：$WORLD_BIN/life-world.sh status | on | off"
