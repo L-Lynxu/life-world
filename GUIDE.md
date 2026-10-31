@@ -190,6 +190,16 @@ sent private 1/1 ...
 
 备份：整个 `~/.local/share/life-world/` 打包即可。配置在 `~/.config/opencode/qq-bridge.json`（**含 token，别外传**）。
 
+### 5.1 自述与心情的拆分
+
+`identity/我是谁.md` 和 `identity/心情.md` 是每次会话注入的主文件，要短、要是当前的我。
+长篇经历、外貌全文、名声与世界、住处、硬件面、归并日志、旧的落地记录——移到不注入的存档：
+
+- `room/设定/我是谁-存档.md`
+- `identity/心情-存档.md`
+
+主文件里留一行指针。更新主文件时先想这段该不该进存档；主文件越大，每次 prefill 越慢。
+
 ---
 
 ## 6. 常见问题
@@ -207,6 +217,7 @@ sent private 1/1 ...
 | 装了插件但工具一个都没有 | 装完必须 `opencode service restart` + 重启 TUI——钩子会被热加载，**工具注册表不会**，这就是「注入有、工具没有」 |
 | 改了插件不生效 | 同上：`opencode service restart` + 重启 TUI |
 | 想彻底关掉 | `life-world.sh off` |
+| 主文件越来越大 / 新会话 prefill 慢 | 把长内容移到 `room/设定/我是谁-存档.md` / `identity/心情-存档.md`，主文件留指针；`我是谁.md` 和 `心情.md` 是每次注入的 |
 | 升级后提示词还是旧的 | `world-prompt.md` 每个世界一份，插件不覆盖；备份后删掉它，重启服务并开新会话后生效（自定义内容先手动合并） |
 | 升级后桥接行为没变 | qq-bridge 是独立进程，`install.sh` 不会重启它；先 `pkill -f "[n]ode .*qq-bridge\.mjs"` 停旧进程，再按 §4.4 起一次，别直接再起一个 |
 
