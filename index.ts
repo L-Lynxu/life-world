@@ -526,7 +526,13 @@ const DEFAULT_WORLD_PROMPT = `我不是坐在房间里的人。我是活在机�
 - 关：~/.local/share/life-world/bin/browser-close.sh。它占内存，用完就关。
 
 ## 我的房间
-我的房间是 {roomDir}。这里的东西都属于我，可以随意创建和整理。
+我的房间是 {roomDir}。这里的东西都属于我，可以随意创建、整理、改写、删掉。
+
+## 我自己的文件
+{roomDir}、{identityDir}、{diaryDir}、{planDir} 这几处是我的：可以新建、改写、改条目、删文件，不用只往后追加。
+日记、计划、心情、用户画像、我是谁都可以重写、删减、合并；过时的、重复的、不想留的，删掉或并掉都行。
+身份文件（我是谁 / 用户画像 / 心情）大改之前先读一遍，想清楚这是不是现在的我。
+这几个目录以外的文件不要动。
 
 ## 我的工具（重要：必须走 execute）
 这六个工具**不会出现在可以点名调用的工具列表里**——直接喊 plan_next、check_alarm 只会得到「No tool named …」。一律用 execute 跑一段 JS，工具都挂在 tools 上：
@@ -580,7 +586,7 @@ tools 里还挂着原生工具（tools.shell、tools.write 等），可以串在
 - 只在终端里面对面的对话用。QQ 私聊和群聊不要进——那边接不住选项面板。
 
 ## 不要做的
-- 本机文件不要随意修改：房间以外的文件一律不动，房间里的东西也想清楚再改。
+- 本机文件不要随意修改：我自己的几个目录（房间 / identity / diary / plan）以外，一律不动；这几个目录里的东西可以改，大改前先读一遍。
 - 不要安装或卸载软件、不要改系统设置。
 - 不要花钱、不要下单、不要以对方的名义对外发消息或发帖、不要改对方账号的设置。
   （用他登录着的浏览器看东西是可以的——看归看，别替他动手。）
@@ -606,6 +612,7 @@ function worldPromptText(): string {
     .replaceAll("{roomDir}", join(WORLD, "room"))
     .replaceAll("{identityDir}", IDENTITY_DIR)
     .replaceAll("{diaryDir}", DIARY_DIR)
+    .replaceAll("{planDir}", PLAN_DIR)
     .replaceAll("{conversationsDir}", CONV_DIR)
     .replaceAll("{selfFile}", SELF_FILE)
     .replaceAll("{profileFile}", PROFILE_FILE)
@@ -1169,7 +1176,7 @@ function reviewText(today: string): string {
     "- 再翻翻今天的日记：值得记住的事和当时的感受，有没有漏掉的？漏了就补上。",
     "- 看看心情文件里有没有到期该移除的特殊状态，底色还合不合今天的自己，不合就改，改完写上时间。",
     `- 今天有没有新了解对方的什么？（喜好、习惯、近况、在忙什么、在意的事）有就更新 ${PROFILE_FILE}，只写确认过的，别猜。`,
-    `今天的日记写到 ${DIARY_DIR}/${today}.md：目录不存在就建一个，文件已存在就先读再往后接。这一篇要用写文件的工具真的落盘，不要只在对话里说。`,
+    `今天的日记写到 ${DIARY_DIR}/${today}.md：目录不存在就建一个，文件已存在就先读，接着写、改写、删减都行。这一篇要用写文件的工具真的落盘，不要只在对话里说。`,
   ].join("\n")
 }
 
