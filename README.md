@@ -92,7 +92,7 @@ QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动�
 
 关掉时：不注入时间/世界提示词/心情/记忆、不打时间戳、6 个工具一个都不挂、定时器空转——等于没装这个插件。世界数据（日记、计划、记忆、心情、闹钟）原地保留，开回来直接接上。
 
-开关记在 `~/.config/opencode/life-world.json` 的 `world.enabled`（不写=开启；旧文件兜底）。脚本改完会重启服务和 TUI：工具与定时器都是进程启动时建的，不重启等于没生效。开关**只认人手**，没有做成给角色调用的工具。
+开关记在 `~/.local/share/life-world/life-world.json` 的 `world.enabled`（不写=开启；旧文件兜底）。脚本改完会重启服务和 TUI：工具与定时器都是进程启动时建的，不重启等于没生效。开关**只认人手**，没有做成给角色调用的工具。
 
 > QQ 桥接是独立进程，不跟着开关走；要一起停得单独停桥接。
 
@@ -103,10 +103,10 @@ QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动�
 当前只做私聊；群聊默认关闭。
 
 ```bash
-# 1. 配置：编辑 ~/.config/opencode/life-world.json 的 bridge
+# 1. 配置：编辑 ~/.local/share/life-world/life-world.json 的 bridge
 #    没有就把仓库的 life-world.example.json 拷过去
-cp life-world.example.json ~/.config/opencode/life-world.json
-chmod 600 ~/.config/opencode/life-world.json
+cp life-world.example.json ~/.local/share/life-world/life-world.json
+chmod 600 ~/.local/share/life-world/life-world.json
 # 填 bridge.ownerQQ、bridge.wsUrl / token、bridge.location；bridge.enabled 改成 true
 
 # 2. 启动（脱离 tmux，避免家会话重置时被 kill-server 带走）
@@ -151,10 +151,11 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 
 ## 数据位置
 
-运行时数据全部在 `~/.local/share/life-world/`，**不随仓库分发**；用户配置在 `~/.config/opencode/life-world.json`（含 token，600）：
+运行时数据全部在 `~/.local/share/life-world/`，**不随仓库分发**；用户配置在 `~/.local/share/life-world/life-world.json`（含 token，600）：
 
 ```
 ~/.local/share/life-world/
+├── life-world.json      用户配置（600；含 QQ token）
 ├── debug.log
 └── worlds/default/
     ├── world.json          运行时状态（闹钟/家会话/last*；不是配置）
@@ -182,7 +183,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 
 ## 配置（`life-world.json`）
 
-唯一用户配置：`~/.config/opencode/life-world.json`（权限 600，含 QQ token）。完整示例见仓库里的 `life-world.example.json`；首次启动时插件会自动生成，旧 `world.json` / `qq-bridge.json` 在它缺失时兜底。
+唯一用户配置：`~/.local/share/life-world/life-world.json`（权限 600，含 QQ token）。完整示例见仓库里的 `life-world.example.json`；首次启动时插件会自动生成，旧 `world.json` / `qq-bridge.json` 在它缺失时兜底。
 
 ```json
 {
@@ -232,7 +233,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 >
 > **什么时候别开**：接的是在线模型（API）。在线模型上下文够长、并发好，这些折叠会丢信息，**保持默认关闭**，按满配置跑即可。
 
-打开方式——在 `~/.config/opencode/life-world.json` 的 `localModel` 里改：
+打开方式——在 `~/.local/share/life-world/life-world.json` 的 `localModel` 里改：
 
 ```json
 "localModel": {

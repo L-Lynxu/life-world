@@ -13,9 +13,19 @@ set -uo pipefail
 export PATH="$HOME/.opencode/bin:$PATH"
 
 WORLD="$HOME/.local/share/life-world/worlds/default/world.json"
-CONFIG="$HOME/.config/opencode/life-world.json"
+CONFIG="$HOME/.local/share/life-world/life-world.json"
+LEGACY_CONFIG="$HOME/.config/opencode/life-world.json"
 START_TUI="$HOME/.local/share/life-world/bin/start-tui.sh"
 BRIDGE_STATE="$HOME/.local/share/life-world/qq-bridge-state.json"
+
+ensure_config() {
+  [ -f "$CONFIG" ] && return
+  if [ -f "$LEGACY_CONFIG" ]; then
+    mkdir -p "$(dirname "$CONFIG")"
+    cp "$LEGACY_CONFIG" "$CONFIG"
+    chmod 600 "$CONFIG"
+  fi
+}
 
 read_state() {
   node -e '
@@ -40,6 +50,7 @@ read_state() {
 }
 
 write_enabled() { # $1 = true | false
+  ensure_config
   node -e '
     const fs = require("fs"), path = require("path")
     const cPath = process.argv[1], wPath = process.argv[2], on = process.argv[3] === "true"
@@ -119,6 +130,7 @@ inbox() { # $1 = 看最近几天（默认 1）
 }
 
 status() {
+  ensure_config
   local s
   s="$(read_state)"
   node -e '
@@ -161,6 +173,7 @@ case "${1:-status}" in
     inbox "${2:-1}"
     ;;
   config)
+    ensure_config
     echo "$CONFIG"
     [ -f "$CONFIG" ] || echo "（尚未生成：启动服务/TUI 后插件会自动生成）"
     ;;
