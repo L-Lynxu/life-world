@@ -816,7 +816,11 @@ function readWorld(): WorldState {
 function writeWorld(state: WorldState): void {
   try {
     mkdirSync(WORLD, { recursive: true })
-    writeFileSync(WORLD_FILE, JSON.stringify(state, null, 2))
+    // 原子写：先写临时文件再 rename，避免写到一半崩溃/断电把 world.json 截断，
+    // 读回失败时会退化成默认空状态，闹钟和家会话就静默丢了。
+    const tmp = `${WORLD_FILE}.tmp`
+    writeFileSync(tmp, JSON.stringify(state, null, 2))
+    renameSync(tmp, WORLD_FILE)
   } catch (error) {
     log(`writeWorld failed: ${String(error)}`)
   }
@@ -1186,8 +1190,14 @@ export default Plugin.define({
                 qqGroupSessions.add(sessionID)
                 log(`qq group style on · ${sessionID}`)
               }
+            } else {
+              // 查询瞬时失败（服务刚重启等）：放掉标记，下一轮再查，别把会话永久漏掉
+              qqStyleChecked.delete(sessionID)
             }
-          })().catch((error) => log(`qq style check failed: ${String(error)}`))
+          })().catch((error) => {
+            qqStyleChecked.delete(sessionID)
+            log(`qq style check failed: ${String(error)}`)
+          })
         }
 
         if (sessionID && sessionID !== lastSession) {
@@ -1196,6 +1206,11 @@ export default Plugin.define({
           void withLock(async () => {
             const fresh = readWorld()
             const current = fresh.homeSessionId
+            // QQ 会话不能当家：立家会把标题改成 life-world home session，
+            // 而 QQ 风格块与 reach_out 拦截都靠 qq-chat / qq-group-* 标题识别。
+            const self = await sessionInfo(sessionID)
+            const selfTitle = self.status === "ok" ? String(self.title ?? "") : ""
+            if (selfTitle === "qq-chat" || selfTitle.startsWith("qq-group-")) return
             if (!current) {
               electHome(sessionID)
               return
@@ -1559,7 +1574,8 @@ export default Plugin.define({
 
           // —— 先处理到点的闹钟：到点才消费；发送失败就留在 alarms 里，下一轮重试 ——
           // （必须排在兜底之前：兜底一旦 return，到点的闹钟就永远轮不到）
-          const pending = readWorld().alarms ?? []
+          const pendingWorld = readWorld()
+          const pending = pendingWorld.running ? pendingWorld.alarms ?? [] : []
           const due = pending.filter((alarm) => {
             const at = Date.parse(alarm.at)
             return Number.isFinite(at) && at <= Date.now()
@@ -1585,6 +1601,7 @@ export default Plugin.define({
           // 判据只看「今天排着的闹钟」（含已到点还没送出去的那几个）；明天以后的闹钟不算，
           // 否则一个几周后才响的闹钟会把每天的兜底永久挡住。
           const current = readWorld()
+          if (!current.running) return
           if (current.lastWake === today) return
           const reviewHour = current.reviewHour ?? 23
           if (nowDate.getHours() >= reviewHour) return
