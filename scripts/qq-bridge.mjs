@@ -14,7 +14,7 @@
  *   node qq-bridge.mjs --test-send [文本]  只发一条测试私聊，然后退出
  */
 
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
@@ -512,7 +512,7 @@ async function runJudge(groupId, batch) {
   writeJson(JUDGE_SESSION_FILE, { id: sid })
   try {
     await api(`/api/session/${sid}/prompt`, { method: "POST", body: JSON.stringify({ text: buildJudgePrompt(groupId, batch) }) })
-    const deadline = Date.now() + (cfg.judgeTimeoutMs || 30000)
+    const deadline = Date.now() + (Number(cfg.judgeTimeoutMs) || 60000)
     while (Date.now() < deadline) {
       await sleep(800)
       const msgs = await apiJson(`/api/session/${sid}/message`)
@@ -953,10 +953,12 @@ if (process.argv[2] === "--test-send") {
   }, 300)
   setTimeout(() => { log("test send timeout"); process.exit(1) }, 20000)
 } else {
-  // 首次启动：今天已有 outbox 就跳过历史，没有就从 0 开始
-  const todayFile = join(OUTBOX_DIR, `${dayOf()}.jsonl`)
-  if (!state.outbox || state.outbox.file !== todayFile) {
-    state.outbox = { file: todayFile, offset: existsSync(todayFile) ? statSync(todayFile).size : 0 }
+  // 首次启动：只初始化新结构（按天游标 + 启用时刻）。
+  // 不能在这里塞旧的 { file, offset }——新结构没有 .file 字段，每次重启都会判定「结构不同」
+  // 而把按天游标整个冲掉，并把 since 重置成重启时刻，跨天补发随之失效。
+  // 旧结构交给 outboxOffsets() 迁移（它兼容 { file, offset }）。
+  if (!state.outbox) {
+    state.outbox = { offsets: {}, since: new Date().toISOString() }
     saveState()
   }
   connect()
