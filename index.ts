@@ -40,6 +40,53 @@ const CHROME_PORT = 9222
 /** 新会话注入的近期原文条数上限 */
 const RECENT_LIMIT = 80
 
+/**
+ * 本地小模型优化（默认关闭）。
+ * 面向「上下文短、并发差、prefill 慢」的本地模型；接在线模型时保持关闭即可。
+ * 打开后在 world.json 里配 localModel: { enabled: true, ... }。
+ */
+interface LocalModelOptions {
+  enabled: boolean
+  /** 新会话注入的历史条数（0 = 不注入） */
+  keepRecent: number
+  /** 保留最近几条 recent-context 工具结果（0 = 不折叠） */
+  foldRecentContext: number
+  /** 折叠后每条结果保留的字符数 */
+  resultChars: number
+  /** 是否折叠 role=tool 的工具消息 */
+  foldToolMessages: boolean
+  /** 保留最近几轮的推理；0 = 全折，-1 = 不折 */
+  foldingReasoningTurns: number
+  /** 是否注入「在线模型子代理」提示 */
+  preferSubagent: boolean
+  /** 是否每轮输出上下文构成统计（调试用） */
+  debugStats: boolean
+}
+
+function localModelOptions(): LocalModelOptions {
+  const raw = ((readWorld() as { localModel?: Record<string, unknown> }).localModel ?? {}) as Record<string, unknown>
+  const num = (k: string, d: number) => (typeof raw[k] === "number" ? (raw[k] as number) : d)
+  return {
+    enabled: raw.enabled === true,
+    keepRecent: num("keepRecent", 20),
+    foldRecentContext: num("foldRecentContext", 6),
+    resultChars: num("resultChars", 300),
+    foldToolMessages: raw.foldToolMessages !== false,
+    foldingReasoningTurns: num("foldingReasoningTurns", 0),
+    preferSubagent: raw.preferSubagent !== false,
+    debugStats: raw.debugStats === true,
+  }
+}
+
+/** 在线模型子代理提示（本地模型优化打开时才注入） */
+const SUBAGENT_MARK = "## 在线模型子代理（可选）"
+const SUBAGENT_BODY = [
+  "先问对方一句：有没有可以调用的在线模型（云端的，或者他在别处跑的强模型）？",
+  "- 没有就算了，不追问，也不硬凑。",
+  "- 有的话，这类活优先交给在线模型当子代理：整篇网页抓取、网络调研、多来源并行查证，以及任何「要快、要并发、内容又多」的处理。你只负责出判断、留结论。",
+  "- 如果在线子代理因为内容审查被掐断（表现是它的回复直接断掉或返回空），不要反复重试：这一次降级为你自己来做。",
+].join("\n")
+
 const PREFIX = "[本地时间 "
 const SYSTEM_MARK = "当前时间："
 const MEMORY_MARK = "## 最近的对话"
@@ -235,6 +282,10 @@ function ingest(): void {
 /** 最近若干条原文，按时间正序。 */
 function recentRecords(limit = RECENT_LIMIT): Record_[] {
   try {
+    const opt = localModelOptions()
+    const effective = opt.enabled ? opt.keepRecent : limit
+    if (effective <= 0) return [] // 0 = 不注入（slice(-0) 会返回全部，必须先短路）
+    limit = effective
     if (!existsSync(CONV_DIR)) return []
     const files = readdirSync(CONV_DIR).filter((f) => f.endsWith(".jsonl")).sort()
     const records: Record_[] = []
@@ -256,6 +307,108 @@ function recentRecords(limit = RECENT_LIMIT): Record_[] {
 }
 
 /** 按消息 id 查它是什么时候说的（用于给请求里的消息加时间戳）。 */
+/**
+ * 折叠 <recent-context> 里较早的工具结果，只保留最近 keepResults 条。
+ * 只动工具结果，不碰对话正文。
+ */
+function foldRecentContext(messages: unknown[], keepResults: number, keepChars: number): void {
+  for (const m of messages as any[]) {
+    if (m?.role !== "user" || !Array.isArray(m.content)) continue
+    for (const p of m.content) {
+      if (p?.type !== "text" || typeof p.text !== "string") continue
+      const text: string = p.text
+      const at = text.indexOf("<recent-context")
+      if (at < 0 || text.startsWith("[已折叠")) continue
+      const head = text.slice(0, at)
+      const chunks = text.slice(at).split(/(?=\[Tool result\])/)
+      if (chunks.length <= 1) continue
+      const items = chunks.slice(1)
+      if (items.length <= keepResults) continue
+      const dropped = items.length - keepResults
+      const kept = items.slice(items.length - keepResults).map((c) =>
+        c.length <= keepChars ? c : c.slice(0, keepChars).replace(/\s+/g, " ") + " …",
+      )
+      p.text = head + chunks[0] + `[已折叠 ${dropped} 条较早的工具结果]\n` + kept.join("")
+    }
+  }
+}
+
+/** 折叠旧轮次的 role=tool 工具消息 */
+function foldToolMessages(messages: unknown[], keepTurns: number, keepChars: number): void {
+  const userIdx: number[] = []
+  messages.forEach((m, i) => {
+    if ((m as { role?: string })?.role === "user") userIdx.push(i)
+  })
+  if (userIdx.length <= keepTurns) return
+  const cutoff = userIdx[userIdx.length - keepTurns - 1]
+  const shrink = (holder: any): void => {
+    if (!holder || typeof holder !== "object") return
+    if (typeof holder.text === "string" && holder.text.length > keepChars && !holder.text.startsWith("[已折叠")) {
+      holder.text = `[已折叠 工具结果 ${Math.round(holder.text.length / 1024)}KB] ` + holder.text.slice(0, keepChars).replace(/\s+/g, " ") + " …"
+    }
+    if (Array.isArray(holder.content)) for (const c of holder.content) shrink(c)
+  }
+  for (let i = 0; i < cutoff; i++) {
+    const msg = messages[i] as any
+    if (msg?.role !== "tool") continue
+    if (Array.isArray(msg.content)) for (const part of msg.content) shrink(part)
+    else shrink(msg)
+  }
+}
+
+/** 折叠旧轮次的推理（思考过程每轮重发太贵） */
+function foldReasoning(messages: unknown[], keepTurns: number): void {
+  if (keepTurns < 0) return
+  const userIdx: number[] = []
+  messages.forEach((m, i) => {
+    if ((m as { role?: string })?.role === "user") userIdx.push(i)
+  })
+  if (userIdx.length <= keepTurns) return
+  const cutoff = userIdx[userIdx.length - keepTurns - 1]
+  for (let i = 0; i < cutoff; i++) {
+    const parts = (messages[i] as { content?: unknown })?.content
+    if (!Array.isArray(parts)) continue
+    for (const part of parts as any[]) {
+      if (part?.type !== "reasoning") continue
+      if (!String(part.text ?? "")) continue
+      part.text = ""
+      if (part.native && typeof part.native === "object") part.native = {}
+    }
+  }
+}
+
+/** 统计一次请求的构成（对话 / 工具 / 推理 / 上下文块），调试用 */
+function statsRequest(messages: unknown[]): void {
+  let dialogue = 0, tools = 0, reasoning = 0, other = 0, ctx = 0
+  for (const m of messages as any[]) {
+    const parts = Array.isArray(m?.content) ? m.content : []
+    if (m?.role === "user") {
+      const text = parts.filter((p: any) => p?.type === "text").map((p: any) => String(p.text || "")).join("")
+      if (text.includes("<recent-context")) {
+        const seg = text.split(/(?=\[Tool result\])/)
+        ctx += seg[0].length
+        for (const t of seg.slice(1)) tools += t.length
+      } else dialogue += text.length
+      continue
+    }
+    if (m?.role === "tool") {
+      for (const p of parts) tools += String(p?.text ?? JSON.stringify(p ?? {})).length
+      continue
+    }
+    for (const p of parts) {
+      if (p?.type === "text") dialogue += String(p.text || "").length
+      else if (p?.type === "reasoning") reasoning += String(p.text || "").length
+      else if (p?.type === "tool-call" || p?.type === "tool-result") tools += JSON.stringify(p).length
+      else other += JSON.stringify(p).length
+    }
+  }
+  const total = dialogue + tools + reasoning + other + ctx
+  if (!total) return
+  const kb = (n: number) => Math.round(n / 1024) + "KB"
+  const pct = (n: number) => ((n / total) * 100).toFixed(1) + "%"
+  log(`ctx stats · 总 ${kb(total)} | 对话 ${kb(dialogue)} ${pct(dialogue)} | 工具 ${kb(tools)} ${pct(tools)} | 推理 ${kb(reasoning)} ${pct(reasoning)} | 上下文块 ${kb(ctx)} ${pct(ctx)}`)
+}
+
 function createdOf(id: string): number | undefined {
   try {
     const db = new DatabaseSync(DB_PATH, { readOnly: true })
@@ -615,6 +768,8 @@ interface Alarm {
 
 interface WorldState {
   running: boolean
+  /** 本地小模型优化配置（默认不存在 = 全关） */
+  localModel?: Record<string, unknown>
   /** 总开关：false 时完全退回原生 opencode（缺省视为开启） */
   enabled?: boolean
   homeSessionId?: string
@@ -970,6 +1125,9 @@ export default Plugin.define({
         // —— 总开关关掉：不注时间、不注世界、不注记忆、不打时间戳 ——
         if (!worldEnabled()) return
 
+        // 本地小模型优化（默认关；world.json 里 localModel.enabled 打开）
+        const opt = localModelOptions()
+
         if (!Array.isArray(system)) return
 
         // —— 2. system：当前时间 + 时区（每轮刷新）——
@@ -1000,6 +1158,14 @@ export default Plugin.define({
         const bIdx = system.findIndex((p) => typeof p?.text === "string" && p.text.startsWith(NAPCAT_MARK))
         if (bIdx >= 0) system[bIdx] = { type: "text", text: bridgeText }
         else system.push({ type: "text", text: bridgeText })
+
+        // —— 3a3. 在线模型子代理提示（仅本地模型优化开启时）——
+        if (opt.enabled && opt.preferSubagent) {
+          const subText = `${SUBAGENT_MARK}\n${SUBAGENT_BODY}`
+          const sIdx = system.findIndex((p) => typeof p?.text === "string" && p.text.startsWith(SUBAGENT_MARK))
+          if (sIdx >= 0) system[sIdx] = { type: "text", text: subText }
+          else system.push({ type: "text", text: subText })
+        }
 
         // —— 3b. 新会话第一次：注入我是谁 + 日记索引 + 最近原文 ——
         const sessionID = String(event.sessionID ?? "")
@@ -1064,6 +1230,14 @@ export default Plugin.define({
           const sIdx = system.findIndex((p) => typeof p?.text === "string" && p.text.startsWith(QQ_GROUP_MARK))
           if (sIdx >= 0) system[sIdx] = { type: "text", text: styleText }
           else system.push({ type: "text", text: styleText })
+        }
+
+        // —— 3d. 本地小模型优化：折叠历史工具结果 / 工具消息 / 推理 ——
+        if (opt.enabled && Array.isArray(messages)) {
+          if (opt.foldRecentContext > 0) foldRecentContext(messages as unknown[], opt.foldRecentContext, opt.resultChars)
+          if (opt.foldToolMessages) foldToolMessages(messages as unknown[], 1, opt.resultChars)
+          foldReasoning(messages as unknown[], opt.foldingReasoningTurns)
+          if (opt.debugStats) statsRequest(messages as unknown[])
         }
 
         // —— 4. 用户消息时间戳 ——

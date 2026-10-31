@@ -11,7 +11,7 @@
 | 时间上下文 | 每轮把「当前时间 + 时区」写进 system |
 | 消息时间戳 | 用户消息正文前加 `[本地时间 YYYY-MM-DD HH:mm TZ]` |
 | 原文归档 | 读 `~/.local/share/opencode/opencode.db` 的 `session_message`，按天写 `conversations/*.jsonl`，含 assistant |
-| 跨窗口记忆 | 新会话第一次请求时，注入最近 80 条原文 + 自述 + 日记索引 |
+| 跨窗口记忆 | 新会话第一次请求时，注入最近 80 条原文（`RECENT_LIMIT`，优化开关打开时可调低）+ 自述 + 日记索引 |
 | 生活线工具 | `plan_next` / `check_alarm` / `cancel_alarm` / `reach_out`（多闹钟，`alarms` 数组）；**只能通过 `execute` 调**（`await tools.plan_next(...)`），不能点名直呼 |
 | 闹钟 | 每 30 秒检查 `world.json`，到点经共享服务 HTTP 接口唤醒家会话；发送成功才移除 |
 | 每日回顾 | 默认 23 点后一天一次，回看、写日记、改写自述、更新用户画像；发送成功才记账 |
@@ -26,6 +26,8 @@
 | 真实浏览器 | `scripts/browser-*` 开带调试口的 Chrome、读浏览历史、关掉 |
 | QQ 桥接（可选） | `scripts/qq-bridge.mjs`：NapCat 私聊 ↔ `qq-chat` 会话；每行一条消息、真人节奏；开关状态会注入给角色 |
 | 压缩 | 只保留对话正文，去掉工具调用过程 |
+| 初次引导 | 首次启用时自己读 `GUIDE.md`：介绍能力、问要不要接 QQ、引导配置 |
+| **本地小模型优化（可选）** | `world.json` 的 `localModel`：折叠工具结果/旧推理、压缩注入条数、提示用在线子模型当子代理。**默认关闭** |
 
 ## 安装
 
@@ -187,6 +189,42 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 - 颜文字数据 `data/kaomoji.json` 为随附资源；发布前请确认其来源与许可证。
 - 权限是提示词软约束，没有 `ctx.permission` 硬拦截（有意为之）。
 - QQ 桥接私聊 / 群聊都已实现；群聊默认关闭。
+
+## 本地小模型优化（可选，默认关闭）
+
+> **什么时候开**：模型跑在本机 / 局域网，**上下文短、并发差、首字慢**（典型：llama.cpp、Ollama、Strata 这类本地推理）。打开后主对话上下文会明显变瘦，prefill 时间大幅下降。
+>
+> **什么时候别开**：接的是在线模型（API）。在线模型上下文够长、并发好，这些折叠会丢信息，**保持默认关闭**，按满配置跑即可。
+
+打开方式——在 `worlds/default/world.json` 里加：
+
+```json
+"localModel": {
+  "enabled": true,
+  "keepRecent": 20,
+  "foldRecentContext": 6,
+  "resultChars": 300,
+  "foldToolMessages": true,
+  "foldingReasoningTurns": 0,
+  "preferSubagent": true,
+  "debugStats": false
+}
+```
+
+| 字段 | 默认 | 作用 |
+|---|---|---|
+| `enabled` | `false` | 总开关。关着时下面全部不生效 |
+| `keepRecent` | 20 | 新会话注入的历史条数（关着时用 `RECENT_LIMIT` = 80） |
+| `foldRecentContext` | 6 | 每轮只保留最近几条 `<recent-context>` 工具结果，0 = 不折 |
+| `resultChars` | 300 | 折叠后每条结果保留多少字符 |
+| `foldToolMessages` | `true` | 是否折叠 `role=tool` 的工具消息 |
+| `foldingReasoningTurns` | 0 | 保留最近几轮的推理；0 = 全折，-1 = 不折 |
+| `preferSubagent` | `true` | 注入「在线模型子代理」提示：有在线模型时把抓网页/调研这类重活委托过去 |
+| `debugStats` | `false` | 每轮往 debug.log 写一行上下文构成统计（调参用） |
+
+**实测**（395 迷你主机 + Qwen3.8-Flash-Next IQ3_XXS，opencode 2.2.5）：同一条会话，每轮请求从 **306 KB / 20 万 token** 降到 **25 KB 上下**，单轮耗时从 145–222 秒降到几十秒。
+
+> 折叠只动工具结果和旧推理，**对话正文一条不动**；`world.json` 用 `execute` 改，保存后下一轮生效，不用重启。
 
 ## 更新颜文字库
 
