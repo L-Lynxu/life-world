@@ -126,8 +126,10 @@ const JUDGE_SESSION_FILE = join(WORLD, "qq-judge-session.json")
 /** 旧版桥接写的判官文件：升级过渡期也读，桥接没重启时不至于漏隔离 */
 const LEGACY_JUDGE_SESSION_FILE = join(ROOT, "qq-judge-session.json")
 const BRIDGE_CONFIG_FILE = join(HOME, ".config/opencode/qq-bridge.json")
-/** 唯一用户配置文件（world / localModel / bridge）；旧的 world.json / qq-bridge.json 只作兜底 */
-const CONFIG_FILE = join(HOME, ".config/opencode/life-world.json")
+/** 唯一用户配置文件（world / localModel / bridge）：放在插件数据目录，不写 ~/.config/opencode */
+const CONFIG_FILE = join(ROOT, "life-world.json")
+/** 旧版配置位置：只读迁移用，迁移后搬走 */
+const LEGACY_LIFE_WORLD_CONFIG = join(HOME, ".config/opencode/life-world.json")
 const BRIDGE_STATE_FILE = join(HOME, ".local/share/life-world/qq-bridge-state.json")
 
 // ———————————————————————— 基础工具 ————————————————————————
@@ -933,11 +935,44 @@ function writeConfig(config: LifeWorldConfig): void {
   }
 }
 
-/** 首次运行生成 life-world.json；已有就不动 */
+/** 把旧位置的文件搬到插件数据目录，避免继续留在 ~/.config/opencode */
+function moveToData(source: string, label: string): void {
+  try {
+    if (!existsSync(source)) return
+    const target = join(ROOT, `${label}.migrated-${Date.now()}`)
+    try { renameSync(source, target) } catch { copyFileSync(source, target); unlinkSync(source) }
+    log(`migrated ${label} → ${target}`)
+  } catch (error) {
+    log(`migrate ${label} failed: ${String(error)}`)
+  }
+}
+
+/** 把 ~/.config/opencode 下所有 life-world.json / qq-bridge.json（含 .bak）搬到插件数据目录 */
+function moveLegacyConfigs(): void {
+  try {
+    const dir = join(HOME, ".config/opencode")
+    if (!existsSync(dir)) return
+    for (const name of readdirSync(dir)) {
+      if (!/^(life-world\.json|qq-bridge\.json)/.test(name)) continue
+      moveToData(join(dir, name), name)
+    }
+  } catch (error) {
+    log(`moveLegacyConfigs failed: ${String(error)}`)
+  }
+}
+
+/** 首次运行生成 life-world.json；已有就不动；顺手把旧位置的配置搬走 */
 function ensureConfig(): void {
   try {
-    if (existsSync(CONFIG_FILE)) return
-    writeConfig(configFromLegacy())
+    if (existsSync(CONFIG_FILE)) {
+      moveLegacyConfigs()
+      return
+    }
+    const config = existsSync(LEGACY_LIFE_WORLD_CONFIG)
+      ? deepMerge(defaultConfig(), JSON.parse(readFileSync(LEGACY_LIFE_WORLD_CONFIG, "utf8")) as unknown)
+      : configFromLegacy()
+    writeConfig(config)
+    moveLegacyConfigs()
     log(`config created · ${CONFIG_FILE}`)
   } catch (error) {
     log(`ensureConfig failed: ${String(error)}`)

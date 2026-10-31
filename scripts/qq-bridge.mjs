@@ -19,7 +19,7 @@ import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
 const HOME = homedir()
-const LIFEWORLD_CONFIG_FILE = join(HOME, ".config/opencode/life-world.json")
+const LIFEWORLD_CONFIG_FILE = join(HOME, ".local/share/life-world/life-world.json")
 /** 旧桥接配置：新 life-world.json 没有 bridge 时兜底 */
 const CONFIG_FILE = join(HOME, ".config/opencode/qq-bridge.json")
 const STATE_FILE = join(HOME, ".local/share/life-world/qq-bridge-state.json")

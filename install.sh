@@ -44,10 +44,12 @@ cp "$SRC/life-world.example.json" "$PLUGIN_DIR/life-world.example.json"
 cp "$SRC/data/kaomoji.json" "$PLUGIN_DIR/data/kaomoji.json"
 mkdir -p "$PLUGIN_DIR/modules"
 cp -a "$SRC/modules/." "$PLUGIN_DIR/modules/"
-if [ ! -f "$CONFIG_DIR/life-world.json" ] && [ ! -f "$CONFIG_DIR/qq-bridge.json" ]; then
-  cp "$SRC/life-world.example.json" "$CONFIG_DIR/life-world.json"
-  chmod 600 "$CONFIG_DIR/life-world.json"
-  echo "  ✓ 配置示例 → $CONFIG_DIR/life-world.json"
+CONFIG_FILE="$HOME/.local/share/life-world/life-world.json"
+if [ ! -f "$CONFIG_FILE" ] && [ ! -f "$CONFIG_DIR/life-world.json" ] && [ ! -f "$CONFIG_DIR/qq-bridge.json" ]; then
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  cp "$SRC/life-world.example.json" "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+  echo "  ✓ 配置示例 → $CONFIG_FILE"
 fi
 cp "$SRC"/scripts/* "$WORLD_BIN/"
 chmod +x "$WORLD_BIN"/*.sh "$WORLD_BIN"/*.mjs 2>/dev/null || true
