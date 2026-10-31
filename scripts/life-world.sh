@@ -77,6 +77,31 @@ tui_active() {
   fi
 }
 
+inbox() { # $1 = 看最近几天（默认 1）
+  local days="${1:-1}"
+  node -e '
+    const fs = require("fs"), path = require("path")
+    const dir = process.argv[1], n = Number(process.argv[2]) || 1
+    const pad = (x) => String(x).padStart(2, "0")
+    const out = []
+    for (let i = n - 1; i >= 0; i--) {
+      const d = new Date(); d.setDate(d.getDate() - i)
+      const day = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+      const f = path.join(dir, day + ".jsonl")
+      if (!fs.existsSync(f)) continue
+      for (const line of fs.readFileSync(f, "utf8").split("\n")) {
+        if (!line.trim()) continue
+        try {
+          const j = JSON.parse(line)
+          if (j.text) out.push([day + " " + new Date(j.t).toTimeString().slice(0, 5), j.text])
+        } catch {}
+      }
+    }
+    if (!out.length) { console.log(`（最近 ${n} 天没有主动发过消息）`); process.exit(0) }
+    for (const [t, x] of out) console.log(`[${t}] ${x}`)
+  ' "$HOME/.local/share/life-world/worlds/default/outbox" "$days"
+}
+
 status() {
   local s
   s="$(read_state)"
@@ -114,11 +139,14 @@ case "${1:-status}" in
     restart_service
     tui_quiet
     ;;
+  inbox)
+    inbox "${2:-1}"
+    ;;
   status)
     status
     ;;
   *)
-    echo "用法：life-world.sh status | on | off"
+    echo "用法：life-world.sh status | on | off | inbox [天数]"
     exit 1
     ;;
 esac

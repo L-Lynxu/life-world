@@ -25,6 +25,7 @@
 | 家会话自愈 | 家会话缺失时，服务进程自动重启 tmux 并重建；标题固定 `life-world home session` |
 | 真实浏览器 | `scripts/browser-*` 开带调试口的 Chrome、读浏览历史、关掉 |
 | QQ 桥接（可选） | `scripts/qq-bridge.mjs`：NapCat 私聊 ↔ `qq-chat` 会话；每行一条消息、真人节奏；开关状态会注入给角色 |
+| **主动消息 outbox** | `reach_out` 写 `outbox/YYYY-MM-DD.jsonl`；桥接每 2 秒投递，**断线/跨天后自动补发最近 3 天未送出的**；`bin/life-world.sh inbox [天数]` 可回看她主动说过什么 |
 | 压缩 | 只保留对话正文，去掉工具调用过程 |
 | 初次引导 | 首次启用时自己读 `GUIDE.md`：介绍能力、问要不要接 QQ、引导配置 |
 | **本地小模型优化（可选）** | `world.json` 的 `localModel`：折叠工具结果/旧推理、压缩注入条数、提示用在线子模型当子代理。**默认关闭** |
@@ -100,6 +101,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 | `group.enabled` | 群聊开关，默认 `false`；角色也能用 `group_chat` 工具实时开关 |
 
 - `/new`：删除 `qq-chat`，下一条消息或她的 `reach_out` 再新建。
+- **outbox 补发**：投递游标按天记录；桥接启动/重连时会扫最近 3 天，把没送出去的补发（跨天离线也不丢）。
 - 回复按行拆成多条：每个短句一条 QQ 消息，两条之间按下一句长度停顿约 1.5~3 秒（加随机抖动），模拟真人打字。
 - 若这一轮正文为空、但她调用了 `reach_out`，桥接会把这一轮缓冲的那些行当回复发出去，避免漏回。
 - 开关关闭或桥接离线（心跳超过 90 秒）时，角色会看到「reach_out 不会送达」，不会以为已经通知到你。

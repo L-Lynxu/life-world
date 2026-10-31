@@ -61,6 +61,7 @@
 | **gal 模式** | 「接下来由你主导」「进入 gal 模式」 |
 | 退出 gal 模式 | 在选项面板的「自己输入」里写「停下」，或者直接说 |
 | 看你收的颜文字 | `room/颜文字.md` |
+| 看自己主动说过什么 | `~/.local/share/life-world/bin/life-world.sh inbox [天数]` |
 | **更新颜文字库** | 用户说「更新颜文字库 / 换个表情库」→ 跑 `node ~/.local/share/life-world/bin/kaomoji-update.mjs`（零依赖，从 npm 拉） |
 | 翻你的日记 | `diary/YYYY-MM-DD.md` |
 
