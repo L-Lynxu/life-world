@@ -40,9 +40,15 @@ mkdir -p "$PLUGIN_DIR/data" "$WORLD_BIN"
 cp "$SRC/index.ts" "$PLUGIN_DIR/index.ts"
 cp "$SRC/README.md" "$PLUGIN_DIR/README.md"
 cp "$SRC/GUIDE.md" "$PLUGIN_DIR/GUIDE.md"
+cp "$SRC/life-world.example.json" "$PLUGIN_DIR/life-world.example.json"
 cp "$SRC/data/kaomoji.json" "$PLUGIN_DIR/data/kaomoji.json"
 mkdir -p "$PLUGIN_DIR/modules"
 cp -a "$SRC/modules/." "$PLUGIN_DIR/modules/"
+if [ ! -f "$CONFIG_DIR/life-world.json" ] && [ ! -f "$CONFIG_DIR/qq-bridge.json" ]; then
+  cp "$SRC/life-world.example.json" "$CONFIG_DIR/life-world.json"
+  chmod 600 "$CONFIG_DIR/life-world.json"
+  echo "  ✓ 配置示例 → $CONFIG_DIR/life-world.json"
+fi
 cp "$SRC"/scripts/* "$WORLD_BIN/"
 chmod +x "$WORLD_BIN"/*.sh "$WORLD_BIN"/*.mjs 2>/dev/null || true
 echo "  ✓ 插件本体 → $PLUGIN_DIR"

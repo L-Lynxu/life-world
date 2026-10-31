@@ -2,7 +2,7 @@ import { Plugin } from "@opencode/plugin"
 import { appendFileSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { DatabaseSync } from "node:sqlite"
 
 /**
@@ -126,6 +126,8 @@ const JUDGE_SESSION_FILE = join(WORLD, "qq-judge-session.json")
 /** 旧版桥接写的判官文件：升级过渡期也读，桥接没重启时不至于漏隔离 */
 const LEGACY_JUDGE_SESSION_FILE = join(ROOT, "qq-judge-session.json")
 const BRIDGE_CONFIG_FILE = join(HOME, ".config/opencode/qq-bridge.json")
+/** 唯一用户配置文件（world / localModel / bridge）；旧的 world.json / qq-bridge.json 只作兜底 */
+const CONFIG_FILE = join(HOME, ".config/opencode/life-world.json")
 const BRIDGE_STATE_FILE = join(HOME, ".local/share/life-world/qq-bridge-state.json")
 
 // ———————————————————————— 基础工具 ————————————————————————
@@ -306,7 +308,7 @@ function ingest(): void {
 }
 
 /** 最近若干条原文，按时间正序。 */
-function recentRecords(limit = RECENT_LIMIT): Record_[] {
+function recentRecords(limit = readConfig().world.recentLimit): Record_[] {
   try {
     const opt = localModelOptions()
     const effective = opt.enabled ? opt.keepRecent : limit
@@ -625,7 +627,8 @@ function readHistory(limit: number, query?: string): { rows: HistoryRow[]; raw: 
 
 async function debuggingReady(): Promise<boolean> {
   try {
-    const response = await fetch(`http://127.0.0.1:${CHROME_PORT}/json/version`, {
+    const port = readConfig().world.browserPort
+    const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
       signal: AbortSignal.timeout(1500),
     })
     return response.ok
@@ -752,7 +755,123 @@ interface WorldState {
 const WORLD_FILE = join(WORLD, "world.json")
 const OUTBOX_DIR = join(WORLD, "outbox")
 
-function readWorld(): WorldState {
+interface WorldSettings {
+  enabled: boolean
+  running: boolean
+  reviewHour: number
+  fallbackWakeTime: string
+  resetHour: number | null
+  recentLimit: number
+  summaryLimit: number
+  alarmStaleHours: number
+  resetCooldownMinutes: number
+  browserPort: number
+  homeTitle: string
+}
+
+interface BridgeGroupSettings {
+  enabled?: boolean
+  keywords?: string[]
+  interjectChance?: number
+  afterReplyChance?: number
+  probabilityDurationMs?: number
+  judgeModel?: string
+  judgeTimeoutMs?: number
+  debounceMs?: number
+  triggerDebounceMs?: number
+  maxBatchWaitMs?: number
+  cooldownMs?: number
+  maxPer10Min?: number
+  bannedWords?: string[]
+}
+
+interface BridgeSettings {
+  enabled: boolean
+  ownerQQ: number
+  ownerName: string
+  wsUrl: string
+  token: string
+  privateSessionTitle: string
+  location: string
+  group: BridgeGroupSettings
+}
+
+interface LifeWorldConfig {
+  world: WorldSettings
+  localModel: LocalModelOptions
+  bridge: BridgeSettings
+}
+
+function deepMerge<T>(base: T, over: unknown): T {
+  if (!over || typeof over !== "object" || Array.isArray(over)) return base
+  const out: any = Array.isArray(base) ? [...(base as any)] : { ...(base as any) }
+  for (const [key, value] of Object.entries(over as Record<string, unknown>)) {
+    const current = out[key]
+    if (
+      value && typeof value === "object" && !Array.isArray(value) &&
+      current && typeof current === "object" && !Array.isArray(current)
+    ) {
+      out[key] = deepMerge(current, value)
+    } else if (value !== undefined) {
+      out[key] = value
+    }
+  }
+  return out as T
+}
+
+function defaultConfig(): LifeWorldConfig {
+  return {
+    world: {
+      enabled: true,
+      running: true,
+      reviewHour: 23,
+      fallbackWakeTime: "09:00",
+      resetHour: null,
+      recentLimit: RECENT_LIMIT,
+      summaryLimit: SUMMARY_LIMIT,
+      alarmStaleHours: 6,
+      resetCooldownMinutes: 5,
+      browserPort: CHROME_PORT,
+      homeTitle: HOME_TITLE,
+    },
+    localModel: {
+      enabled: false,
+      keepRecent: 20,
+      foldRecentContext: 6,
+      resultChars: 300,
+      foldToolMessages: true,
+      foldingReasoningTurns: 0,
+      preferSubagent: true,
+      debugStats: false,
+    },
+    bridge: {
+      enabled: false,
+      ownerQQ: 0,
+      ownerName: "",
+      wsUrl: "ws://127.0.0.1:3001",
+      token: "",
+      privateSessionTitle: "qq-chat",
+      location: "",
+      group: {
+        enabled: false,
+        keywords: [],
+        interjectChance: 0.05,
+        afterReplyChance: 0.8,
+        probabilityDurationMs: 120000,
+        judgeModel: "default",
+        judgeTimeoutMs: 60000,
+        debounceMs: 10000,
+        triggerDebounceMs: 1200,
+        maxBatchWaitMs: 60000,
+        cooldownMs: 8000,
+        maxPer10Min: 0,
+        bannedWords: [],
+      },
+    },
+  }
+}
+
+function readWorldFile(): WorldState {
   try {
     if (!existsSync(WORLD_FILE)) return { running: true, alarms: [] }
     const state = { running: true, ...(JSON.parse(readFileSync(WORLD_FILE, "utf8")) as Partial<WorldState>) }
@@ -768,13 +887,92 @@ function readWorld(): WorldState {
   }
 }
 
+/** 没有 life-world.json 时，从旧的 world.json / qq-bridge.json 组一份 */
+function configFromLegacy(): LifeWorldConfig {
+  const config = defaultConfig()
+  const state = readWorldFile()
+  config.world.enabled = state.enabled !== false
+  config.world.running = state.running !== false
+  if (typeof state.reviewHour === "number") config.world.reviewHour = state.reviewHour
+  if (typeof state.fallbackWakeTime === "string") config.world.fallbackWakeTime = state.fallbackWakeTime
+  if (typeof state.resetHour === "number") config.world.resetHour = state.resetHour
+  if (state.localModel) config.localModel = deepMerge(config.localModel, state.localModel)
+  try {
+    const legacy = JSON.parse(readFileSync(BRIDGE_CONFIG_FILE, "utf8")) as any
+    config.bridge = deepMerge(config.bridge, {
+      enabled: legacy.enabled === true,
+      ownerQQ: Number(legacy.ownerQQ) || 0,
+      ownerName: typeof legacy.ownerName === "string" ? legacy.ownerName : "",
+      wsUrl: legacy.napcat?.wsUrl ?? legacy.wsUrl ?? config.bridge.wsUrl,
+      token: legacy.napcat?.token ?? legacy.token ?? "",
+      privateSessionTitle: legacy.private?.sessionTitle ?? legacy.privateSessionTitle ?? "qq-chat",
+      location: legacy.location ?? "",
+      group: legacy.group ?? {},
+    })
+  } catch { /* 没有旧桥接配置 */ }
+  return config
+}
+
+function readConfig(): LifeWorldConfig {
+  try {
+    if (existsSync(CONFIG_FILE)) {
+      return deepMerge(defaultConfig(), JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as unknown)
+    }
+  } catch (error) {
+    log(`config read failed: ${String(error)}`)
+  }
+  return configFromLegacy()
+}
+
+function writeConfig(config: LifeWorldConfig): void {
+  try {
+    mkdirSync(dirname(CONFIG_FILE), { recursive: true })
+    atomicWrite(CONFIG_FILE, JSON.stringify(config, null, 2), 0o600)
+  } catch (error) {
+    log(`writeConfig failed: ${String(error)}`)
+  }
+}
+
+/** 首次运行生成 life-world.json；已有就不动 */
+function ensureConfig(): void {
+  try {
+    if (existsSync(CONFIG_FILE)) return
+    writeConfig(configFromLegacy())
+    log(`config created · ${CONFIG_FILE}`)
+  } catch (error) {
+    log(`ensureConfig failed: ${String(error)}`)
+  }
+}
+
+/** 合并读：设置来自 life-world.json，运行时状态来自 world.json */
+function readWorld(): WorldState {
+  const state = readWorldFile()
+  const config = readConfig()
+  return {
+    ...state,
+    enabled: config.world.enabled,
+    running: config.world.running,
+    reviewHour: config.world.reviewHour,
+    fallbackWakeTime: config.world.fallbackWakeTime,
+    resetHour: config.world.resetHour ?? undefined,
+    localModel: config.localModel as unknown as Record<string, unknown>,
+  }
+}
+
+/** 只写运行时状态；设置留在 life-world.json，避免每 30 秒写回覆盖用户配置 */
 function writeWorld(state: WorldState): void {
   try {
     mkdirSync(WORLD, { recursive: true })
-    atomicWrite(WORLD_FILE, JSON.stringify(state, null, 2))
+    const runtime: any = { ...state }
+    for (const key of ["enabled", "running", "reviewHour", "fallbackWakeTime", "resetHour", "localModel"]) delete runtime[key]
+    atomicWrite(WORLD_FILE, JSON.stringify(runtime, null, 2))
   } catch (error) {
     log(`writeWorld failed: ${String(error)}`)
   }
+}
+
+function homeTitle(): string {
+  return readConfig().world.homeTitle || HOME_TITLE
 }
 
 /**
@@ -840,7 +1038,7 @@ async function renameHome(sessionID: string): Promise<void> {
   try {
     const res = await api(`/api/session/${sessionID}`, {
       method: "PATCH",
-      body: JSON.stringify({ title: HOME_TITLE }),
+      body: JSON.stringify({ title: homeTitle() }),
     })
     if (!res.ok) log(`rename home HTTP ${res.status} · ${sessionID}`)
     else log(`rename home ok · ${sessionID}`)
@@ -863,7 +1061,7 @@ async function resetTmuxAndHome(reason: string): Promise<void> {
   if (!isServiceProcess()) return
   const state = readWorld()
   const last = state.lastResetAt ? Date.parse(state.lastResetAt) : 0
-  if (Number.isFinite(last) && Date.now() - last < RESET_COOLDOWN) return
+  if (Number.isFinite(last) && Date.now() - last < readConfig().world.resetCooldownMinutes * 60_000) return
   delete state.homeSessionId
   state.lastResetAt = new Date().toISOString()
   writeWorld(state)
@@ -911,7 +1109,7 @@ async function ensureHome(): Promise<string | undefined> {
         log(`home cleared (qq session) · ${current}`)
         return undefined
       }
-      if (info.title !== HOME_TITLE) await renameHome(current)
+      if (info.title !== homeTitle()) await renameHome(current)
       return current
     }
     if (info.status === "error") return undefined // 服务不可达，下一轮再试
@@ -1038,21 +1236,20 @@ interface BridgeStatus {
 }
 
 function readBridgeStatus(): BridgeStatus {
-  let config: any
+  const config = readConfig().bridge
   let state: any
-  try { config = JSON.parse(readFileSync(BRIDGE_CONFIG_FILE, "utf8")) } catch { config = undefined }
   try { state = JSON.parse(readFileSync(BRIDGE_STATE_FILE, "utf8")) } catch { state = undefined }
-  const enabled = config?.enabled === true
+  const enabled = config.enabled === true
   const lastSeen = typeof state?.lastSeen === "string" ? state.lastSeen : undefined
   const seenMs = lastSeen ? Date.parse(lastSeen) : 0
   const online = enabled && Number.isFinite(seenMs) && Date.now() - seenMs < 90_000
   return {
-    configured: Boolean(config),
+    configured: Number(config.ownerQQ) > 0,
     enabled,
     online,
-    ownerQQ: Number(config?.ownerQQ) || undefined,
-    ownerName: typeof config?.ownerName === "string" ? config.ownerName : undefined,
-    groupEnabled: config?.group?.enabled === true,
+    ownerQQ: Number(config.ownerQQ) || undefined,
+    ownerName: typeof config.ownerName === "string" ? config.ownerName : undefined,
+    groupEnabled: config.group?.enabled === true,
     lastSeen,
   }
 }
@@ -1074,13 +1271,8 @@ function qqSessionKind(sessionID: string): "private" | "group" | undefined {
 
 /** QQ 私聊会话的标题：qq-bridge.json 可自定义，默认 qq-chat。 */
 function qqPrivateTitle(): string {
-  try {
-    const config = JSON.parse(readFileSync(BRIDGE_CONFIG_FILE, "utf8")) as { private?: { sessionTitle?: unknown } }
-    const title = config?.private?.sessionTitle
-    return typeof title === "string" && title.trim() ? title.trim() : "qq-chat"
-  } catch {
-    return "qq-chat"
-  }
+  const title = readConfig().bridge.privateSessionTitle
+  return typeof title === "string" && title.trim() ? title.trim() : "qq-chat"
 }
 
 function bridgeStatusText(): string {
@@ -1117,6 +1309,7 @@ export default Plugin.define({
     }
     ensureWorldPrompt()
     ensureMood()
+    ensureConfig()
     loadArchive()
     log(`loaded · opencode ${ctx.app.version} · ${zoneName()} · archived=${archived.size}`)
 
@@ -1316,9 +1509,10 @@ export default Plugin.define({
             lines.push(`${role === "user" ? "对方" : "我"}：${text}`)
           }
           const joined = lines.join("\n")
+          const summaryLimit = readConfig().world.summaryLimit
           const summary =
-            joined.length > SUMMARY_LIMIT
-              ? `（更早的对话已经省略）\n${joined.slice(-SUMMARY_LIMIT)}`
+            joined.length > summaryLimit
+              ? `（更早的对话已经省略）\n${joined.slice(-summaryLimit)}`
               : joined
           if (summary.trim()) {
             event.result = { summary }
@@ -1484,7 +1678,7 @@ export default Plugin.define({
         add({
           name: "group_chat",
           description:
-            "开关 QQ 群聊功能。enabled=true 开启，false 关闭。写入 qq-bridge.json 的 group.enabled，桥接会实时读取，不需要重启。",
+            "开关 QQ 群聊功能。enabled=true 开启，false 关闭。写入 life-world.json 的 bridge.group.enabled，桥接会实时读取，不需要重启。",
           input: {
             type: "object",
             properties: { enabled: { type: "boolean", description: "true 开启，false 关闭" } },
@@ -1492,10 +1686,9 @@ export default Plugin.define({
           execute: async (input: any) => {
             if (typeof input?.enabled !== "boolean") return ok("请传 enabled: true 或 false。")
             try {
-              const data = JSON.parse(readFileSync(BRIDGE_CONFIG_FILE, "utf8")) as any
-              data.group = data.group || {}
-              data.group.enabled = input.enabled
-              atomicWrite(BRIDGE_CONFIG_FILE, JSON.stringify(data, null, 2), 0o600)
+              const config = readConfig()
+              config.bridge.group = { ...(config.bridge.group ?? {}), enabled: input.enabled }
+              writeConfig(config)
               log(`group_chat · ${input.enabled ? "on" : "off"}`)
               return ok(`QQ 群聊已${input.enabled ? "开启" : "关闭"}。`)
             } catch (error) {
@@ -1612,9 +1805,10 @@ export default Plugin.define({
           // 发送成功才清，失败留在原地下轮重试，别静默吞掉。
           const stale: Alarm[] = []
           const onTime: Alarm[] = []
+          const staleMs = readConfig().world.alarmStaleHours * 3_600_000
           for (const alarm of due) {
             const at = Date.parse(alarm.at)
-            if (Number.isFinite(at) && Date.now() - at > ALARM_STALE_MS) stale.push(alarm)
+            if (Number.isFinite(at) && Date.now() - at > staleMs) stale.push(alarm)
             else onTime.push(alarm)
           }
           for (const alarm of onTime) {

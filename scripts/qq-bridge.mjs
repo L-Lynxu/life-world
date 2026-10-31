@@ -19,6 +19,8 @@ import { homedir } from "node:os"
 import { dirname, join } from "node:path"
 
 const HOME = homedir()
+const LIFEWORLD_CONFIG_FILE = join(HOME, ".config/opencode/life-world.json")
+/** 旧桥接配置：新 life-world.json 没有 bridge 时兜底 */
 const CONFIG_FILE = join(HOME, ".config/opencode/qq-bridge.json")
 const STATE_FILE = join(HOME, ".local/share/life-world/qq-bridge-state.json")
 const OUTBOX_DIR = join(HOME, ".local/share/life-world/worlds/default/outbox")
@@ -38,6 +40,12 @@ function log(...args) {
 function readJson(file, fallback) {
   try { return JSON.parse(readFileSync(file, "utf8")) } catch { return fallback }
 }
+/** 新 life-world.json 优先；旧 qq-bridge.json 只作兜底。升级后重启桥接即可切到新文件。 */
+function readBridgeConfig() {
+  const live = readJson(LIFEWORLD_CONFIG_FILE, null)
+  if (live?.bridge && typeof live.bridge === "object") return live.bridge
+  return readJson(CONFIG_FILE, null)
+}
 function writeJson(file, data) {
   try {
     mkdirSync(dirname(file), { recursive: true })
@@ -49,8 +57,8 @@ function writeJson(file, data) {
 const dayOf = (d = new Date()) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`
 
-const config = readJson(CONFIG_FILE, null)
-if (!config) { log("config missing", CONFIG_FILE); process.exit(1) }
+const config = readBridgeConfig()
+if (!config) { log("config missing", LIFEWORLD_CONFIG_FILE); process.exit(1) }
 if (config.enabled !== true) { log("disabled, exit"); process.exit(0) }
 
 let service = readJson(SERVICE_FILE, null)
@@ -74,15 +82,16 @@ function reloadService() {
 
 const ownerQQ = Number(config.ownerQQ)
 if (!ownerQQ) { log("ownerQQ missing"); process.exit(1) }
-/** 实时读配置：运行中改了 private.sessionTitle，新会话用它建，不用重启桥接 */
+/** 实时读配置：运行中改了 privateSessionTitle，新会话用它建，不用重启桥接 */
 const privateTitle = () => {
-  const title = readJson(CONFIG_FILE, config)?.private?.sessionTitle
+  const live = readBridgeConfig()
+  const title = live?.privateSessionTitle ?? live?.private?.sessionTitle
   // 与插件 qqPrivateTitle() 同口径：首尾空白去掉，空串/非字符串回落默认
   return typeof title === "string" && title.trim() ? title.trim() : "qq-chat"
 }
 const location = config.location || HOME
-const wsUrl = config.napcat?.wsUrl || "ws://127.0.0.1:3001"
-const wsToken = config.napcat?.token || ""
+const wsUrl = config.wsUrl || config.napcat?.wsUrl || "ws://127.0.0.1:3001"
+const wsToken = config.token || config.napcat?.token || ""
 
 mkdirSync(JUDGE_DIR, { recursive: true })
 let state = readJson(STATE_FILE, {})
@@ -354,8 +363,8 @@ const groupRunWindows = new Map()
 
 function groupCfg() {
   // 实时读配置：group_chat 工具改 enabled 后不用重启桥接
-  const live = readJson(CONFIG_FILE, config)
-  return live.group || {}
+  const live = readBridgeConfig()
+  return live?.group || {}
 }
 let lastGroupEnabled = null
 function groupEnabled() {
