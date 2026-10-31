@@ -1,6 +1,7 @@
 # life-world
 
 > 本插件在 [dsh-world](https://github.com/chenkezhen480/dsh-world) 的基础上改造而来，感谢原作者。
+> 本插件的代码由 **DeepSeek** 编写，感谢它的辛勤付出。
 
 给 [opencode](https://opencode.ai) v2 里的陪伴角色一个会记得、会生活的世界：跨会话记忆、自己的时间、每日回顾、心情状态、颜文字和真实浏览器。
 
