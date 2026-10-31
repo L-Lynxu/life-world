@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * life-world · NapCat QQ bridge (optional)
+ * life-world · OneBot QQ bridge (optional)
  *
  * 单向说明：
  *   - 只处理私聊；群聊暂不处理（group.enabled 关闭）。
@@ -181,7 +181,7 @@ async function deletePrivate() {
   log("deleted private session", id)
 }
 
-// ———————————————————————— NapCat WebSocket ————————————————————————
+// ———————————————————————— OneBot WebSocket ————————————————————————
 let ws = null
 let wsReady = false
 /** 本次连接开始握手的时间；看门狗据此避免把还没超时的 CONNECTING 反复掐掉 */
@@ -1004,9 +1004,9 @@ setInterval(() => {
     state.lastSeen = new Date().toISOString()
     saveState()
   } else {
-    // 看门狗：断着就提醒重连（NapCat 重启、网络恢复后能自己回来）。
+    // 看门狗：断着就提醒重连（OneBot 服务端重启、网络恢复后能自己回来）。
     // 但握手还没到 60 秒时不要动：15 秒看门狗 + 5 秒重连会把慢握手反复掐断，
-    // 远端 NapCat、慢 DNS 或 TLS 抖动时会变成永远连不上。
+    // 远端服务端、慢 DNS 或 TLS 抖动时会变成永远连不上。
     if (connectingSince && Date.now() - connectingSince < 60_000) return
     scheduleReconnect("watchdog")
   }
@@ -1017,7 +1017,7 @@ if (process.argv[2] === "--test-send") {
   const timer = setInterval(async () => {
     if (!wsReady) return
     clearInterval(timer)
-    const text = process.argv[3] || "NapCat 桥接测试：已连接到 QQ。"
+    const text = process.argv[3] || "OneBot 桥接测试：已连接到 QQ。"
     try {
       const ok = await sendPrivate(text)
       log("test send", ok ? "ok" : "failed")

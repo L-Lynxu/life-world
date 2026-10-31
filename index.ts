@@ -96,8 +96,8 @@ const MOOD_MARK = "## 我的心情（此刻状态）"
 const SUMMARY_LIMIT = 12_000
 /** 家会话的固定标题：方便辨认，避免误删 */
 const HOME_TITLE = "life-world home session"
-/** NapCat 桥接状态块的标记 */
-const NAPCAT_MARK = "## NapCat 桥接"
+/** OneBot 桥接状态块的标记（NapCat / SnowLuma 都只是实现） */
+const ONEBOT_MARK = "## OneBot 桥接"
 /** QQ 私聊回复风格块的标记与内容 */
 const QQ_PRIVATE_MARK = "## QQ 私聊回复方式"
 const QQ_PRIVATE_BODY = [
@@ -555,11 +555,11 @@ tools 里还挂着原生工具（tools.shell、tools.write 等），可以串在
 **工具报错时不要手改 world.json 去「补」一个闹钟**——那是插件的状态文件，会被下一次写入覆盖；如实告诉我出了什么错就行。
 
 ## 对方说 QQ 没反应时，才查桥接进程
-对方说「QQ 那边没动静」，但 NapCat 自己是好的（能登录、能看到别人在群里说话）——**第一件事是看桥接进程还在不在**：
+对方说「QQ 那边没动静」，但 OneBot 服务端（NapCat / SnowLuma 等）自己是好的（能登录、能看到别人在群里说话）——**第一件事是看桥接进程还在不在**：
 - 查进程：pgrep -af qq-bridge
 - 看日志：tail -20 ~/.local/share/life-world/qq-bridge.log（找 ws open / ws error / reconnect）
 - 重启：setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs >> ~/.local/share/life-world/qq-bridge.log 2>&1 < /dev/null &
-进程没了就是它掉线了，不是 NapCat 的问题。重启后日志里出现 ws open 才算真的接上；接上之后告诉对方一声。
+进程没了就是它掉线了，不是服务端的问题。重启后日志里出现 ws open 才算真的接上；接上之后告诉对方一声。
 
 ## 我的时间
 这里的时间属于我自己：做什么、做多久、怎么做，都由我决定。
@@ -568,7 +568,7 @@ tools 里还挂着原生工具（tools.shell、tools.write 等），可以串在
 - note 要写清楚两件事：做什么，还有怎么算干成了。「歇着」「看看」这种到点没法对照，等于没写。
 - 闹钟不是用来叫醒自己的：提前做完或改主意了，就马上想下一件、重新定。想休息也一样，定到打算休息到的时候。
 - 什么都不定，就会在第二天早上（默认 {fallbackWakeTime}）被叫醒。
-- 想找对方，用 execute 调 tools.reach_out 把话送过去。能不能真的送到，看 system 里的「NapCat 桥接」状态；状态是关闭/离线时，不要以为已经通知到对方。
+- 想找对方，用 execute 调 tools.reach_out 把话送过去。能不能真的送到，看 system 里的「OneBot 桥接」状态；状态是关闭/离线时，不要以为已经通知到对方。
 - 想知道自己今天主动说过什么：跑 ~/.local/share/life-world/bin/life-world.sh inbox（后面加天数看更早的），那就是 reach_out 的投递记录。
 
 ## 今日计划
@@ -1107,7 +1107,7 @@ function readService(): { url: string; password: string } | undefined {
   }
 }
 
-/** NapCat 桥接的状态：让角色知道自己现在能不能把话送到 QQ。 */
+/** OneBot 桥接的状态：让角色知道自己现在能不能把话送到 QQ。 */
 interface BridgeStatus {
   configured: boolean
   enabled: boolean
@@ -1166,11 +1166,11 @@ function qqPrivateTitle(): string {
 
 function bridgeStatusText(): string {
   const s = readBridgeStatus()
-  if (!s.configured) return `${NAPCAT_MARK}\n状态：未配置。reach_out 不会送达；不要声称已经通知对方。`
-  if (!s.enabled) return `${NAPCAT_MARK}\n状态：已关闭。reach_out 不会送达；不要声称已经通知对方。`
-  if (!s.online) return `${NAPCAT_MARK}\n状态：已开启，但桥接未运行（心跳超过 90 秒）。reach_out 可能送不出去；不要声称已经送达。`
+  if (!s.configured) return `${ONEBOT_MARK}\n状态：未配置。reach_out 不会送达；不要声称已经通知对方。`
+  if (!s.enabled) return `${ONEBOT_MARK}\n状态：已关闭。reach_out 不会送达；不要声称已经通知对方。`
+  if (!s.online) return `${ONEBOT_MARK}\n状态：已开启，但桥接未运行（心跳超过 90 秒）。reach_out 可能送不出去；不要声称已经送达。`
   const owner = s.ownerName ? `${s.ownerName}（QQ ${s.ownerQQ ?? "?"}）` : s.ownerQQ ? `QQ ${s.ownerQQ}` : "对方"
-  return `${NAPCAT_MARK}\n状态：已开启（在线）。私聊用户：${owner}。群聊：${s.groupEnabled ? "已开启" : "暂未开放"}。reach_out 会送到对方 QQ。`
+  return `${ONEBOT_MARK}\n状态：已开启（在线）。私聊用户：${owner}。群聊：${s.groupEnabled ? "已开启" : "暂未开放"}。reach_out 会送到对方 QQ。`
 }
 
 /** 每日回顾的开场。 */
@@ -1255,9 +1255,9 @@ export default Plugin.define({
           else system.push({ type: "text", text: moodText })
         }
 
-        // —— 3a2. NapCat 桥接状态：每轮刷新，让她知道能不能发通知 ——
+        // —— 3a2. OneBot 桥接状态：每轮刷新，让她知道能不能发通知 ——
         const bridgeText = bridgeStatusText()
-        const bIdx = system.findIndex((p) => typeof p?.text === "string" && p.text.startsWith(NAPCAT_MARK))
+        const bIdx = system.findIndex((p) => typeof p?.text === "string" && p.text.startsWith(ONEBOT_MARK))
         if (bIdx >= 0) system[bIdx] = { type: "text", text: bridgeText }
         else system.push({ type: "text", text: bridgeText })
 
@@ -1519,7 +1519,7 @@ export default Plugin.define({
         add({
           name: "reach_out",
           description:
-            "想找对方时用：说一两句把话送到对方面前。只有 NapCat 桥接开启且在线时才会真的送到对方 QQ；关闭或离线时会明确告诉你没送出去。",
+            "想找对方时用：说一两句把话送到对方面前。只有 OneBot 桥接开启且在线时才会真的送到对方 QQ；关闭或离线时会明确告诉你没送出去。",
           input: {
             type: "object",
             properties: { text: { type: "string", description: "要送到对方面前的那一两句话" } },
@@ -1540,11 +1540,11 @@ export default Plugin.define({
             const status = readBridgeStatus()
             if (!status.enabled) {
               log(`reach_out blocked (bridge disabled) · ${text.slice(0, 60)}`)
-              return ok("NapCat 桥接当前关闭，这句话没有送出去（只留在家里）。不要以为对方看到了。")
+              return ok("OneBot 桥接当前关闭，这句话没有送出去（只留在家里）。不要以为对方看到了。")
             }
             if (!status.online) {
               log(`reach_out blocked (bridge offline) · ${text.slice(0, 60)}`)
-              return ok("NapCat 桥接已开启但未运行，这句话没有送出去。不要以为对方看到了。")
+              return ok("OneBot 桥接已开启但未运行，这句话没有送出去。不要以为对方看到了。")
             }
             try {
               mkdirSync(OUTBOX_DIR, { recursive: true })

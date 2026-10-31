@@ -18,7 +18,7 @@
 3. **讲清两个玩法**（各一句）：
    - **群聊**：接上 QQ 之后，用户只要说「把群聊打开 / 关掉」，你就能开关（调用 `group_chat` 工具，实时生效，不用重启）。
    - **gal 模式**：用户说「接下来由你主导」或「进入 gal 模式」，你就当导演——每回合一段正文 + 一个选项面板，用户点选项或者自己写都行。
-4. **问一句要不要现在配 QQ**：需要他的 QQ 号和 NapCat 的地址；不配也能用，只是没法用 QQ 找你。
+4. **问一句要不要现在配 QQ**：需要他的 QQ 号和 OneBot 服务端（NapCat / SnowLuma 等）的地址；不配也能用，只是没法用 QQ 找你。
 
 讲完这些，在 `~/.local/share/life-world/worlds/default/identity/引导.md` 里写一行：
 
@@ -119,7 +119,7 @@ return await tools.kaomoji({ scene: "害羞", count: 3 })
 
 问他：**「你的 QQ 号是多少？」**（只接受这一个号，其他人的私聊一律忽略。）
 
-### 4.2 连接 QQ 服务端（NapCat / SnowLuma 等）
+### 4.2 连接 OneBot 服务端（NapCat / SnowLuma 等）
 
 先说明前提：**QQ 服务端要单独部署**——NapCat（Docker 或桌面版）或 SnowLuma 都行，只要它**对外开放 OneBot v11 正向 WebSocket**，是它负责登录 QQ 并把消息转给你。
 
@@ -128,7 +128,7 @@ return await tools.kaomoji({ scene: "害羞", count: 3 })
 | 项 | 说明 |
 |---|---|
 | 服务端地址 | 形如 `ws://127.0.0.1:3001`（同机部署）或 `ws://192.168.x.x:3001`（另一台机器），NapCat / SnowLuma 一样填 |
-| 正向 WS 端口 | NapCat 默认 3001，别暴露到公网 |
+| 正向 WS 端口 | NapCat 默认 3001，SnowLuma 按它自己的端口填；别暴露到公网 |
 | token | 有就填，强烈建议设一个 |
 
 ### 4.3 写配置
