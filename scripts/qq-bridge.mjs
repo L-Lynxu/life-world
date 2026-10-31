@@ -798,6 +798,36 @@ async function pollPrivate() {
 
 // ———————————————————————— outbox -> QQ ————————————————————————
 let outboxBusy = false
+/** 补发范围：最近几天（跨天离线后也能补上） */
+const OUTBOX_DAYS = 3
+
+function outboxFile(day) {
+  return join(OUTBOX_DIR, `${day}.jsonl`)
+}
+
+/** outbox 游标按天存；兼容旧的 { file, offset } 结构 */
+function outboxOffsets() {
+  if (!state.outbox || !state.outbox.offsets) {
+    const offsets = {}
+    const prev = state.outbox || {}
+    const day = String(prev.file || "").match(/(\d{4}-\d{2}-\d{2})\.jsonl/)
+    if (day) offsets[day[1]] = Number(prev.offset) || 0
+    state.outbox = { offsets, since: new Date().toISOString() }
+    saveState()
+  }
+  return state.outbox.offsets
+}
+
+function recentDays(n) {
+  const out = []
+  for (let i = n - 1; i >= 0; i -= 1) {
+    const d = new Date()
+    d.setDate(d.getDate() - i)
+    out.push(dayOf(d))
+  }
+  return out
+}
+
 async function pollOutbox() {
   if (outboxBusy) return
   outboxBusy = true
@@ -809,62 +839,85 @@ async function pollOutbox() {
       log("run window timeout, flush reaches", buffered.length)
       if (buffered.length) await sendPrivate(buffered.join("\n"))
     }
-    const file = join(OUTBOX_DIR, `${dayOf()}.jsonl`)
-    if (!existsSync(file)) {
-      if (state.outbox && state.outbox.file !== file) { state.outbox = { file, offset: 0 }; saveState() }
-      return
-    }
-    const buf = readFileSync(file)
-    if (!state.outbox || state.outbox.file !== file) {
-      state.outbox = { file, offset: buf.length }
-      saveState()
-      log("outbox baseline", file, buf.length)
-      return
-    }
-    if (buf.length <= state.outbox.offset) return
-    const chunk = buf.subarray(state.outbox.offset).toString("utf8")
-    const lines = chunk.split("\n")
-    lines.pop() // 最后一段可能是半行，留到下次
-    let consumed = 0
-    for (const line of lines) {
-      const bytes = Buffer.byteLength(line + "\n")
-      if (!line.trim()) { consumed += bytes; continue }
-      let item
-      try { item = JSON.parse(line) } catch { consumed += bytes; continue }
-      if (item.kind !== "reach" || !item.text) { consumed += bytes; continue }
-      // 群聊运行期间产生的 reach_out：不能发到私聊，跳过
-      const ts = Date.parse(item.t || "")
-      let inGroupRun = false
-      for (const w of groupRunWindows.values()) {
-        if (Number.isFinite(ts) && ts >= w.start - 2000 && ts <= (w.end || Date.now()) + 2000) { inGroupRun = true; break }
-      }
-      if (inGroupRun) {
-        log("suppress reach_out during group run", item.text.slice(0, 30))
-        consumed += bytes
-        continue
-      }
-      if (runWindow && Number.isFinite(ts) && ts >= runWindow.start - 2000 && ts <= (runWindow.end || Date.now()) + 2000) {
-        if (!runWindow.end) {
-          runWindow.reaches.push(item.text)
-          log("buffer reach_out during qq-chat run", item.text.slice(0, 30))
-        } else {
-          log("suppress reach_out during qq-chat run", item.text.slice(0, 30))
+
+    const offsets = outboxOffsets()
+    for (const day of recentDays(OUTBOX_DAYS)) {
+      const file = outboxFile(day)
+      if (!existsSync(file)) continue
+      const buf = readFileSync(file)
+      let offset = offsets[day]
+      if (offset === undefined) {
+        if (day === dayOf(new Date())) {
+          // 今天的新文件：从头读
+          offsets[day] = 0
+          saveState()
+          continue
         }
-        consumed += bytes
+        // 更早的文件：只补「升级之后才写进去」的条目，旧内容当作已处理
+        const since = Date.parse(state.outbox.since || "") || 0
+        const text = buf.toString("utf8")
+        let pos = 0
+        let firstPos = -1
+        for (const line of text.split("\n")) {
+          if (line.trim()) {
+            try {
+              const j = JSON.parse(line)
+              const t = Date.parse(j.t || "")
+              if (Number.isFinite(t) && t >= since) { firstPos = pos; break }
+            } catch { /* 坏行跳过 */ }
+          }
+          pos += Buffer.byteLength(line + "\n")
+        }
+        offsets[day] = firstPos >= 0 ? firstPos : buf.length
+        saveState()
+        log("outbox baseline", day, offsets[day], firstPos >= 0 ? "will catch up" : "skip history")
         continue
       }
-      const id = await ensurePrivate()
-      if (!id) break
-      await api(`/api/session/${id}/synthetic`, {
-        method: "POST",
-        body: JSON.stringify({ text: item.text, description: "reach_out", resume: false }),
-      }).catch(() => {})
-      const ok = await sendPrivate(item.text)
-      if (!ok) break
-      consumed += bytes
+      if (buf.length <= offset) continue
+      const chunk = buf.subarray(offset).toString("utf8")
+      const lines = chunk.split("\n")
+      lines.pop() // 最后一段可能是半行，留到下次
+      let consumed = 0
+      let blocked = false
+      for (const line of lines) {
+        const bytes = Buffer.byteLength(line + "\n")
+        if (!line.trim()) { consumed += bytes; continue }
+        let item
+        try { item = JSON.parse(line) } catch { consumed += bytes; continue }
+        if (item.kind !== "reach" || !item.text) { consumed += bytes; continue }
+        // 群聊运行期间产生的 reach_out：不能发到私聊，跳过
+        const ts = Date.parse(item.t || "")
+        let inGroupRun = false
+        for (const w of groupRunWindows.values()) {
+          if (Number.isFinite(ts) && ts >= w.start - 2000 && ts <= (w.end || Date.now()) + 2000) { inGroupRun = true; break }
+        }
+        if (inGroupRun) {
+          if (runWindow && !runWindow.end) {
+            runWindow.reaches.push(item.text)
+            log("buffer reach_out during qq-chat run", item.text.slice(0, 30))
+          } else {
+            log("suppress reach_out during qq-chat run", item.text.slice(0, 30))
+          }
+          consumed += bytes
+          continue
+        }
+        const id = await ensurePrivate()
+        if (!id) { blocked = true; break }
+        await api(`/api/session/${id}/synthetic`, {
+          method: "POST",
+          body: JSON.stringify({ text: item.text, description: "reach_out", resume: false }),
+        }).catch(() => {})
+        const ok = await sendPrivate(item.text)
+        if (!ok) { blocked = true; break }
+        consumed += bytes
+      }
+      if (consumed > 0) {
+        offsets[day] = offset + consumed
+        saveState()
+        if (day !== dayOf(new Date())) log("outbox catch-up", day, consumed)
+      }
+      if (blocked) break // 发不出去就停，下次再试（游标没推进的部分会重试）
     }
-    state.outbox = { file, offset: state.outbox.offset + consumed }
-    saveState()
   } catch (error) {
     log("outbox failed", String(error))
   } finally {
