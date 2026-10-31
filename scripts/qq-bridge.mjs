@@ -548,15 +548,16 @@ async function runJudge(groupId, batch) {
   const res = await apiJson("/api/session", { method: "POST", body: JSON.stringify(body) })
   const sid = res.data?.data?.id
   if (!sid) { log("judge create failed", res.status, JSON.stringify(res.data).slice(0, 160)); return "SKIP" }
-  writeJson(JUDGE_SESSION_FILE, { id: sid })
-  // 新路径写失败（磁盘满/权限）就别发判官的私密 prompt 了：
-  // 旧插件只认这个路径，漏了标记等于把私密上下文发给判官模型。
-  if (readJson(JUDGE_SESSION_FILE, null)?.id !== sid) {
-    log("judge mark write failed, skip judge")
-    return "SKIP"
-  }
-  writeJson(LEGACY_JUDGE_SESSION_FILE, { id: sid })
   try {
+    writeJson(JUDGE_SESSION_FILE, { id: sid })
+    // 新路径写失败/读回不匹配（磁盘满、权限、被另一实例覆盖）就别发判官的私密 prompt 了：
+    // 旧插件只认这个路径，漏了标记等于把私密上下文发给判官模型。
+    // 放在 try 里，失败时也走 finally 删判官会话和两个标记文件。
+    if (readJson(JUDGE_SESSION_FILE, null)?.id !== sid) {
+      log("judge mark verify failed, skip judge")
+      return "SKIP"
+    }
+    writeJson(LEGACY_JUDGE_SESSION_FILE, { id: sid })
     await api(`/api/session/${sid}/prompt`, { method: "POST", body: JSON.stringify({ text: buildJudgePrompt(groupId, batch) }) })
     const deadline = Date.now() + (Number(cfg.judgeTimeoutMs) || 60000)
     while (Date.now() < deadline) {
