@@ -168,6 +168,8 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 
 主文件里留一行指针即可；世界提示词里也写了这条规则，角色会自己维护。
 
+硬限制：`我是谁.md` 主文件不超过 500 字；`心情.md` 每条状态只写状态名、设置时间、持续时间、不超过 15 个字的行为特点，不写详细描述。
+
 ## 配置（`world.json`）
 
 ```json
