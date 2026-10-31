@@ -26,7 +26,7 @@
 | **gal 模式（强制模式）** | 纯提示词：她当导演，每回合「一段叙事正文 + 一次 `question` 单选闸门」；只在对方要求由她主导时进入 |
 | 家会话自愈 | 家会话缺失时，服务进程自动重启 tmux 并重建；标题固定 `life-world home session` |
 | 真实浏览器 | `scripts/browser-*` 开带调试口的 Chrome、读浏览历史、关掉 |
-| QQ 桥接（可选） | `scripts/qq-bridge.mjs`：NapCat 私聊 ↔ `qq-chat` 会话；每行一条消息、真人节奏；开关状态会注入给角色 |
+| QQ 桥接（可选） | `scripts/qq-bridge.mjs`：接任意 **OneBot v11 正向 WebSocket**（NapCat、SnowLuma 等）↔ `qq-chat` 会话；每行一条消息、真人节奏；开关状态会注入给角色 |
 | **主动消息 outbox** | `reach_out` 写 `outbox/YYYY-MM-DD.jsonl`；桥接每 2 秒投递，**断线/跨天后自动补发最近 3 天未送出的**；`bin/life-world.sh inbox [天数]` 可回看她主动说过什么 |
 | 压缩 | 只保留对话正文，去掉工具调用过程 |
 | 初次引导 | 首次启用时自己读 `GUIDE.md`：介绍能力、问要不要接 QQ、引导配置 |
@@ -78,9 +78,9 @@ opencode service restart
 
 > QQ 桥接是独立进程，不跟着开关走；要一起停得单独停桥接。
 
-## 可选：QQ 桥接（NapCat）
+## 可选：QQ 桥接（OneBot v11 正向 WS）
 
-`scripts/qq-bridge.mjs` 是一条可选的 QQ 私聊通道：NapCat 正向 WS → 桥接 → `qq-chat` 会话；角色回复后，桥接把最后一条 assistant 文本发回 QQ。
+`scripts/qq-bridge.mjs` 是一条可选的 QQ 通道：**任意实现了 OneBot v11 正向 WebSocket 的服务端**都可以——NapCat、SnowLuma 等都行，只要它对外开放（正向）WS 服务器，把地址填进配置即可。链路是：QQ 服务端 WS → 桥接 → `qq-chat` 会话；角色回复后，桥接把最后一条 assistant 文本发回 QQ。
 
 当前只做私聊；群聊默认关闭。
 
@@ -99,7 +99,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 |---|---|
 | `enabled` | 总开关；life-world 会把状态注入 system，关闭时 `reach_out` 不会写 outbox |
 | `ownerQQ` | 唯一允许的私聊用户，也是通知目标 |
-| `napcat.wsUrl` / `token` | NapCat 正向 WS 地址与 access token |
+| `napcat.wsUrl` / `token` | 正向 WS 地址与 token（NapCat、SnowLuma 等通用；字段名沿用 napcat 是历史原因） |
 | `group.enabled` | 群聊开关，默认 `false`；角色也能用 `group_chat` 工具实时开关 |
 
 - `/new`：删除 `qq-chat`，下一条消息或她的 `reach_out` 再新建。
