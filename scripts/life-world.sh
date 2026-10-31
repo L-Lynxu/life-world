@@ -42,7 +42,7 @@ write_enabled() { # $1 = true | false
     try { s = JSON.parse(fs.readFileSync(p, "utf8")) } catch {}
     s.enabled = on
     fs.mkdirSync(path.dirname(p), { recursive: true })
-    const tmp = p + ".tmp"
+    const tmp = p + "." + process.pid + ".tmp"
     fs.writeFileSync(tmp, JSON.stringify(s, null, 2))
     fs.renameSync(tmp, p)
   ' "$WORLD" "$1"

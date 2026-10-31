@@ -22,7 +22,7 @@ const HOME = homedir()
 const CONFIG_FILE = join(HOME, ".config/opencode/qq-bridge.json")
 const STATE_FILE = join(HOME, ".local/share/life-world/qq-bridge-state.json")
 const OUTBOX_DIR = join(HOME, ".local/share/life-world/worlds/default/outbox")
-const JUDGE_SESSION_FILE = join(HOME, ".local/share/life-world/qq-judge-session.json")
+const JUDGE_SESSION_FILE = join(HOME, ".local/share/life-world/worlds/default/qq-judge-session.json")
 const JUDGE_DIR = join(HOME, ".local/share/life-world/qq-judge")
 const GROUP_TMP_DIR = join(HOME, ".local/share/life-world/tmp")
 const LOG_FILE = join(HOME, ".local/share/life-world/qq-bridge.log")
@@ -39,7 +39,7 @@ function readJson(file, fallback) {
 function writeJson(file, data) {
   try {
     mkdirSync(dirname(file), { recursive: true })
-    const tmp = `${file}.tmp`
+    const tmp = `${file}.${process.pid}.tmp`
     writeFileSync(tmp, JSON.stringify(data, null, 2))
     renameSync(tmp, file)
   } catch (error) { log("write state failed", String(error)) }
@@ -72,7 +72,8 @@ function reloadService() {
 
 const ownerQQ = Number(config.ownerQQ)
 if (!ownerQQ) { log("ownerQQ missing"); process.exit(1) }
-const sessionTitle = config.private?.sessionTitle || "qq-chat"
+/** 实时读配置：运行中改了 private.sessionTitle，新会话用它建，不用重启桥接 */
+const privateTitle = () => readJson(CONFIG_FILE, config)?.private?.sessionTitle || "qq-chat"
 const location = config.location || HOME
 const wsUrl = config.napcat?.wsUrl || "ws://127.0.0.1:3001"
 const wsToken = config.napcat?.token || ""
@@ -140,7 +141,7 @@ async function ensurePrivate() {
   }
   const res = await apiJson("/api/session", {
     method: "POST",
-    body: JSON.stringify({ title: sessionTitle, location: { directory: location } }),
+    body: JSON.stringify({ title: privateTitle(), location: { directory: location } }),
   })
   const id = res.data?.data?.id
   if (!id) { log("create session failed", res.status, JSON.stringify(res.data).slice(0, 200)); return undefined }
@@ -193,18 +194,29 @@ function scheduleReconnect(reason) {
 
 function connect() {
   const url = wsToken ? `${wsUrl}?access_token=${encodeURIComponent(wsToken)}` : wsUrl
-  ws = new WebSocket(url)
-  ws.addEventListener("open", () => {
+  // 先把旧连接摘掉再关：旧 socket 的 close 处理器用 ws !== socket 做代际判断，
+  // 摘掉之后它不会再把新连接的状态打掉，也不会排多余的重连。
+  const previous = ws
+  ws = null
+  if (previous) { try { previous.close() } catch { /* 已经关了 */ } }
+  // 新 socket 还没 open 的这段时间里，call() 不能拿旧连接的 wsReady 往 CONNECTING 的 socket 上发消息。
+  wsReady = false
+  const socket = new WebSocket(url)
+  ws = socket
+  socket.addEventListener("open", () => {
+    if (ws !== socket) return
     wsReady = true
     state.lastSeen = new Date().toISOString()
     saveState()
     log("ws open", wsUrl)
   })
-  ws.addEventListener("close", () => {
+  socket.addEventListener("close", () => {
+    if (ws !== socket) return
     wsReady = false
     scheduleReconnect("close")
   })
-  ws.addEventListener("error", (event) => {
+  socket.addEventListener("error", (event) => {
+    if (ws !== socket) return
     log("ws error", event?.message || "")
     // 不在这里调 ws.close()：对没建立起来的连接，close() 会同步再触发 error，
     // 每 5 秒一次的重连就会变成每秒上百条错误的风暴。
@@ -212,7 +224,8 @@ function connect() {
     wsReady = false
     scheduleReconnect("error")
   })
-  ws.addEventListener("message", (event) => {
+  socket.addEventListener("message", (event) => {
+    if (ws !== socket) return
     let msg
     try { msg = JSON.parse(event.data) } catch { return }
     if (msg.echo && pending.has(msg.echo)) {
@@ -385,7 +398,7 @@ function getGroupState(groupId) {
   const key = String(groupId)
   let st = groupStates.get(key)
   if (!st) {
-    st = { key, buffer: [], timer: null, firstAt: 0, lastReplyAt: 0, replies: [], sessionId: state.groups?.[key] || "", lastIdle: 0, lastAssistantId: "", waitSince: 0, baseSet: false }
+    st = { key, buffer: [], timer: null, firstAt: 0, lastReplyAt: 0, replies: [], sessionId: state.groups?.[key] || "", lastIdle: 0, lastAssistantId: "", waitSince: 0, baseSet: false, busy: false, pending: false }
     groupStates.set(key, st)
   }
   return st
@@ -495,6 +508,14 @@ function buildJudgePrompt(groupId, batch) {
     "- 如果 bot 刚说过话、或这条不需要它接 → SKIP。",
   ].join("\n")
 }
+/** 判官全局串行：JUDGE_SESSION_FILE 是单文件，两个群同时判官会互删对方的 id */
+let judgeChain = Promise.resolve()
+function withJudgeLock(fn) {
+  const run = judgeChain.then(fn, fn)
+  judgeChain = run.catch(() => {})
+  return run
+}
+
 async function runJudge(groupId, batch) {
   const cfg = groupCfg()
   const judgeModel = String(cfg.judgeModel || "default")
@@ -600,6 +621,28 @@ async function processGroup(groupId) {
   const st = getGroupState(key)
   st.timer = null
   st.firstAt = 0
+  // 判官/发消息还没收尾：这一轮记成待办，收尾后再跑。
+  // 不拦的话，判官等待期间来的新消息会让同一批 buffer 被并发送两次，
+  // 既会重复回复，也会让两个判官会话互删 JUDGE_SESSION_FILE。
+  if (st.busy) {
+    st.pending = true
+    return
+  }
+  st.busy = true
+  try {
+    await processGroupNow(key)
+  } finally {
+    st.busy = false
+    if (st.pending) {
+      st.pending = false
+      const fresh = st.buffer.filter((m) => !m.recorded)
+      if (fresh.length && groupEnabled()) scheduleGroup(key, fresh.some((m) => m.trigger))
+    }
+  }
+}
+
+async function processGroupNow(key) {
+  const st = getGroupState(key)
   if (!groupEnabled() || st.buffer.length === 0) return
   const cfg = groupCfg()
   const now = Date.now()
@@ -631,7 +674,7 @@ async function processGroup(groupId) {
     await recordGroupContext(key, batch)
     return
   }
-  const verdict = await runJudge(key, batch)
+  const verdict = await withJudgeLock(() => runJudge(key, batch))
   if (verdict !== "REPLY") {
     // 被点名还被判官拦下：单独记一笔，方便回头调判官提示词
     if (triggered) log("judge SKIP on triggered batch", { messages: batch.length })
@@ -710,7 +753,9 @@ function scheduleGroup(groupId, trigger) {
   const maxWait = cfg.maxBatchWaitMs ?? 60000
   const delay = Math.max(0, Math.min(base, maxWait - elapsed))
   clearTimeout(st.timer)
-  st.timer = setTimeout(() => processGroup(groupId), delay)
+  st.timer = setTimeout(() => {
+    processGroup(groupId).catch((error) => log("group process failed", String(error)))
+  }, delay)
 }
 async function handleGroup(msg) {
   log("group event", JSON.stringify({ enabled: groupEnabled(), group: msg.group_id, user: msg.user_id, self: msg.self_id, text: groupText(msg).slice(0, 60) }))
@@ -965,5 +1010,5 @@ if (process.argv[2] === "--test-send") {
   setInterval(pollPrivate, 1500)
   setInterval(pollGroups, 1500)
   setInterval(pollOutbox, 2000)
-  log("bridge started", { ownerQQ, sessionTitle, wsUrl, group: config.group?.enabled === true })
+  log("bridge started", { ownerQQ, sessionTitle: privateTitle(), wsUrl, group: config.group?.enabled === true })
 }

@@ -1,5 +1,5 @@
 import { Plugin } from "@opencode/plugin"
-import { appendFileSync, closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { appendFileSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -133,6 +133,27 @@ function log(text: string): void {
     appendFileSync(LOG_FILE, `${new Date().toISOString()} ${text}\n`)
   } catch {
     // 日志失败不影响请求
+  }
+}
+
+/**
+ * 原子写：唯一临时名 + fsync + rename。
+ * 临时名带 pid 和随机串，避免两个进程（工具写 / 定时器写）撞同一个 tmp 互相覆盖。
+ */
+function atomicWrite(path: string, text: string, mode?: number): void {
+  const tmp = `${path}.${process.pid}.${Math.random().toString(36).slice(2, 8)}.tmp`
+  try {
+    const fd = openSync(tmp, "w", mode)
+    try {
+      writeFileSync(fd, text)
+      try { fsyncSync(fd) } catch { /* 某些文件系统不支持 fsync */ }
+    } finally {
+      closeSync(fd)
+    }
+    renameSync(tmp, path)
+  } catch (error) {
+    try { unlinkSync(tmp) } catch { /* 临时文件可能还没建出来 */ }
+    throw error
   }
 }
 
@@ -816,11 +837,7 @@ function readWorld(): WorldState {
 function writeWorld(state: WorldState): void {
   try {
     mkdirSync(WORLD, { recursive: true })
-    // 原子写：先写临时文件再 rename，避免写到一半崩溃/断电把 world.json 截断，
-    // 读回失败时会退化成默认空状态，闹钟和家会话就静默丢了。
-    const tmp = `${WORLD_FILE}.tmp`
-    writeFileSync(tmp, JSON.stringify(state, null, 2))
-    renameSync(tmp, WORLD_FILE)
+    atomicWrite(WORLD_FILE, JSON.stringify(state, null, 2))
   } catch (error) {
     log(`writeWorld failed: ${String(error)}`)
   }
@@ -899,6 +916,8 @@ async function renameHome(sessionID: string): Promise<void> {
 }
 
 const RESET_COOLDOWN = 5 * 60_000
+/** 到点超过这么久的闹钟不再逐条发，合并成一条积压清单（不静默丢） */
+const ALARM_STALE_MS = 6 * 60 * 60_000
 
 /** 是否是共享服务进程（只有它能在 tmux 外安全地重启 tmux）。 */
 function isServiceProcess(): boolean {
@@ -945,6 +964,19 @@ async function ensureHome(): Promise<string | undefined> {
   if (current) {
     const info = await sessionInfo(current)
     if (info.status === "ok") {
+      const title = String(info.title ?? "")
+      // 家会话不该是 QQ 会话：立家会改名并破坏 qq-chat / qq-group-* 的识别。
+      // 标题可能已经被改成 life-world home session，所以同步查桥接状态里的会话 id。
+      // 发现这种（升级前可能被误立的）就地摘掉，下一轮按「家缺失」重建。
+      if (qqSessionKind(current) || title === qqPrivateTitle() || title.startsWith("qq-group-")) {
+        const fresh = readWorld()
+        if (fresh.homeSessionId === current) {
+          delete fresh.homeSessionId
+          writeWorld(fresh)
+        }
+        log(`home cleared (qq session) · ${current}`)
+        return undefined
+      }
       if (info.title !== HOME_TITLE) await renameHome(current)
       return current
     }
@@ -1000,10 +1032,13 @@ async function sendHome(sessionID: string, text: string): Promise<boolean> {
 
 /** 进程间互斥：服务端与 TUI 各跑一份定时器，用文件锁避免重复处理。 */
 async function withLock<T>(fn: () => Promise<T>): Promise<T | undefined> {
+  // 锁内容带本次调用的唯一 token：醒来后只续/只删自己的锁，
+  // 避免被挂起超过 90 秒、锁被别人接管后，还去刷别人的 mtime 或删别人的锁。
+  const token = `${process.pid}:${Math.random().toString(36).slice(2, 10)}`
   const acquire = (): boolean => {
     try {
       const fd = openSync(LOCK_FILE, "wx")
-      writeFileSync(fd, `${process.pid} ${Date.now()}`)
+      writeFileSync(fd, token)
       closeSync(fd)
       return true
     } catch (error) {
@@ -1021,11 +1056,24 @@ async function withLock<T>(fn: () => Promise<T>): Promise<T | undefined> {
       return false
     }
   }
+  const ownsLock = (): boolean => {
+    try { return readFileSync(LOCK_FILE, "utf8") === token } catch { return false }
+  }
   if (!acquire()) return undefined
+  // 持锁期间每 30 秒刷新一次 mtime：一轮里送多个闹钟可能超过 90 秒，
+  // 不刷会被另一个进程当成残留锁删掉，同一批闹钟就会重复送达。
+  const beacon = setInterval(() => {
+    if (!ownsLock()) return
+    try { utimesSync(LOCK_FILE, new Date(), new Date()) } catch { /* 锁已不在 */ }
+  }, 30_000)
+  ;(beacon as unknown as { unref?: () => void }).unref?.()
   try {
     return await fn()
   } finally {
-    try { unlinkSync(LOCK_FILE) } catch { /* 别人已经删了 */ }
+    clearInterval(beacon)
+    if (ownsLock()) {
+      try { unlinkSync(LOCK_FILE) } catch { /* 别人已经删了 */ }
+    }
   }
 }
 
@@ -1072,6 +1120,32 @@ function readBridgeStatus(): BridgeStatus {
     ownerName: typeof config?.ownerName === "string" ? config.ownerName : undefined,
     groupEnabled: config?.group?.enabled === true,
     lastSeen,
+  }
+}
+
+/** 桥接状态里记着的 QQ 会话：私聊 id + 各群会话 id。标题被改名了也认得出。 */
+function qqSessionKind(sessionID: string): "private" | "group" | undefined {
+  try {
+    const state = JSON.parse(readFileSync(BRIDGE_STATE_FILE, "utf8")) as {
+      privateSessionId?: unknown
+      groups?: Record<string, unknown>
+    }
+    if (state.privateSessionId === sessionID) return "private"
+    for (const value of Object.values(state.groups ?? {})) {
+      if (value === sessionID) return "group"
+    }
+  } catch { /* 没有桥接状态 */ }
+  return undefined
+}
+
+/** QQ 私聊会话的标题：qq-bridge.json 可自定义，默认 qq-chat。 */
+function qqPrivateTitle(): string {
+  try {
+    const config = JSON.parse(readFileSync(BRIDGE_CONFIG_FILE, "utf8")) as { private?: { sessionTitle?: unknown } }
+    const title = config?.private?.sessionTitle
+    return typeof title === "string" && title.trim() ? title.trim() : "qq-chat"
+  } catch {
+    return "qq-chat"
   }
 }
 
@@ -1182,8 +1256,15 @@ export default Plugin.define({
           void (async () => {
             const info = await sessionInfo(sessionID)
             const title = info.title
-            if (info.status === "ok") {
-              if (title === "qq-chat") {
+            const kind = qqSessionKind(sessionID)
+            if (kind === "private") {
+              qqPrivateSessions.add(sessionID)
+              log(`qq private style on (state) · ${sessionID}`)
+            } else if (kind === "group") {
+              qqGroupSessions.add(sessionID)
+              log(`qq group style on (state) · ${sessionID}`)
+            } else if (info.status === "ok") {
+              if (title === qqPrivateTitle()) {
                 qqPrivateSessions.add(sessionID)
                 log(`qq private style on · ${sessionID}`)
               } else if (typeof title === "string" && title.startsWith("qq-group-")) {
@@ -1201,16 +1282,19 @@ export default Plugin.define({
         }
 
         if (sessionID && sessionID !== lastSession) {
-          lastSession = sessionID
-          // 没有家、或家已被删：在锁里选举/重选，避免两个进程各立一个
+          // 没有家、或家已被删：在锁里选举/重选，避免两个进程各立一个。
+          // lastSession 等这次查询成功后再记：查询失败或锁被占时保留重试机会。
           void withLock(async () => {
             const fresh = readWorld()
             const current = fresh.homeSessionId
             // QQ 会话不能当家：立家会把标题改成 life-world home session，
             // 而 QQ 风格块与 reach_out 拦截都靠 qq-chat / qq-group-* 标题识别。
+            // 查不到标题（服务不可达）就不立家，下一轮再试，别在盲区里把 QQ 会话立成家。
             const self = await sessionInfo(sessionID)
-            const selfTitle = self.status === "ok" ? String(self.title ?? "") : ""
-            if (selfTitle === "qq-chat" || selfTitle.startsWith("qq-group-")) return
+            if (self.status !== "ok") return
+            lastSession = sessionID
+            const selfTitle = String(self.title ?? "")
+            if (qqSessionKind(sessionID) || selfTitle === qqPrivateTitle() || selfTitle.startsWith("qq-group-")) return
             if (!current) {
               electHome(sessionID)
               return
@@ -1425,7 +1509,7 @@ export default Plugin.define({
             if (currentSessionID) {
               const current = await sessionInfo(currentSessionID)
               const title = current.title
-              if (title === "qq-chat" || (typeof title === "string" && title.startsWith("qq-group-"))) {
+              if (qqSessionKind(currentSessionID) || title === qqPrivateTitle() || (typeof title === "string" && title.startsWith("qq-group-"))) {
                 log(`reach_out blocked (direct chat) · ${text.slice(0, 60)}`)
                 return ok("你现在就在和对方聊天，直接回复即可，不要用 reach_out。")
               }
@@ -1468,9 +1552,7 @@ export default Plugin.define({
               const data = JSON.parse(readFileSync(BRIDGE_CONFIG_FILE, "utf8")) as any
               data.group = data.group || {}
               data.group.enabled = input.enabled
-              const tmp = `${BRIDGE_CONFIG_FILE}.tmp`
-              writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 })
-              renameSync(tmp, BRIDGE_CONFIG_FILE)
+              atomicWrite(BRIDGE_CONFIG_FILE, JSON.stringify(data, null, 2), 0o600)
               log(`group_chat · ${input.enabled ? "on" : "off"}`)
               return ok(`QQ 群聊已${input.enabled ? "开启" : "关闭"}。`)
             } catch (error) {
@@ -1548,6 +1630,9 @@ export default Plugin.define({
           const today = dayOf(nowDate)
           const state = readWorld()
 
+          // running=false：保留生活但不打扰——不重置、不重建家、不回顾、不闹钟、不兜底
+          if (!state.running) return
+
           // 可选：每晚定时重置（world.json 里设 resetHour 才启用）
           const resetHour = state.resetHour
           if (isServiceProcess() && typeof resetHour === "number" && nowDate.getHours() >= resetHour && state.lastResetDate !== today) {
@@ -1580,7 +1665,16 @@ export default Plugin.define({
             const at = Date.parse(alarm.at)
             return Number.isFinite(at) && at <= Date.now()
           })
+          // 到点太久的不逐条发（宕机/暂停后一次炸一串），合并成一条积压清单；
+          // 发送成功才清，失败留在原地下轮重试，别静默吞掉。
+          const stale: Alarm[] = []
+          const onTime: Alarm[] = []
           for (const alarm of due) {
+            const at = Date.parse(alarm.at)
+            if (Number.isFinite(at) && Date.now() - at > ALARM_STALE_MS) stale.push(alarm)
+            else onTime.push(alarm)
+          }
+          for (const alarm of onTime) {
             const text =
               `【我的时间】${shortStamp(new Date().toISOString())} 到了，说好做到这里是：${alarm.note}。\n` +
               "先看看做完了没有：做完了就想想下一件，用 execute 调 tools.plan_next 重新说好做到几点；没做完就再往后定。想休息也一样，定到打算休息到的时候。\n" +
@@ -1594,6 +1688,30 @@ export default Plugin.define({
               log(`alarm fired · ${alarm.note}`)
             } else {
               log(`alarm deferred · ${alarm.note}`)
+            }
+          }
+          if (stale.length > 0) {
+            const recent = stale.slice(-5)
+            const lines = recent.map((alarm) => {
+              const note = alarm.note.length > 160 ? `${alarm.note.slice(0, 160)}…` : alarm.note
+              return `- ${shortStamp(alarm.at)}：${note}`
+            })
+            const more = stale.length > recent.length ? `\n（另有 ${stale.length - recent.length} 条更早的没列出来）` : ""
+            const text =
+              `【我的时间】这期间积压了 ${stale.length} 个到点安排（到点已超过 6 小时，没来得及逐条提醒）：\n` +
+              `${lines.join("\n")}${more}\n` +
+              "先看看哪些还值得做：要做的挑出来，用 execute 调 tools.plan_next 重新排上；剩下的就放下。\n" +
+              `今天的计划在 ${join(PLAN_DIR, `${today}.md`)}，有变化顺手改掉。`
+            if (await sendHome(home, text)) {
+              const fresh = readWorld()
+              const ids = new Set(stale.map((alarm) => alarm.id))
+              fresh.alarms = (fresh.alarms ?? []).filter((item) => !ids.has(item.id))
+              // 积压清单也算今天叫醒过一次，避免早上兜底再来一条
+              fresh.lastWake = today
+              writeWorld(fresh)
+              log(`alarm backlog flushed · ${stale.length}`)
+            } else {
+              log(`alarm backlog deferred · ${stale.length}`)
             }
           }
 
@@ -1647,7 +1765,7 @@ export default Plugin.define({
     }
 
     // 服务进程启动时校验家会话；缺失就自动重启 tmux 重建（开关关掉时不碰）
-    if (worldEnabled()) {
+    if (worldEnabled() && readWorld().running !== false) {
       void withLock(ensureHome)
         .then((id) => { if (id) log(`home ensured · ${id}`) })
         .catch((error) => log(`ensure home failed: ${String(error)}`))
