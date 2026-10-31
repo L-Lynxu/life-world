@@ -73,7 +73,11 @@ function reloadService() {
 const ownerQQ = Number(config.ownerQQ)
 if (!ownerQQ) { log("ownerQQ missing"); process.exit(1) }
 /** 实时读配置：运行中改了 private.sessionTitle，新会话用它建，不用重启桥接 */
-const privateTitle = () => readJson(CONFIG_FILE, config)?.private?.sessionTitle || "qq-chat"
+const privateTitle = () => {
+  const title = readJson(CONFIG_FILE, config)?.private?.sessionTitle
+  // 与插件 qqPrivateTitle() 同口径：首尾空白去掉，空串/非字符串回落默认
+  return typeof title === "string" && title.trim() ? title.trim() : "qq-chat"
+}
 const location = config.location || HOME
 const wsUrl = config.napcat?.wsUrl || "ws://127.0.0.1:3001"
 const wsToken = config.napcat?.token || ""
@@ -178,6 +182,8 @@ async function deletePrivate() {
 // ———————————————————————— NapCat WebSocket ————————————————————————
 let ws = null
 let wsReady = false
+/** 本次连接开始握手的时间；看门狗据此避免把还没超时的 CONNECTING 反复掐掉 */
+let connectingSince = 0
 let echoSeq = 0
 const pending = new Map()
 
@@ -203,8 +209,10 @@ function connect() {
   wsReady = false
   const socket = new WebSocket(url)
   ws = socket
+  connectingSince = Date.now()
   socket.addEventListener("open", () => {
     if (ws !== socket) return
+    connectingSince = 0
     wsReady = true
     state.lastSeen = new Date().toISOString()
     saveState()
@@ -212,11 +220,13 @@ function connect() {
   })
   socket.addEventListener("close", () => {
     if (ws !== socket) return
+    connectingSince = 0
     wsReady = false
     scheduleReconnect("close")
   })
   socket.addEventListener("error", (event) => {
     if (ws !== socket) return
+    connectingSince = 0
     log("ws error", event?.message || "")
     // 不在这里调 ws.close()：对没建立起来的连接，close() 会同步再触发 error，
     // 每 5 秒一次的重连就会变成每秒上百条错误的风暴。
@@ -977,7 +987,10 @@ setInterval(() => {
     state.lastSeen = new Date().toISOString()
     saveState()
   } else {
-    // 看门狗：断着就每 15 秒提醒一次重连（NapCat 重启、网络恢复后能自己回来）
+    // 看门狗：断着就提醒重连（NapCat 重启、网络恢复后能自己回来）。
+    // 但握手还没到 60 秒时不要动：15 秒看门狗 + 5 秒重连会把慢握手反复掐断，
+    // 远端 NapCat、慢 DNS 或 TLS 抖动时会变成永远连不上。
+    if (connectingSince && Date.now() - connectingSince < 60_000) return
     scheduleReconnect("watchdog")
   }
 }, 15000)
