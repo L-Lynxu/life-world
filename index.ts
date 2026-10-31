@@ -1682,8 +1682,9 @@ export default Plugin.define({
             if (await sendHome(home, text)) {
               const fresh = readWorld()
               fresh.alarms = (fresh.alarms ?? []).filter((item) => item.id !== alarm.id)
-              // 今天已经被自己的闹钟叫醒过了，兜底不用再来一次
-              fresh.lastWake = today
+              // 只有「今天」的闹钟才算今天叫醒过；跨午夜补发昨天的闹钟
+              // 不能把新的一天标成 lastWake，否则会吃掉当天早上的兜底。
+              if (dayOf(new Date(alarm.at)) === today) fresh.lastWake = today
               writeWorld(fresh)
               log(`alarm fired · ${alarm.note}`)
             } else {
