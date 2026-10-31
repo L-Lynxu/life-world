@@ -92,7 +92,7 @@ QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动�
 
 关掉时：不注入时间/世界提示词/心情/记忆、不打时间戳、6 个工具一个都不挂、定时器空转——等于没装这个插件。世界数据（日记、计划、记忆、心情、闹钟）原地保留，开回来直接接上。
 
-开关记在 `world.json` 的 `enabled`（不写=开启）。脚本改完会重启服务和 TUI：工具与定时器都是进程启动时建的，不重启等于没生效。开关**只认人手**，没有做成给角色调用的工具。
+开关记在 `~/.config/opencode/life-world.json` 的 `world.enabled`（不写=开启；旧文件兜底）。脚本改完会重启服务和 TUI：工具与定时器都是进程启动时建的，不重启等于没生效。开关**只认人手**，没有做成给角色调用的工具。
 
 > QQ 桥接是独立进程，不跟着开关走；要一起停得单独停桥接。
 
@@ -103,10 +103,11 @@ QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动�
 当前只做私聊；群聊默认关闭。
 
 ```bash
-# 1. 配置
-cp qq-bridge.example.json ~/.config/opencode/qq-bridge.json
-chmod 600 ~/.config/opencode/qq-bridge.json
-# 填 ownerQQ、napcat.wsUrl / token、location；enabled 改成 true
+# 1. 配置：编辑 ~/.config/opencode/life-world.json 的 bridge
+#    没有就把仓库的 life-world.example.json 拷过去
+cp life-world.example.json ~/.config/opencode/life-world.json
+chmod 600 ~/.config/opencode/life-world.json
+# 填 bridge.ownerQQ、bridge.wsUrl / token、bridge.location；bridge.enabled 改成 true
 
 # 2. 启动（脱离 tmux，避免家会话重置时被 kill-server 带走）
 setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
@@ -115,24 +116,24 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 
 | 字段 | 说明 |
 |---|---|
-| `enabled` | 总开关；life-world 会把状态注入 system，关闭时 `reach_out` 不会写 outbox |
-| `ownerQQ` | 唯一允许的私聊用户，也是通知目标 |
-| `napcat.wsUrl` / `token` | 正向 WS 地址与 token（NapCat、SnowLuma 等通用；字段名沿用 napcat 是历史原因） |
-| `group.enabled` | 群聊开关，默认 `false`；角色也能用 `group_chat` 工具实时开关 |
+| `bridge.enabled` | 总开关；life-world 会把状态注入 system，关闭时 `reach_out` 不会写 outbox |
+| `bridge.ownerQQ` | 唯一允许的私聊用户，也是通知目标 |
+| `bridge.wsUrl` / `token` | 正向 WS 地址与 token（NapCat、SnowLuma 等通用；旧 `qq-bridge.json` 的 `napcat.*` 仍兜底） |
+| `bridge.group.enabled` | 群聊开关，默认 `false`；角色也能用 `group_chat` 工具实时开关 |
 
 - `/new`：删除 `qq-chat`，下一条消息或她的 `reach_out` 再新建。
 - **outbox 补发**：投递游标按天记录；桥接启动/重连时会扫最近 3 天，把没送出去的补发（跨天离线也不丢）。
 - 回复按行拆成多条：每个短句一条 QQ 消息，两条之间按下一句长度停顿约 1.5~3 秒（加随机抖动），模拟真人打字。
 - 若这一轮正文为空、但她调用了 `reach_out`，桥接会把这一轮缓冲的那些行当回复发出去，避免漏回。
 - 开关关闭或桥接离线（心跳超过 90 秒）时，角色会看到「reach_out 不会送达」，不会以为已经通知到你。
-- `qq-bridge.json` 含凭据，不要提交仓库；`.gitignore` 已排除。
+- `life-world.json` 含凭据（token），权限 600，别外传；旧 `qq-bridge.json` 仅作兜底。
 
 ### 群聊（可选）
 
 `group.enabled` 默认 `false`。打开后：
 
 - 群会话标题 `qq-group-<群号>`，每群一个；`/new` 只有 `ownerQQ` 能触发。
-- 角色可以用 `group_chat` 工具开关群聊：写 `qq-bridge.json` 的 `group.enabled`，桥接实时读取，不用重启。
+- 角色可以用 `group_chat` 工具开关群聊：写 `life-world.json` 的 `bridge.group.enabled`，桥接实时读取，不用重启。
 - **保留原人格和记忆**，额外注入「QQ 群聊模式」：把对方当普通朋友，不用情侣/伴侣称呼、不谈亲密关系/私聊内容。
 - **两段式读空气**：@/点名/关键词直接进判官；其余消息每批按 `interjectChance`（默认 0.05）掷骰；判官调用 `judgeModel`（默认 `default`，跟随主聊天默认模型），只输出 `REPLY`/`SKIP`。回复后短时把概率提到 `afterReplyChance`。
 - 判官会话（标题 `qq-judge`）会跳过 life-world 注入，避免私聊记忆发给外部模型。
@@ -150,13 +151,13 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 
 ## 数据位置
 
-运行时数据全部在 `~/.local/share/life-world/`，**不随仓库分发**：
+运行时数据全部在 `~/.local/share/life-world/`，**不随仓库分发**；用户配置在 `~/.config/opencode/life-world.json`（含 token，600）：
 
 ```
 ~/.local/share/life-world/
 ├── debug.log
 └── worlds/default/
-    ├── world.json
+    ├── world.json          运行时状态（闹钟/家会话/last*；不是配置）
     ├── world-prompt.md
     ├── identity/          我是谁 / 用户画像 / 心情
     ├── conversations/     原文归档
@@ -179,33 +180,34 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 
 硬限制：`我是谁.md` 主文件不超过 500 字；`心情.md` 每条状态只写状态名、设置时间、持续时间、不超过 15 个字的行为特点，不写详细描述。
 
-## 配置（`world.json`）
+## 配置（`life-world.json`）
+
+唯一用户配置：`~/.config/opencode/life-world.json`（权限 600，含 QQ token）。完整示例见仓库里的 `life-world.example.json`；首次启动时插件会自动生成，旧 `world.json` / `qq-bridge.json` 在它缺失时兜底。
 
 ```json
 {
-  "running": true,
-  "enabled": true,
-  "homeSessionId": "ses_...",
-  "alarms": [],
-  "lastReview": "YYYY-MM-DD",
-  "reviewHour": 23,
-  "fallbackWakeTime": "09:00",
-  "lastWake": "YYYY-MM-DD",
-  "lastResetAt": "2026-01-01T00:00:00.000Z",
-  "resetHour": 4,
-  "lastResetDate": "YYYY-MM-DD"
+  "world": {
+    "enabled": true, "running": true, "reviewHour": 23, "fallbackWakeTime": "09:00",
+    "resetHour": null, "recentLimit": 80, "summaryLimit": 12000,
+    "alarmStaleHours": 6, "resetCooldownMinutes": 5, "browserPort": 9222,
+    "homeTitle": "life-world home session"
+  },
+  "localModel": { "enabled": false, "keepRecent": 20, "foldRecentContext": 6, "resultChars": 300, "foldToolMessages": true, "foldingReasoningTurns": 0, "preferSubagent": true, "debugStats": false },
+  "bridge": {
+    "enabled": false, "ownerQQ": 0, "ownerName": "", "wsUrl": "ws://127.0.0.1:3001",
+    "token": "", "privateSessionTitle": "qq-chat", "location": "",
+    "group": { "enabled": false, "keywords": [], "interjectChance": 0.05, "afterReplyChance": 0.8, "probabilityDurationMs": 120000, "judgeModel": "default", "judgeTimeoutMs": 60000, "debounceMs": 10000, "triggerDebounceMs": 1200, "maxBatchWaitMs": 60000, "cooldownMs": 8000, "maxPer10Min": 0, "bannedWords": [] }
+  }
 }
 ```
 
-| 字段 | 说明 |
+| 区块 | 主要字段 |
 |---|---|
-| `enabled` | 总开关；`false` 时完全不插手会话。不写这个字段视为开启 |
-| `running` | 回顾/闹钟要不要发；`false` 时保留生活但不打扰 |
-| `homeSessionId` | 家会话；标题固定 `life-world home session`；缺失时自动重建 |
-| `alarms` | 多闹钟数组；到点且发送成功才移除 |
-| `reviewHour` | 每日回顾从几点开始，默认 23 |
-| `fallbackWakeTime` | 没定闹钟时早上几点叫醒，默认 09:00 |
-| `resetHour` | 可选：每天该点后自动重置 tmux；不设则关闭 |
+| `world` | 总开关 `enabled`、暂停打扰 `running`、回顾 `reviewHour`、早上兜底 `fallbackWakeTime`、夜间重置 `resetHour`、注入/压缩/积压/冷却/浏览器/家会话标题等 |
+| `localModel` | 本地小模型优化，见下文 |
+| `bridge` | QQ/OneBot 桥接，见下文 QQ 一节 |
+
+`world.json` 现在只存运行时状态（家会话、闹钟、lastReview/lastWake 等），不要手改；配置只改 `life-world.json`。
 
 ## 家会话
 
@@ -230,7 +232,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 >
 > **什么时候别开**：接的是在线模型（API）。在线模型上下文够长、并发好，这些折叠会丢信息，**保持默认关闭**，按满配置跑即可。
 
-打开方式——在 `worlds/default/world.json` 里加：
+打开方式——在 `~/.config/opencode/life-world.json` 的 `localModel` 里改：
 
 ```json
 "localModel": {
@@ -258,7 +260,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 
 **实测**（395 迷你主机 + Qwen3.8-Flash-Next IQ3_XXS，opencode 2.2.5）：同一条会话，每轮请求从 **306 KB / 20 万 token** 降到 **25 KB 上下**，单轮耗时从 145–222 秒降到几十秒。
 
-> 折叠只动工具结果和旧推理，**对话正文一条不动**；`world.json` 用 `execute` 改，保存后下一轮生效，不用重启。
+> 折叠只动工具结果和旧推理，**对话正文一条不动**；`life-world.json` 改完下一轮生效，不用重启。
 >
 > 另外：`我是谁.md` / `心情.md` 是每次注入的主文件，按「数据位置」里的拆分规则压短，对新会话 prefill 比折叠选项更直接。
 

@@ -45,7 +45,7 @@
 
 - **关掉 = 完全退回原生 opencode**：不注入时间/记忆/心情、不挂 6 个工具、定时器不动。
 - **数据原地保留**：日记、计划、记忆、心情、闹钟都还在，`on` 回来无缝接上。
-- **开关只认人手**：你没有开/关它的工具，也别自己改 `world.json` 的 `enabled`。
+- **开关只认人手**：你没有开/关它的工具，也别自己改配置；开关在 `~/.config/opencode/life-world.json` 的 `world.enabled`。
 - **QQ 桥接是独立进程**，不跟开关走；要一起停得单独停桥接（见 §5.5）。
 
 ---
@@ -63,6 +63,7 @@
 | 退出 gal 模式 | 在选项面板的「自己输入」里写「停下」，或者直接说 |
 | 看你收的颜文字 | `room/颜文字.md` |
 | 看自己主动说过什么 | `~/.local/share/life-world/bin/life-world.sh inbox [天数]` |
+| 看配置文件在哪 | `~/.local/share/life-world/bin/life-world.sh config` |
 | **更新颜文字库** | 用户说「更新颜文字库 / 换个表情库」→ 跑 `node ~/.local/share/life-world/bin/kaomoji-update.mjs`（零依赖，从 npm 拉） |
 | 翻你的日记 | `diary/YYYY-MM-DD.md` |
 
@@ -147,8 +148,8 @@ return await tools.kaomoji({ scene: "害羞", count: 3 })
 ### 4.3 写配置
 
 ```bash
-cp ~/.config/opencode/plugins/life-world/qq-bridge.example.json ~/.config/opencode/qq-bridge.json
-chmod 600 ~/.config/opencode/qq-bridge.json
+cp ~/.config/opencode/plugins/life-world/life-world.example.json ~/.config/opencode/life-world.json
+chmod 600 ~/.config/opencode/life-world.json
 ```
 
 然后把 `enabled` 改成 `true`、`ownerQQ` 填他的号、`napcat.wsUrl` / `napcat.token` 按实际填、`location` 填他常用的工作目录。
@@ -191,7 +192,7 @@ sent private 1/1 ...
 ├── qq-bridge.log                桥接日志
 ├── qq-bridge-state.json         桥接状态（会话 id、心跳）
 └── worlds/default/
-    ├── world.json               世界状态（开关、闹钟、家会话）
+    ├── world.json               运行时状态（闹钟、家会话、last*；不是配置）
     ├── world-prompt.md          世界提示词（可改，删了会用内置默认重建）
     ├── identity/                我是谁 / 用户画像 / 心情
     ├── conversations/           原文归档（一天一个 jsonl）
@@ -201,7 +202,7 @@ sent private 1/1 ...
     └── outbox/                  reach_out 出口
 ```
 
-备份：整个 `~/.local/share/life-world/` 打包即可。配置在 `~/.config/opencode/qq-bridge.json`（**含 token，别外传**）。
+备份：整个 `~/.local/share/life-world/` 打包即可。配置在 `~/.config/opencode/life-world.json`（**含 token，别外传**）；旧 `qq-bridge.json` 仅兜底。
 规则模块在插件目录 `~/.config/opencode/plugins/life-world/modules/`，不在世界数据里。
 
 ### 5.1 自述与心情的拆分

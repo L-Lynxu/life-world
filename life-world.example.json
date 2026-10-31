@@ -1,0 +1,49 @@
+{
+  "world": {
+    "enabled": true,
+    "running": true,
+    "reviewHour": 23,
+    "fallbackWakeTime": "09:00",
+    "resetHour": null,
+    "recentLimit": 80,
+    "summaryLimit": 12000,
+    "alarmStaleHours": 6,
+    "resetCooldownMinutes": 5,
+    "browserPort": 9222,
+    "homeTitle": "life-world home session"
+  },
+  "localModel": {
+    "enabled": false,
+    "keepRecent": 20,
+    "foldRecentContext": 6,
+    "resultChars": 300,
+    "foldToolMessages": true,
+    "foldingReasoningTurns": 0,
+    "preferSubagent": true,
+    "debugStats": false
+  },
+  "bridge": {
+    "enabled": false,
+    "ownerQQ": 0,
+    "ownerName": "",
+    "wsUrl": "ws://127.0.0.1:3001",
+    "token": "",
+    "privateSessionTitle": "qq-chat",
+    "location": "",
+    "group": {
+      "enabled": false,
+      "keywords": ["Qwen", "AI", "deepseek", "claude", "chatgpt"],
+      "interjectChance": 0.05,
+      "afterReplyChance": 0.8,
+      "probabilityDurationMs": 120000,
+      "judgeModel": "default",
+      "judgeTimeoutMs": 60000,
+      "debounceMs": 10000,
+      "triggerDebounceMs": 1200,
+      "maxBatchWaitMs": 60000,
+      "cooldownMs": 8000,
+      "maxPer10Min": 0,
+      "bannedWords": []
+    }
+  }
+}
