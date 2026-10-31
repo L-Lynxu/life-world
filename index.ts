@@ -411,7 +411,17 @@ function ingest(): void {
     for (const row of rows) {
       const nextCursor = Math.max(cursor, row.time_created)
       const text = textFromRow(row.type, row.data)
-      if (!text || archived.has(row.id)) {
+      if (!text) {
+        // 流式写入的 assistant 可能先被扫到空正文。先登记成「长度 0 的已归档」，
+        // 让 fixPartialArchives 在正文补全后补写；否则游标一过就永久漏掉这条。
+        if (!archived.has(row.id)) {
+          archived.add(row.id)
+          archivedLength.set(row.id, 0)
+        }
+        cursor = nextCursor
+        continue
+      }
+      if (archived.has(row.id)) {
         cursor = nextCursor
         continue
       }
@@ -918,6 +928,14 @@ function defaultConfig(): LifeWorldConfig {
       foldingReasoningTurns: 0,
       preferSubagent: true,
       debugStats: false,
+      concurrency: {
+        enabled: false,
+        deferMinutes: 30,
+        userActiveSeconds: 90,
+        groupPause: true,
+        groupMaxAgeMinutes: 10,
+        leaseTtlMinutes: 10,
+      },
     },
     bridge: {
       enabled: false,
@@ -1099,6 +1117,8 @@ function configFromLegacy(): LifeWorldConfig {
 
 /** 最近一次成功读到的配置：文件被改坏时拿它顶一下，别让一次手滑把开关状态翻回去 */
 let lastGoodConfig: LifeWorldConfig | undefined
+/** 配置坏掉时 readConfig 每轮会被调多次，日志限频 */
+let configErrorAt = 0
 
 function readConfig(): LifeWorldConfig {
   try {
@@ -1108,7 +1128,10 @@ function readConfig(): LifeWorldConfig {
       return merged
     }
   } catch (error) {
-    log(`config read failed: ${String(error)}`)
+    if (Date.now() - configErrorAt > 300_000) {
+      configErrorAt = Date.now()
+      log(`config read failed: ${String(error)}`)
+    }
   }
   if (lastGoodConfig) return lastGoodConfig
   return configFromLegacy()
@@ -1456,6 +1479,8 @@ async function resetTmuxAndHome(reason: string): Promise<void> {
   if (Number.isFinite(last) && Date.now() - last < readConfig().world.resetCooldownMinutes * 60_000) return
   delete state.homeSessionId
   state.lastResetAt = new Date().toISOString()
+  // 家缺失触发的重置也算「今天重置过」，否则冷却过后 nightly 分支会把刚建好的 home 再杀一遍
+  state.lastResetDate = dayOf(new Date())
   writeWorld(state)
   log(`tmux reset · ${reason}`)
   const script = [
@@ -2262,11 +2287,14 @@ export default Plugin.define({
             // 否则今晚这一次重置会被静默跳过、当天也不再重试。
             const lastReset = fresh.lastResetAt ? Date.parse(fresh.lastResetAt) : 0
             const cooldownMs = readConfig().world.resetCooldownMinutes * 60_000
-            if (Number.isFinite(lastReset) && Date.now() - lastReset < cooldownMs) return
-            fresh.lastResetDate = today
-            writeWorld(fresh)
-            await resetTmuxAndHome("nightly")
-            return
+            // 冷却中只跳过「重置」这一件事，不要 return 掉整拍——
+            // 否则回顾/闹钟会跟着停 5 分钟。
+            if (!(Number.isFinite(lastReset) && Date.now() - lastReset < cooldownMs)) {
+              fresh.lastResetDate = today
+              writeWorld(fresh)
+              await resetTmuxAndHome("nightly")
+              return
+            }
           }
 
           // 先确保家会话可用；缺失时服务进程会自动重启 tmux 重建
@@ -2300,7 +2328,15 @@ export default Plugin.define({
             gateLogAt = Date.now()
             log(`${what} deferred (model gate busy)`)
           }
-          if (gateOn && gateBusy()) {
+          // 自己刚发出的定时回合（kind=timer）不算「别人占着」：闹钟提示发给同一个 home 会话，
+          // 会由 opencode 顺序排队；否则上一轮回顾还没结束就会把新闹钟整体推迟 30 分钟。
+          const ownTimerLease = (() => {
+            if (!gateOn) return false
+            const gate = readGateState()
+            const expires = gate.expires ? Date.parse(gate.expires) : 0
+            return gate.owner === home && gate.kind === "timer" && Number.isFinite(expires) && expires > Date.now()
+          })()
+          if (gateOn && gateBusy() && !ownTimerLease) {
             deferDueAlarms()
             logGateSkip("timer")
             return
@@ -2320,7 +2356,7 @@ export default Plugin.define({
               ? (state.lastReview !== reviewTarget ? reviewTarget : "")
               // 补做昨天：必须排除「今天已经回顾过」——否则在 reviewHour=0~5 时，
               // 上一分支刚把 lastReview 写成今天，这里又会去补昨天，两个日期来回翻转。
-              : currentHour < 6 && state.lastReview && state.lastReview !== yesterday && state.lastReview !== today
+              : currentHour < 6 && reviewSetting >= 6 && state.lastReview && state.lastReview !== yesterday && state.lastReview !== today
                 ? yesterday
                 : ""
           if (reviewDay) {

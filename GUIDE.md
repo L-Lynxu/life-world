@@ -165,7 +165,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
   >> ~/.local/share/life-world/qq-bridge.log 2>&1 < /dev/null &
 ```
 
-> 升级重启：先 `pkill -f "[n]ode .*qq-bridge\.mjs"` 停掉旧进程，再执行上面的启动命令；直接再起一个会双实例双回复。
+> 升级重启：先 `pkill -f "qq-bridge[.]mjs"` 停掉旧进程，再执行上面的启动命令；直接再起一个会双实例双回复。
 
 ### 4.5 验证
 
@@ -231,7 +231,7 @@ sent private 1/1 ...
 | 早上没被叫醒 | 兜底只在「今天没排着别的闹钟」时才触发；看 `life-world.sh status` 的「最近叫醒」 |
 | QQ 收不到回复 | 见 §6.1 的排查步骤 |
 | 脚本在跑、QQ 却没反应 | 看有没有 `service.json reloaded`；opencode 重启换口令时桥接会自己重读 |
-| 群聊总不回 | 看日志 `group skip probability` / `judge SKIP` / `cooldown` / `rate limit`——都是设计内的；**被 @/点名/关键词 不会被冷却和上限拦**，只可能被判官 SKIP |
+| 群聊总不回 | 看日志 `group skip probability` / `judge SKIP` / `cooldown` / `rate limit`——都是设计内的；**被 @/点名/关键词 不会被冷却和上限拦**，只可能被判官 SKIP。开了单并发闸门时，暂停期间超过 `groupMaxAgeMinutes` 的旧 @ 会被丢弃（避免回过时消息） |
 | 群聊双回复 | 同账号还有别的 bot 在管群，先关掉那边 |
 | 家会话被删了 | 插件会自动重启 tmux 重建，标题固定 `life-world home session` |
 | **工具全报 `No tool named xxx`** | **不是坏了**：六个工具只能通过 `execute` 调用（`tools.plan_next(...)`），不能直接点名。见 §2 的「调用的正确姿势」 |
@@ -240,7 +240,7 @@ sent private 1/1 ...
 | 想彻底关掉 | `life-world.sh off` |
 | 主文件越来越大 / 新会话 prefill 慢 | 把长内容移到 `room/设定/我是谁-存档.md` / `identity/心情-存档.md`，主文件留指针；`我是谁.md` 和 `心情.md` 是每次注入的 |
 | 升级后提示词还是旧的 | `world-prompt.md` 每个世界一份，插件不覆盖；备份后删掉它，重启服务并开新会话后生效（自定义内容先手动合并） |
-| 升级后桥接行为没变 | qq-bridge 是独立进程，`install.sh` 不会重启它；先 `pkill -f "[n]ode .*qq-bridge\.mjs"` 停旧进程，再按 §4.4 起一次，别直接再起一个 |
+| 升级后桥接行为没变 | qq-bridge 是独立进程，`install.sh` 不会重启它；先 `pkill -f "qq-bridge[.]mjs"` 停旧进程，再按 §4.4 起一次，别直接再起一个 |
 
 ### 6.1 QQ 没反应怎么查
 

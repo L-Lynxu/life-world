@@ -45,7 +45,7 @@ function rotateLog() {
 rotateLog()
 function log(...args) {
   const line = `[${new Date().toISOString()}] ${args.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" ")}`
-  try { mkdirSync(dirname(LOG_FILE), { recursive: true }); appendFileSync(LOG_FILE, line + "\n") } catch {}
+  try { mkdirSync(dirname(LOG_FILE), { recursive: true }); appendFileSync(LOG_FILE, line + "\n", { mode: 0o600 }) } catch {}
   if (process.stdout.isTTY) console.log(line)
 }
 function readJson(file, fallback) {
@@ -301,6 +301,7 @@ async function ensurePrivateNow() {
       return state.privateSessionId
     }
     if (info.status === "missing") {
+      releaseGate(state.privateSessionId)
       delete state.privateSessionId
       delete state.lastSessionId
       delete state.lastIdle
@@ -348,6 +349,7 @@ async function deletePrivate() {
   delete state.lastIdle
   delete state.lastAssistantId
   runWindow = null
+  releaseGate(id)
   saveState()
   log("deleted private session", id)
 }
@@ -525,10 +527,18 @@ async function handlePrivate(msg) {
   }
   const annotated = `[私聊｜${nameOf(msg)}（QQ ${msg.user_id}）] ${text}\n（这是 QQ 私聊。像真人发消息一样：每个短句单独一行，每行会作为一条独立的 QQ 消息发出；一次发 1~3 条，最多 4 条；不要写长段落，不要用标题/列表/编号/加粗，不要复述工具或过程。直接回复即可，不要调用 reach_out。）`
   runWindow = { start: Date.now(), end: 0, reaches: [] }
-  const res = await api(`/api/session/${id}/prompt`, {
-    method: "POST",
-    body: JSON.stringify({ text: annotated }),
-  })
+  let res
+  try {
+    res = await api(`/api/session/${id}/prompt`, {
+      method: "POST",
+      body: JSON.stringify({ text: annotated }),
+    })
+  } catch (error) {
+    // 服务不可达时 api() 会抛错：别让这条消息无声消失
+    log("prompt failed", String(error))
+    await call("send_private_msg", { user_id: ownerQQ, message: "（我这边暂时没接上，稍后再发一次试试）" }).catch(() => {})
+    return
+  }
   if (!res.ok) {
     log("prompt failed", res.status, (await res.text()).slice(0, 200))
     // 别让这条消息无声消失：给对方一句提示，下一条通常会重新接上
@@ -651,11 +661,25 @@ function getGroupState(groupId) {
   const key = String(groupId)
   let st = groupStates.get(key)
   if (!st) {
-    st = { key, buffer: [], timer: null, firstAt: 0, lastReplyAt: 0, replies: [], sessionId: state.groups?.[key] || "", lastIdle: 0, lastAssistantId: "", waitSince: 0, baseSet: false, busy: false, pending: false, batchTrigger: false, retryAt: 0 }
+    st = { key, buffer: [], timer: null, firstAt: 0, lastReplyAt: 0, replies: [], sessionId: state.groups?.[key] || "", lastIdle: 0, lastAssistantId: "", waitSince: 0, baseSet: false, busy: false, pending: false, batchTrigger: false, retryAt: 0, gateLogAt: 0 }
     groupStates.set(key, st)
   }
   return st
 }
+/** 延后重跑这一批：必须接住 Promise，否则 processGroup 抛错会杀死桥接进程 */
+function retryGroupLater(key, delay = 15000) {
+  const st = getGroupState(key)
+  clearTimeout(st.timer)
+  st.timer = setTimeout(() => {
+    processGroup(key).catch((error) => log("group retry failed", String(error)))
+  }, delay)
+}
+function logGroupPause(st, message) {
+  if (st.gateLogAt && Date.now() - st.gateLogAt < 60000) return
+  st.gateLogAt = Date.now()
+  log(message)
+}
+
 async function resetGroupBaseline(key, id) {
   const st = getGroupState(key)
   st.sessionId = id
@@ -918,7 +942,7 @@ async function downloadMedia(media) {
     const ext = (media.url.split("?")[0].match(/\.(png|jpe?g|gif|webp)$/i) || [".jpg"])[0]
     mkdirSync(GROUP_TMP_DIR, { recursive: true })
     const path = join(GROUP_TMP_DIR, `qq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`)
-    writeFileSync(path, buf)
+    writeFileSync(path, buf, { mode: 0o600 })
     return path
   } catch (error) {
     log("download media failed", String(error))
@@ -1023,10 +1047,10 @@ async function processGroupNow(key) {
   }
   // 用户正在聊天 / 别的回合还在跑：整批暂停，15 秒后再看
   if (conc.enabled && conc.groupPause && gateBusy()) {
-    st.retryAt = Date.now() + 15000
-    clearTimeout(st.timer)
-    st.timer = setTimeout(() => processGroup(key), 15000)
-    log("group paused (model gate busy)")
+    // 只延后「开新回合」，不要设 st.retryAt：那个字段会连带阻塞 pollGroups 投递，
+    // 上一轮回复会因为自己的租约迟迟发不出去（卡到 5 分钟窗口超时）。
+    retryGroupLater(key)
+    logGroupPause(st, "group paused (model gate busy)")
     return
   }
 
@@ -1069,10 +1093,8 @@ async function processGroupNow(key) {
   // 判官也要吃模型：先领闸门，领不到就整批暂停，15 秒后再试
   const gateOwner = `qq-group:${key}`
   if (conc.enabled && !acquireGate(gateOwner, "qq-group")) {
-    st.retryAt = Date.now() + 15000
-    clearTimeout(st.timer)
-    st.timer = setTimeout(() => processGroup(key), 15000)
-    log("group paused before judge (model gate busy)")
+    retryGroupLater(key)
+    logGroupPause(st, "group paused before judge (model gate busy)")
     return
   }
   const verdict = await withJudgeLock(() => runJudge(key, batch))
@@ -1118,6 +1140,9 @@ async function pollGroups() {
   if (pollingGroups) return
   pollingGroups = true
   try {
+  const conc = concurrencyCfg()
+  // 本地单并发模型一轮可能跑几分钟：用租约 TTL 当等待上限，别 45 秒就放弃
+  const waitLimit = conc.enabled ? conc.leaseTtlMinutes * 60000 : 45000
   for (const [key, st] of groupStates) {
     if (!st.sessionId) continue
     if (st.retryAt && Date.now() < st.retryAt) continue
@@ -1146,22 +1171,29 @@ async function pollGroups() {
       const idle = info.info?.time?.idle
       if (!idle || idle === st.lastIdle) continue
       const msgs = await apiJson(`/api/session/${st.sessionId}/message`)
-      const arr = Array.isArray(msgs.data?.data) ? msgs.data.data : []
+      // 拉取失败时绝不能推进 lastIdle：否则这一轮回复会被永久跳过
+      if (!msgs.ok || !Array.isArray(msgs.data?.data)) {
+        st.retryAt = Date.now() + 5000
+        continue
+      }
+      const arr = msgs.data.data
       const a = arr.find((m) => m?.type === "assistant" && m?.time?.completed)
       if (!a) {
         const w = groupRunWindows.get(key)
-        if (w && !w.end && Date.now() - w.start > 45000) {
+        if (w && !w.end && Date.now() - w.start > waitLimit) {
           w.end = Date.now()
           releaseGate(`qq-group:${key}`)
-          log("group no assistant, release gate", key)
+          st.lastIdle = idle
+          log("group no assistant, give up", key)
+        } else {
+          st.retryAt = Date.now() + 2000
         }
-        st.lastIdle = idle
         continue
       }
       if (a.id === st.lastAssistantId) {
-        // 新一轮可能还在流式输出：先不推进 idle，等新 assistant 完成；超过 45 秒则放弃
+        // 新一轮可能还在流式输出：先不推进 idle，等新 assistant 完成；超过等待上限则放弃
         if (!st.waitSince) st.waitSince = Date.now()
-        if (Date.now() - st.waitSince > 45000) {
+        if (Date.now() - st.waitSince > waitLimit) {
           st.lastIdle = idle
           st.waitSince = 0
           const w = groupRunWindows.get(key)
@@ -1234,7 +1266,14 @@ async function handleGroup(msg) {
   const st = getGroupState(groupId)
   const trigger = at || keywordMatch(text)
   st.buffer.push({ sender: nameOf(msg), userId: msg.user_id, text, media: groupMedia(msg), trigger, at: Date.now(), recorded: false })
-  if (st.buffer.length > 30) st.buffer.splice(0, st.buffer.length - 30)
+  if (st.buffer.length > 30) {
+    // 先丢普通消息，未处理的 @/关键词消息尽量留着，别被刷屏挤掉
+    const excess = st.buffer.length - 30
+    const pinned = st.buffer.filter((m) => m.trigger && !m.recorded)
+    const rest = st.buffer.filter((m) => !(m.trigger && !m.recorded))
+    const dropped = Math.min(excess, rest.length)
+    st.buffer = [...rest.slice(dropped), ...pinned].sort((a, b) => a.at - b.at)
+  }
   scheduleGroup(groupId, trigger)
 }
 
@@ -1252,6 +1291,7 @@ async function pollPrivate() {
     const id = state.privateSessionId
     const { status, info } = await sessionInfo(id)
     if (status === "missing") {
+      releaseGate(id)
       delete state.privateSessionId
       delete state.lastSessionId
       delete state.lastIdle
@@ -1264,7 +1304,11 @@ async function pollPrivate() {
     const idle = info?.time?.idle
     if (!idle || idle === state.lastIdle) return
     const res = await apiJson(`/api/session/${id}/message`)
-    if (!res.ok || !Array.isArray(res.data?.data)) return
+    if (!res.ok || !Array.isArray(res.data?.data)) {
+      // 接口瞬时失败：别每 1.5 秒重查一轮，给 3 秒退避（但不推进水位，避免丢回复）
+      privateRetryAt = Date.now() + 3000
+      return
+    }
     const assistants = res.data.data.filter((m) => m?.type === "assistant" && m?.time?.completed)
     if (assistants.length === 0) return
     // assistants 最新在前：把 lastAssistantId 之后完成的都按时间正序发掉，
@@ -1331,6 +1375,8 @@ let outboxBusy = false
 let outboxRetryAt = 0
 /** 每条 outbox 的连续失败次数：某条永久发不出去时进死信，别饿死后面的消息 */
 const outboxAttempts = new Map()
+/** 已经成功写回私聊上下文的 reach：发送重试时不要重复写 */
+const outboxSyntheticDone = new Set()
 const OUTBOX_MAX_ATTEMPTS = 20
 /** 补发范围：最近几天（跨天离线后也能补上） */
 const OUTBOX_DAYS = 3
@@ -1389,6 +1435,7 @@ async function pollOutbox() {
         runWindow.end = Date.now()
       } else {
         runWindow.reaches.unshift(...buffered)
+        outboxRetryAt = Date.now() + 15000
       }
     }
 
@@ -1455,11 +1502,13 @@ async function pollOutbox() {
         }
         // 连续失败到上限就进死信并跳过，避免一条永久失败的消息把所有主动消息堵死
         const lineKey = `${day}:${offset + consumed}`
-        const giveUp = () => {
+        // 服务暂时不可达（ensurePrivate 失败）不能按「QQ 永久拒绝」处理：
+        // 那种情况给 200 次（约 50 分钟）机会，别把用户的主动消息直接丢进死信。
+        const giveUp = (threshold = OUTBOX_MAX_ATTEMPTS) => {
           const attempts = (outboxAttempts.get(lineKey) || 0) + 1
           outboxAttempts.set(lineKey, attempts)
           if (outboxAttempts.size > 500) outboxAttempts.clear()
-          if (attempts < OUTBOX_MAX_ATTEMPTS) return false
+          if (attempts < threshold) return false
           try {
             appendFileSync(join(OUTBOX_DIR, "failed.jsonl"), `${line}\n`, { mode: 0o600 })
           } catch (error) {
@@ -1471,14 +1520,20 @@ async function pollOutbox() {
         }
         const id = await ensurePrivate()
         if (!id) {
-          if (giveUp()) { consumed += bytes; continue }
+          if (giveUp(200)) { consumed += bytes; continue }
           blocked = true
           break
         }
-        await api(`/api/session/${id}/synthetic`, {
-          method: "POST",
-          body: JSON.stringify({ text: item.text, description: "reach_out", resume: false }),
-        }).catch(() => {})
+        if (!outboxSyntheticDone.has(lineKey)) {
+          const syn = await api(`/api/session/${id}/synthetic`, {
+            method: "POST",
+            body: JSON.stringify({ text: item.text, description: "reach_out", resume: false }),
+          }).catch(() => undefined)
+          if (syn?.ok) {
+            outboxSyntheticDone.add(lineKey)
+            if (outboxSyntheticDone.size > 500) outboxSyntheticDone.clear()
+          }
+        }
         const ok = await sendPrivate(item.text)
         if (!ok) {
           if (giveUp()) { consumed += bytes; continue }

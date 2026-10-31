@@ -69,7 +69,7 @@ opencode service restart
 
 注意：`worlds/default/world-prompt.md` 是每个世界一份，插件不会自动覆盖它。想让角色拿到新版默认提示词，先备份再删掉这个文件（或手动把新段落合并进去）；文件会在下次插件加载时用新默认重建，**重启 opencode 服务并开新会话（或等下一次压缩）后生效**。自定义过的提示词请手动合并，别直接删。
 
-QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动重启 qq-bridge**（若在跑）：先 `pkill -f "[n]ode .*qq-bridge\.mjs"` 停掉旧进程，再按下面的启动命令起一次；不要直接再起一个，会双实例双回复。只重启服务/TUI 时，判官隔离由插件侧兼容旧路径兜底，但桥接自身的其余修复仍要等它重启。
+QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动重启 qq-bridge**（若在跑）：先 `pkill -f "qq-bridge[.]mjs"` 停掉旧进程，再按下面的启动命令起一次；不要直接再起一个，会双实例双回复。只重启服务/TUI 时，判官隔离由插件侧兼容旧路径兜底，但桥接自身的其余修复仍要等它重启。
 
 ## 规则模块
 
@@ -101,9 +101,9 @@ QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动�
 
 ## 可选：QQ 桥接（OneBot v11 正向 WS）
 
-`scripts/qq-bridge.mjs` 是一条可选的 QQ 通道：**任意实现了 OneBot v11 正向 WebSocket 的服务端**都可以——NapCat、SnowLuma 等都行，只要它对外开放（正向）WS 服务器，把地址填进配置即可。链路是：QQ 服务端 WS → 桥接 → `qq-chat` 会话；角色回复后，桥接把最后一条 assistant 文本发回 QQ。
+`scripts/qq-bridge.mjs` 是一条可选的 QQ 通道：**任意实现了 OneBot v11 正向 WebSocket 的服务端**都可以——NapCat、SnowLuma 等都行，只要它对外开放（正向）WS 服务器，把地址填进配置即可。链路是：QQ 服务端 WS → 桥接 → `qq-chat` 会话；角色回复后，桥接把新完成的 assistant 文本按时间顺序发回 QQ（一次积压多条也不会漏）。
 
-当前只做私聊；群聊默认关闭。
+私聊与群聊都已实现；群聊默认关闭。
 
 ```bash
 # 1. 配置：编辑 ~/.local/share/life-world/life-world.json 的 bridge
@@ -120,7 +120,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 
 | 字段 | 说明 |
 |---|---|
-| `bridge.enabled` | 总开关；life-world 会把状态注入 system，关闭时 `reach_out` 不会写 outbox |
+| `bridge.enabled` | 总开关；life-world 会把状态注入 system，关闭时 `reach_out` 不会写 outbox。**桥接在启动时读取它**，运行中改需要重启桥接（`group_chat` 写的群开关是实时读取的） |
 | `bridge.ownerQQ` | 唯一允许的私聊用户，也是通知目标 |
 | `bridge.wsUrl` / `token` | 正向 WS 地址与 token（NapCat、SnowLuma 等通用）。旧的 `~/.config/opencode/qq-bridge.json` 只在 `life-world.json` 完全没有 `bridge` 段时兜底；正常情况改这里。 |
 | `bridge.group.enabled` | 群聊开关，默认 `false`；角色也能用 `group_chat` 工具实时开关 |
@@ -291,7 +291,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 | 用户在聊天 | 插件和桥接看到「用户活跃」后，不再发起新的定时/群聊回合 |
 | 定时任务冲突 | 到点的闹钟 `at += deferMinutes`（默认 30 分钟）后放回；回顾/兜底本轮跳过 |
 | QQ 群聊 | 判官和群回复暂停；空闲后只处理最新一批，超过 `groupMaxAgeMinutes` 的旧消息丢弃 |
-| 释放 | 回合结束（`session.idle` / 桥接轮询到回复完成）释放；进程被杀靠 `leaseTtlMinutes` 兜底 |
+| 释放 | 回合结束（`session.idle`；桥接在群回合完成/放弃、私聊 `/new` 或会话删除时）释放；进程被杀靠 `leaseTtlMinutes` 兜底 |
 
 **边界**：只能阻止**新回合**。已经在跑的那一轮无法被抢断（opencode 的取消接口没有接），用户的请求仍要等它结束；QQ 私聊和 TUI 同时来消息同样只能排队。
 
