@@ -213,6 +213,12 @@ function connect() {
   socket.addEventListener("open", () => {
     if (ws !== socket) return
     connectingSince = 0
+    // 慢握手在 60 秒后成功时，看门狗可能已经排了 5 秒重连：取消它，
+    // 否则刚建好的连接会被下一次 connect() 关掉重建。
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
     wsReady = true
     state.lastSeen = new Date().toISOString()
     saveState()
