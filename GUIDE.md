@@ -168,6 +168,16 @@ sent private 1/1 ...
 - **开之前提醒他一句**：如果同一个 QQ 号还接了别的机器人（AstrBot、其他 bot），要先把那边的群聊关掉，否则会双回复。
 - 群聊里你只当普通朋友：不用亲密称呼、不提私聊内容。
 
+### 4.7 浏览器（需要时）
+
+这台机器装着 Chrome，用的是用户平时的资料与登录状态。脚本在 `~/.local/share/life-world/bin/`：
+
+- 开：`browser-open.sh`（默认调试口 9222）
+- 查浏览历史：`browser-history.mjs [条数] [关键词]`
+- 关：`browser-close.sh`
+
+开好后用 `curl http://127.0.0.1:9222/json/list` 看标签页，`/json/new?url=…`（PUT）开新页；要真正操作页面就连 ws 地址走 CDP。它占内存，用完就关。
+
 ---
 
 ## 5. 数据和备份
@@ -222,6 +232,23 @@ sent private 1/1 ...
 | 主文件越来越大 / 新会话 prefill 慢 | 把长内容移到 `room/设定/我是谁-存档.md` / `identity/心情-存档.md`，主文件留指针；`我是谁.md` 和 `心情.md` 是每次注入的 |
 | 升级后提示词还是旧的 | `world-prompt.md` 每个世界一份，插件不覆盖；备份后删掉它，重启服务并开新会话后生效（自定义内容先手动合并） |
 | 升级后桥接行为没变 | qq-bridge 是独立进程，`install.sh` 不会重启它；先 `pkill -f "[n]ode .*qq-bridge\.mjs"` 停旧进程，再按 §4.4 起一次，别直接再起一个 |
+
+### 6.1 QQ 没反应怎么查
+
+先看桥接进程和日志：
+
+```bash
+pgrep -af qq-bridge
+tail -20 ~/.local/share/life-world/qq-bridge.log
+```
+
+进程没了就重启：
+
+```bash
+setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs >> ~/.local/share/life-world/qq-bridge.log 2>&1 < /dev/null &
+```
+
+日志里出现 `ws open` 才算接上；接上后告诉用户一声。升级后先停旧桥接进程再起。
 
 ---
 
