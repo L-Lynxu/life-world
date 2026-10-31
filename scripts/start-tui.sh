@@ -5,7 +5,8 @@ export PATH="$HOME/.opencode/bin:$PATH"
 cd "$HOME" || exit 1
 
 tmux kill-session -t home 2>/dev/null
-pkill -f "^opencode$" 2>/dev/null
+# 不再用 pkill "^opencode$"：那会顺手杀掉用户在其他终端/SSH 里开的裸 opencode。
+# home 会话里的 TUI 已经由 kill-session 带走。
 sleep 1
 
 tmux new-session -d -s home "export PATH=\$HOME/.opencode/bin:\$PATH; cd \$HOME; opencode"

@@ -33,9 +33,6 @@ const PLAN_DIR = join(WORLD, "plan")
 const LOG_FILE = join(ROOT, "debug.log")
 const WORLD_PROMPT_FILE = join(WORLD, "world-prompt.md")
 const DB_PATH = join(HOME, ".local/share/opencode/opencode.db")
-const CHROME_DIR = join(HOME, ".config/google-chrome")
-const CHROME_HISTORY = join(CHROME_DIR, "Default/History")
-const CHROME_PORT = 9222
 /** 插件目录：规则模块 modules/ 也在这里 */
 const PLUGIN_DIR = (import.meta as unknown as { dir?: string }).dir ?? process.cwd()
 const MODULES_DIR = join(PLUGIN_DIR, "modules")
@@ -48,6 +45,21 @@ const RECENT_LIMIT = 80
  * 面向「上下文短、并发差、prefill 慢」的本地模型；接在线模型时保持关闭即可。
  * 打开后在 world.json 里配 localModel: { enabled: true, ... }。
  */
+/** 单并发模型闸门：只在 localModel.enabled 且 concurrency.enabled 时生效 */
+interface ConcurrencyOptions {
+  enabled: boolean
+  /** 用户聊天冲突时，定时任务直接延期多少分钟 */
+  deferMinutes: number
+  /** 用户请求后多少秒内算「正在聊天」 */
+  userActiveSeconds: number
+  /** 群聊在用户/其他回合期间暂停 */
+  groupPause: boolean
+  /** 群聊暂停期间，超过多少分钟的旧消息直接丢弃 */
+  groupMaxAgeMinutes: number
+  /** 租约 TTL：回合结束事件丢失时的兜底 */
+  leaseTtlMinutes: number
+}
+
 interface LocalModelOptions {
   enabled: boolean
   /** 新会话注入的历史条数（0 = 不注入） */
@@ -64,11 +76,15 @@ interface LocalModelOptions {
   preferSubagent: boolean
   /** 是否每轮输出上下文构成统计（调试用） */
   debugStats: boolean
+  /** 单并发模型闸门（默认关闭；在线模型不需要） */
+  concurrency: ConcurrencyOptions
 }
 
 function localModelOptions(): LocalModelOptions {
   const raw = ((readWorld() as { localModel?: Record<string, unknown> }).localModel ?? {}) as Record<string, unknown>
   const num = (k: string, d: number) => (typeof raw[k] === "number" ? (raw[k] as number) : d)
+  const conc = (raw.concurrency && typeof raw.concurrency === "object" ? raw.concurrency : {}) as Record<string, unknown>
+  const cnum = (k: string, d: number) => (typeof conc[k] === "number" && Number.isFinite(conc[k]) ? (conc[k] as number) : d)
   return {
     enabled: raw.enabled === true,
     keepRecent: num("keepRecent", 20),
@@ -78,6 +94,14 @@ function localModelOptions(): LocalModelOptions {
     foldingReasoningTurns: num("foldingReasoningTurns", 0),
     preferSubagent: raw.preferSubagent !== false,
     debugStats: raw.debugStats === true,
+    concurrency: {
+      enabled: conc.enabled === true,
+      deferMinutes: cnum("deferMinutes", 30),
+      userActiveSeconds: cnum("userActiveSeconds", 90),
+      groupPause: conc.groupPause !== false,
+      groupMaxAgeMinutes: cnum("groupMaxAgeMinutes", 10),
+      leaseTtlMinutes: cnum("leaseTtlMinutes", 10),
+    },
   }
 }
 
@@ -143,7 +167,7 @@ const pad = (n: number) => String(n).padStart(2, "0")
 function log(text: string): void {
   try {
     mkdirSync(ROOT, { recursive: true })
-    appendFileSync(LOG_FILE, `${new Date().toISOString()} ${text}\n`)
+    appendFileSync(LOG_FILE, `${new Date().toISOString()} ${text}\n`, { mode: 0o600 })
   } catch {
     // 日志失败不影响请求
   }
@@ -220,6 +244,8 @@ interface Record_ {
 }
 
 const archived = new Set<string>()
+/** 已归档正文的长度：assistant 是流式写入的，同一 id 变长时要补一行修正记录 */
+const archivedLength = new Map<string, number>()
 /** 增量归档的时间游标（毫秒） */
 let cursor = 0
 
@@ -232,7 +258,10 @@ function loadArchive(): void {
         if (!line.trim()) continue
         try {
           const record = JSON.parse(line) as Record_
-          if (record?.id) archived.add(record.id)
+          if (record?.id) {
+            archived.add(record.id)
+            archivedLength.set(record.id, String(record.text ?? "").length)
+          }
           const at = Date.parse(record?.t ?? "")
           if (Number.isFinite(at) && at > cursor) cursor = at
         } catch {
@@ -245,18 +274,24 @@ function loadArchive(): void {
   }
 }
 
-/** 返回是否已落盘（或本来就记过）。写失败时调用方不要推进游标，下一轮重试。 */
-function archive(record: Record_): boolean {
-  if (!record.id || archived.has(record.id) || !record.text) return true
+function appendRecord(record: Record_): boolean {
   try {
-    mkdirSync(CONV_DIR, { recursive: true })
-    appendFileSync(join(CONV_DIR, `${dayOf(new Date(record.t))}.jsonl`), `${JSON.stringify(record)}\n`)
-    archived.add(record.id)
+    mkdirSync(CONV_DIR, { recursive: true, mode: 0o700 })
+    appendFileSync(join(CONV_DIR, `${dayOf(new Date(record.t))}.jsonl`), `${JSON.stringify(record)}\n`, { mode: 0o600 })
     return true
   } catch (error) {
     log(`archive failed: ${String(error)}`)
     return false
   }
+}
+
+/** 返回是否已落盘（或本来就记过）。写失败时调用方不要推进游标，下一轮重试。 */
+function archive(record: Record_): boolean {
+  if (!record.id || archived.has(record.id) || !record.text) return true
+  if (!appendRecord(record)) return false
+  archived.add(record.id)
+  archivedLength.set(record.id, record.text.length)
+  return true
 }
 
 interface StoredRow {
@@ -281,6 +316,8 @@ function readJudgeIds(): Set<string> {
   return ids
 }
 
+let sessionColumnWarned = false
+
 /** 直接从 opencode 的消息库读增量：不依赖 API，assistant 的回复也在。 */
 function scanMessages(afterMs: number, excludeSessions: string[] = []): StoredRow[] {
   if (!existsSync(DB_PATH)) return []
@@ -303,6 +340,10 @@ function scanMessages(afterMs: number, excludeSessions: string[] = []): StoredRo
            order by time_created asc limit 500`,
         )
         .all(afterMs, ...excludeSessions) as unknown as StoredRow[]
+    }
+    if (!sessionColumn && excludeSessions.length > 0 && !sessionColumnWarned) {
+      sessionColumnWarned = true
+      log("session_message has no session_id column: judge sessions cannot be excluded from archive")
     }
     return db
       .prepare(
@@ -331,11 +372,41 @@ function textFromRow(type: string, dataJson: string): string {
   }
 }
 
+/**
+ * 补全流式写入的 assistant 正文。
+ * opencode 可能在生成中途就把 assistant 行读得到：只归档当时的半截内容，
+ * 之后同一 id 的文本变长时不会补写（archived 去重）。这里按 id 追加修正记录，
+ * recentRecords 按 id 保留最后一条，记忆里拿到的就是完整正文。
+ */
+let lastArchiveFixScan = 0
+function fixPartialArchives(judgeIds: string[]): number {
+  if (Date.now() - lastArchiveFixScan < 5000) return 0
+  lastArchiveFixScan = Date.now()
+  let fixed = 0
+  for (const row of scanMessages(Date.now() - 20 * 60_000, judgeIds)) {
+    const known = archivedLength.get(row.id)
+    if (known === undefined) continue
+    const text = textFromRow(row.type, row.data)
+    if (!text || text.length <= known) continue
+    const record: Record_ = {
+      id: row.id,
+      t: new Date(row.time_created).toISOString(),
+      role: row.type as "user" | "assistant",
+      text,
+    }
+    if (!appendRecord(record)) break
+    archivedLength.set(row.id, text.length)
+    fixed += 1
+  }
+  return fixed
+}
+
 function ingest(): void {
   try {
     // 判官会话（发给在线模型做群聊读空气）不能进原文归档，
     // 否则它的指令/判定会被 recentRecords 当成「我」说过的话注入角色记忆。
-    const rows = scanMessages(cursor, [...readJudgeIds()])
+    const judgeIds = [...readJudgeIds()]
+    const rows = scanMessages(cursor, judgeIds)
     let added = 0
     for (const row of rows) {
       const nextCursor = Math.max(cursor, row.time_created)
@@ -349,7 +420,9 @@ function ingest(): void {
       cursor = nextCursor
       added += 1
     }
+    const fixed = fixPartialArchives(judgeIds)
     if (added > 0) log(`ingest +${added} (cursor=${cursor})`)
+    if (fixed > 0) log(`archive updated +${fixed}`)
   } catch (error) {
     log(`ingest failed: ${String(error)}`)
   }
@@ -378,14 +451,17 @@ function recentRecords(limit = readConfig().world.recentLimit): Record_[] {
         }
       }
     }
-    // 两个进程各跑一份 ingest 时同一句会被 append 两次：按 id 去重再取最近 N 条
-    const seen = new Set<string>()
-    const unique = records.filter((record) => {
-      if (!record?.id) return true
-      if (seen.has(record.id)) return false
-      seen.add(record.id)
-      return true
-    })
+    // 两个进程各跑一份 ingest 时同一句会被 append 两次；流式回复也会追加修正记录。
+    // 按 id 去重、保留**最后**一条（修正后的完整正文），顺序按首次出现的位置。
+    const order: string[] = []
+    const byId = new Map<string, Record_>()
+    const loose: Record_[] = []
+    for (const record of records) {
+      if (!record?.id) { loose.push(record); continue }
+      if (!byId.has(record.id)) order.push(record.id)
+      byId.set(record.id, record)
+    }
+    const unique = [...order.map((id) => byId.get(id) as Record_), ...loose]
     return unique.slice(-limit)
   } catch (error) {
     log(`recentRecords failed: ${String(error)}`)
@@ -638,64 +714,6 @@ function diaryIndex(): string {
   }
 }
 
-// ———————————————————————— 浏览器 ————————————————————————
-
-/** Chrome 的 History 时间是 WebKit 纪元（1601-01-01 起的微秒）。 */
-function webkitToDate(ts: number): Date | undefined {
-  if (!Number.isFinite(ts) || ts <= 0) return undefined
-  return new Date(ts / 1000 - 11_644_473_600_000)
-}
-
-interface HistoryRow {
-  url: string
-  title: string
-  visit_count: number
-  last_visit_time: number
-}
-
-/** 读 Chrome 浏览历史：先复制一份再查，避免被运行中的 Chrome 锁住。 */
-function readHistory(limit: number, query?: string): { rows: HistoryRow[]; raw: number } | { error: string } {
-  try {
-    if (!existsSync(CHROME_HISTORY)) return { error: "这台机器上没有 Chrome 历史记录。" }
-    const cache = join(ROOT, "cache")
-    mkdirSync(cache, { recursive: true })
-    const copy = join(cache, "history.db")
-    copyFileSync(CHROME_HISTORY, copy)
-    for (const suffix of ["-wal", "-shm"]) {
-      const from = CHROME_HISTORY + suffix
-      if (existsSync(from)) copyFileSync(from, copy + suffix)
-    }
-    const db = new DatabaseSync(copy, { readOnly: true })
-    try {
-      const base = "select url, title, visit_count, last_visit_time from urls"
-      const order = " order by last_visit_time desc"
-      const rows = query
-        ? (db
-            .prepare(`${base} where url like ? or title like ?${order} limit ?`)
-            .all(`%${query}%`, `%${query}%`, limit) as unknown as HistoryRow[])
-        : (db.prepare(`${base}${order} limit ?`).all(limit) as unknown as HistoryRow[])
-      const total = (db.prepare("select count(*) as n from urls").get() as { n: number }).n
-      return { rows, raw: total }
-    } finally {
-      db.close()
-    }
-  } catch (error) {
-    return { error: `读历史失败：${String(error)}` }
-  }
-}
-
-async function debuggingReady(): Promise<boolean> {
-  try {
-    const port = readConfig().world.browserPort
-    const response = await fetch(`http://127.0.0.1:${port}/json/version`, {
-      signal: AbortSignal.timeout(1500),
-    })
-    return response.ok
-  } catch {
-    return false
-  }
-}
-
 // ———————————————————————— 颜文字 ————————————————————————
 
 /** 中文场景 → 原始分类 slug（与 Claude Code 那边的 pick.js 同一张表） */
@@ -824,7 +842,6 @@ interface WorldSettings {
   summaryLimit: number
   alarmStaleHours: number
   resetCooldownMinutes: number
-  browserPort: number
   homeTitle: string
 }
 
@@ -890,7 +907,6 @@ function defaultConfig(): LifeWorldConfig {
       summaryLimit: SUMMARY_LIMIT,
       alarmStaleHours: 6,
       resetCooldownMinutes: 5,
-      browserPort: CHROME_PORT,
       homeTitle: HOME_TITLE,
     },
     localModel: {
@@ -950,6 +966,7 @@ function normalizeConfig(config: LifeWorldConfig): LifeWorldConfig {
 
   const world = obj(config?.world)
   const local = obj(config?.localModel)
+  const conc = obj(local.concurrency)
   const bridge = obj(config?.bridge)
   const group = obj(bridge.group)
   const wake = str(world.fallbackWakeTime, base.world.fallbackWakeTime)
@@ -976,7 +993,6 @@ function normalizeConfig(config: LifeWorldConfig): LifeWorldConfig {
       summaryLimit: Math.floor(num(world.summaryLimit, base.world.summaryLimit, 1)),
       alarmStaleHours: num(world.alarmStaleHours, base.world.alarmStaleHours, 0),
       resetCooldownMinutes: num(world.resetCooldownMinutes, base.world.resetCooldownMinutes, 0),
-      browserPort: Math.floor(num(world.browserPort, base.world.browserPort, 1, 65535)),
       homeTitle: str(world.homeTitle, base.world.homeTitle),
     },
     localModel: {
@@ -989,6 +1005,14 @@ function normalizeConfig(config: LifeWorldConfig): LifeWorldConfig {
       foldingReasoningTurns: Math.floor(num(local.foldingReasoningTurns, 0, -1)),
       preferSubagent: bool(local.preferSubagent, true),
       debugStats: bool(local.debugStats, false),
+      concurrency: {
+        enabled: bool(conc.enabled, false),
+        deferMinutes: Math.floor(num(conc.deferMinutes, 30, 1)),
+        userActiveSeconds: Math.floor(num(conc.userActiveSeconds, 90, 5)),
+        groupPause: bool(conc.groupPause, true),
+        groupMaxAgeMinutes: Math.floor(num(conc.groupMaxAgeMinutes, 10, 0)),
+        leaseTtlMinutes: Math.floor(num(conc.leaseTtlMinutes, 10, 1)),
+      },
     },
     bridge: {
       ...bridge,
@@ -1090,7 +1114,7 @@ function readConfig(): LifeWorldConfig {
   return configFromLegacy()
 }
 
-function writeConfig(config: LifeWorldConfig): void {
+function writeConfig(config: LifeWorldConfig): boolean {
   try {
     mkdirSync(dirname(CONFIG_FILE), { recursive: true })
     // 写回时保留 schema 之外的键（比如 bridge.napcat / private 这类兼容字段、
@@ -1099,8 +1123,10 @@ function writeConfig(config: LifeWorldConfig): void {
     try { extra = JSON.parse(readFileSync(CONFIG_FILE, "utf8")) } catch { extra = undefined }
     const base = extra && typeof extra === "object" && !Array.isArray(extra) ? extra : {}
     atomicWrite(CONFIG_FILE, JSON.stringify(deepMerge(base, normalizeConfig(config)), null, 2), 0o600)
+    return true
   } catch (error) {
     log(`writeConfig failed: ${String(error)}`)
+    return false
   }
 }
 
@@ -1164,17 +1190,168 @@ function readWorld(): WorldState {
 }
 
 /** 只写运行时状态；设置留在 life-world.json，避免每 30 秒写回覆盖用户配置 */
+/** 写 world.json 失败后的冷却：磁盘满/只读时，别每 30 秒重发一遍完整模型回合 */
+let worldWriteBlockedUntil = 0
+
 function writeWorld(state: WorldState): boolean {
   try {
     mkdirSync(WORLD, { recursive: true })
     const runtime: any = { ...state }
     for (const key of ["enabled", "running", "reviewHour", "fallbackWakeTime", "resetHour", "localModel"]) delete runtime[key]
-    atomicWrite(WORLD_FILE, JSON.stringify(runtime, null, 2))
+    atomicWrite(WORLD_FILE, JSON.stringify(runtime, null, 2), 0o600)
     return true
   } catch (error) {
     log(`writeWorld failed: ${String(error)}`)
+    worldWriteBlockedUntil = Date.now() + 5 * 60_000
     return false
   }
+}
+
+// ———————————————————————— 单并发模型闸门 ————————————————————————
+// 只有本地单并发模型才需要：接在线 API 时 localModel.enabled / concurrency.enabled 都关着，
+// 下面这些函数不会读写任何文件。
+
+interface GateState {
+  owner?: string
+  kind?: string
+  since?: string
+  expires?: string
+  userActiveUntil?: string
+}
+
+let gateLogAt = 0
+let idleShapeLogged = false
+
+function gateEnabled(): boolean {
+  const opt = localModelOptions()
+  return opt.enabled && opt.concurrency.enabled
+}
+
+function readGateState(): GateState {
+  try {
+    return JSON.parse(readFileSync(GATE_FILE, "utf8")) as GateState
+  } catch {
+    return {}
+  }
+}
+
+function writeGateState(state: GateState): void {
+  try {
+    mkdirSync(WORLD, { recursive: true })
+    atomicWrite(GATE_FILE, JSON.stringify(state, null, 2), 0o600)
+  } catch (error) {
+    log(`gate write failed: ${String(error)}`)
+  }
+}
+
+/** 闸门文件很短，用 wx 锁把读改写串起来；陈旧锁 5 秒自动接管 */
+function withGateLock<T>(fn: () => T): T | undefined {
+  const acquire = (): boolean => {
+    try {
+      const fd = openSync(GATE_LOCK_FILE, "wx")
+      closeSync(fd)
+      return true
+    } catch (error) {
+      if ((error as { code?: string })?.code !== "EEXIST") return false
+      try {
+        if (Date.now() - statSync(GATE_LOCK_FILE).mtimeMs > 5000) {
+          unlinkSync(GATE_LOCK_FILE)
+          return acquire()
+        }
+      } catch { return acquire() }
+      return false
+    }
+  }
+  if (!acquire()) return undefined
+  try {
+    return fn()
+  } finally {
+    try { unlinkSync(GATE_LOCK_FILE) } catch { /* 已被别人清掉 */ }
+  }
+}
+
+/** 现在是否应该让非用户回合让路 */
+function gateBusy(): boolean {
+  const state = readGateState()
+  const expires = state.expires ? Date.parse(state.expires) : 0
+  if (state.owner && Number.isFinite(expires) && expires > Date.now()) return true
+  const until = state.userActiveUntil ? Date.parse(state.userActiveUntil) : 0
+  return Number.isFinite(until) && until > Date.now()
+}
+
+/** 用户会话每次请求都调用：刷新活跃时间，并把租约抢到自己名下（用户优先级最高） */
+function markUserActive(owner: string): void {
+  const opt = localModelOptions()
+  if (!opt.enabled || !opt.concurrency.enabled || !owner) return
+  withGateLock(() => {
+    const state = readGateState()
+    const now = Date.now()
+    state.userActiveUntil = new Date(now + opt.concurrency.userActiveSeconds * 1000).toISOString()
+    const expires = state.expires ? Date.parse(state.expires) : 0
+    const free = !state.owner || !Number.isFinite(expires) || expires <= now
+    if (free || state.owner === owner) {
+      state.owner = owner
+      state.kind = "user"
+      state.since = state.since ?? new Date().toISOString()
+      state.expires = new Date(now + opt.concurrency.leaseTtlMinutes * 60_000).toISOString()
+    }
+    writeGateState(state)
+  })
+}
+
+/** 定时任务/群聊发 prompt 前领租约；忙则返回 false（调用方自己延期） */
+function acquireGate(owner: string, kind: string): boolean {
+  const opt = localModelOptions()
+  if (!opt.enabled || !opt.concurrency.enabled) return true
+  return withGateLock(() => {
+    const state = readGateState()
+    const now = Date.now()
+    const expires = state.expires ? Date.parse(state.expires) : 0
+    if (state.owner === owner) {
+      state.expires = new Date(now + opt.concurrency.leaseTtlMinutes * 60_000).toISOString()
+      writeGateState(state)
+      return true
+    }
+    if (state.owner && Number.isFinite(expires) && expires > now) return false
+    const until = state.userActiveUntil ? Date.parse(state.userActiveUntil) : 0
+    if (Number.isFinite(until) && until > now) return false
+    writeGateState({
+      ...state,
+      owner,
+      kind,
+      since: new Date(now).toISOString(),
+      expires: new Date(now + opt.concurrency.leaseTtlMinutes * 60_000).toISOString(),
+    })
+    return true
+  }) ?? false
+}
+
+/** idle 事件拿不到 sessionID 时的兜底：按 kind 释放定时/用户租约 */
+function releaseGateByKind(kind: string): void {
+  if (!gateEnabled()) return
+  withGateLock(() => {
+    const state = readGateState()
+    if (state.kind !== kind) return
+    delete state.owner
+    delete state.kind
+    delete state.since
+    delete state.expires
+    writeGateState(state)
+  })
+}
+
+/** 回合结束（session.idle）释放自己持有的租约 */
+function releaseGate(owner: string): void {
+  if (!owner || !gateEnabled()) return
+  withGateLock(() => {
+    const state = readGateState()
+    if (state.owner !== owner) return
+    delete state.owner
+    delete state.kind
+    delete state.since
+    delete state.expires
+    writeGateState(state)
+  })
 }
 
 function homeTitle(): string {
@@ -1212,6 +1389,9 @@ let lastSession = ""
 let currentSessionID = ""
 
 const LOCK_FILE = join(WORLD, ".timer.lock")
+/** 单并发模型闸门（插件与 QQ 桥接共享） */
+const GATE_FILE = join(WORLD, "model-gate.json")
+const GATE_LOCK_FILE = join(WORLD, ".model-gate.lock")
 /** 锁建不出来（目录不可写 / 磁盘满）时限频记日志，否则定时器会静默停转 */
 let lockErrorLoggedAt = 0
 
@@ -1315,7 +1495,7 @@ async function ensureHome(): Promise<string | undefined> {
       // 家会话不该是 QQ 会话：立家会改名并破坏 qq-chat / qq-group-* 的识别。
       // 标题可能已经被改成 life-world home session，所以同步查桥接状态里的会话 id。
       // 发现这种（升级前可能被误立的）就地摘掉，下一轮按「家缺失」重建。
-      if (qqSessionKind(current) || title === qqPrivateTitle() || title.startsWith("qq-group-")) {
+      if (qqSessionKind(current) || title === qqPrivateTitle() || title.startsWith("qq-group-") || title === "qq-judge") {
         const fresh = readWorld()
         if (fresh.homeSessionId === current) {
           delete fresh.homeSessionId
@@ -1399,7 +1579,18 @@ async function withLock<T>(fn: () => Promise<T>): Promise<T | undefined> {
         return false
       }
       try {
-        if (Date.now() - statSync(LOCK_FILE).mtimeMs > 90_000) {
+        const stale = Date.now() - statSync(LOCK_FILE).mtimeMs > 90_000
+        // 持锁进程被硬杀时 mtime 要等 90 秒才过期；能读到 pid 就直接判断它还在不在
+        let ownerDead = false
+        try {
+          const ownerPid = Number(readFileSync(LOCK_FILE, "utf8").split(":")[0])
+          if (ownerPid) {
+            try { process.kill(ownerPid, 0) } catch (probe) {
+              ownerDead = (probe as { code?: string })?.code === "ESRCH"
+            }
+          }
+        } catch { /* 锁文件刚被删 */ }
+        if (stale || ownerDead) {
           unlinkSync(LOCK_FILE)
           return acquire()
         }
@@ -1527,7 +1718,7 @@ export default Plugin.define({
 
   async setup(ctx) {
     for (const dir of [CONV_DIR, DIARY_DIR, PLAN_DIR, OUTBOX_DIR, join(WORLD, "room"), IDENTITY_DIR]) {
-      try { mkdirSync(dir, { recursive: true }) } catch { /* 建不出来也就这样 */ }
+      try { mkdirSync(dir, { recursive: true, mode: 0o700 }) } catch { /* 建不出来也就这样 */ }
     }
     ensureWorldPrompt()
     ensureMood()
@@ -1625,6 +1816,10 @@ export default Plugin.define({
         // —— 3b. 新会话第一次：注入我是谁 + 日记索引 + 最近原文 ——
         const sessionID = String(event.sessionID ?? "")
         if (sessionID) currentSessionID = sessionID
+        // 单并发闸门：用户直接会话（TUI / QQ 私聊）标记活跃；群聊不标
+        if (sessionID && gateEnabled() && qqSessionKind(sessionID) !== "group") {
+          markUserActive(sessionID)
+        }
 
         // —— 3b0. QQ 会话：标记私聊/群聊，稍后在记忆之后注入对应风格 ——
         if (sessionID && !qqStyleChecked.has(sessionID)) {
@@ -1680,7 +1875,7 @@ export default Plugin.define({
             if (self.status !== "ok") return
             lastSession = sessionID
             const selfTitle = String(self.title ?? "")
-            if (qqSessionKind(sessionID) || selfTitle === qqPrivateTitle() || selfTitle.startsWith("qq-group-")) return
+            if (qqSessionKind(sessionID) || selfTitle === qqPrivateTitle() || selfTitle.startsWith("qq-group-") || selfTitle === "qq-judge") return
             if (!current) {
               electHome(sessionID)
               return
@@ -1948,7 +2143,8 @@ export default Plugin.define({
               mkdirSync(OUTBOX_DIR, { recursive: true })
               appendFileSync(
                 join(OUTBOX_DIR, `${dayOf(new Date())}.jsonl`),
-                `${JSON.stringify({ t: new Date().toISOString(), kind: "reach", text })}\n`,
+                `${JSON.stringify({ t: new Date().toISOString(), kind: "reach", text, session: sessionID })}\n`,
+                { mode: 0o600 },
               )
               log(`reach_out · ${text.slice(0, 60)}`)
             } catch (error) {
@@ -1972,7 +2168,7 @@ export default Plugin.define({
             try {
               const config = readConfig()
               config.bridge.group = { ...(config.bridge.group ?? {}), enabled: input.enabled }
-              writeConfig(config)
+              if (!writeConfig(config)) return ok("开关没能写进 life-world.json（磁盘/权限问题），桥接那边实际没变，看看 debug.log。")
               log(`group_chat · ${input.enabled ? "on" : "off"}`)
               return ok(`QQ 群聊已${input.enabled ? "开启" : "关闭"}。`)
             } catch (error) {
@@ -2047,6 +2243,8 @@ export default Plugin.define({
     const timer = setInterval(async () => {
       // 总开关关掉：不回顾、不闹钟、不兜底、不往外发消息，连家会话都不重建
       if (!worldEnabled()) return
+      // world.json 写不进去（磁盘满/只读）时先停 5 分钟：否则「发了消息但记不上账」会每 30 秒重发一整轮
+      if (Date.now() < worldWriteBlockedUntil) return
       await withLock(async () => {
         try {
           const nowDate = new Date()
@@ -2060,6 +2258,11 @@ export default Plugin.define({
           const resetHour = state.resetHour
           if (isServiceProcess() && typeof resetHour === "number" && nowDate.getHours() >= resetHour && state.lastResetDate !== today) {
             const fresh = readWorld()
+            // 先看冷却：还在冷却里就下轮再试，不能先把 lastResetDate 写掉，
+            // 否则今晚这一次重置会被静默跳过、当天也不再重试。
+            const lastReset = fresh.lastResetAt ? Date.parse(fresh.lastResetAt) : 0
+            const cooldownMs = readConfig().world.resetCooldownMinutes * 60_000
+            if (Number.isFinite(lastReset) && Date.now() - lastReset < cooldownMs) return
             fresh.lastResetDate = today
             writeWorld(fresh)
             await resetTmuxAndHome("nightly")
@@ -2070,25 +2273,67 @@ export default Plugin.define({
           const home = await ensureHome()
           if (!home) return // 家会话重建中/不可用，下一轮再发
 
+          // —— 单并发闸门：用户正在聊天/别的回合还在跑时，定时任务整体让路 ——
+          // 只有 localModel.enabled && localModel.concurrency.enabled 时才生效。
+          const gateOn = gateEnabled()
+          const deferDueAlarms = () => {
+            const deferMinutes = localModelOptions().concurrency.deferMinutes
+            const nowMs = Date.now()
+            const fresh = readWorld()
+            const dueIds = new Set(
+              (fresh.alarms ?? []).filter((alarm) => {
+                const at = Date.parse(alarm.at)
+                return Number.isFinite(at) && at <= nowMs
+              }).map((alarm) => alarm.id),
+            )
+            if (dueIds.size === 0) return
+            fresh.alarms = (fresh.alarms ?? []).map((alarm) =>
+              dueIds.has(alarm.id)
+                ? { ...alarm, at: new Date(Date.parse(alarm.at) + deferMinutes * 60_000).toISOString() }
+                : alarm,
+            )
+            writeWorld(fresh)
+            log(`alarms deferred · ${dueIds.size} × ${deferMinutes}m (model gate busy)`)
+          }
+          const logGateSkip = (what: string) => {
+            if (Date.now() - gateLogAt < 300_000) return
+            gateLogAt = Date.now()
+            log(`${what} deferred (model gate busy)`)
+          }
+          if (gateOn && gateBusy()) {
+            deferDueAlarms()
+            logGateSkip("timer")
+            return
+          }
+
           // 每日回顾：当晚 reviewHour 之后，一天一次；发送成功才记 lastReview。
           // 机器在 23 点那一小时里睡着/关机的话，第二天凌晨（6 点前）补做昨天的，
           // 否则那一天永远不会被回顾。
           const yesterday = dayOf(new Date(nowDate.getTime() - 86_400_000))
           const reviewSetting = state.reviewHour ?? 23
           const currentHour = nowDate.getHours()
+          // reviewHour 落在 0~5 点表示「凌晨回顾昨天」：目标日应该是昨天，
+          // 而不是刚开始两小时的新一天。
+          const reviewTarget = reviewSetting < 6 ? yesterday : today
           const reviewDay =
             currentHour >= reviewSetting
-              ? (state.lastReview !== today ? today : "")
+              ? (state.lastReview !== reviewTarget ? reviewTarget : "")
               // 补做昨天：必须排除「今天已经回顾过」——否则在 reviewHour=0~5 时，
               // 上一分支刚把 lastReview 写成今天，这里又会去补昨天，两个日期来回翻转。
               : currentHour < 6 && state.lastReview && state.lastReview !== yesterday && state.lastReview !== today
                 ? yesterday
                 : ""
-          if (reviewDay && await sendHome(home, reviewText(reviewDay))) {
-            const fresh = readWorld()
-            fresh.lastReview = reviewDay
-            writeWorld(fresh)
-            log(`daily review · ${reviewDay}`)
+          if (reviewDay) {
+            if (gateOn && !acquireGate(home, "timer")) {
+              logGateSkip("review")
+            } else if (await sendHome(home, reviewText(reviewDay))) {
+              const fresh = readWorld()
+              fresh.lastReview = reviewDay
+              writeWorld(fresh)
+              log(`daily review · ${reviewDay}`)
+            } else if (gateOn) {
+              releaseGate(home)
+            }
           }
 
           // —— 先处理到点的闹钟：到点才消费；发送失败就留在 alarms 里，下一轮重试 ——
@@ -2109,6 +2354,12 @@ export default Plugin.define({
             if (Number.isFinite(at) && Date.now() - at > staleMs) stale.push(alarm)
             else onTime.push(alarm)
           }
+          let timerSendOk = false
+          if (gateOn && due.length > 0 && !acquireGate(home, "timer")) {
+            deferDueAlarms()
+            logGateSkip("alarms")
+            return
+          }
           for (const alarm of onTime) {
             const text =
               `【我的时间】${shortStamp(alarm.at)} 到了，说好做到这里是：${String(alarm.note ?? "（没有写）")}。\n` +
@@ -2121,6 +2372,7 @@ export default Plugin.define({
               // 不能把新的一天标成 lastWake，否则会吃掉当天早上的兜底。
               if (dayOf(new Date(alarm.at)) === today) fresh.lastWake = today
               writeWorld(fresh)
+              timerSendOk = true
               log(`alarm fired · ${alarm.note}`)
             } else {
               log(`alarm deferred · ${alarm.note}`)
@@ -2147,11 +2399,14 @@ export default Plugin.define({
               // 不能把新的一天标成 lastWake，否则会吃掉当天早上的兜底。
               if (stale.some((alarm) => dayOf(new Date(alarm.at)) === today)) fresh.lastWake = today
               writeWorld(fresh)
+              timerSendOk = true
               log(`alarm backlog flushed · ${stale.length}`)
             } else {
               log(`alarm backlog deferred · ${stale.length}`)
             }
           }
+
+          if (gateOn && due.length > 0 && !timerSendOk) releaseGate(home)
 
           // —— 早上兜底：今天没有别的安排时，才叫醒她拟计划 ——
           // 判据只看「今天排着的闹钟」（含已到点还没送出去的那几个）；明天以后的闹钟不算，
@@ -2173,6 +2428,10 @@ export default Plugin.define({
           const wakeMinutes = fh * 60 + fm
           // 只在「早上」那一段窗口里叫醒（默认 09:00 起 4 小时内），免得半夜启动也喊早上好
           if (nowMinutes < wakeMinutes || nowMinutes >= wakeMinutes + 240) return
+          if (gateOn && !acquireGate(home, "timer")) {
+            logGateSkip("fallback wake")
+            return
+          }
           const wakeText =
             `【我的时间】早上了，新的一天。先看看今天的安排：${join(PLAN_DIR, `${today}.md`)}。\n` +
             "没有的话，就自己拟一份大概的全天计划——今天想做哪几件事、大概什么时候做，不用太细，写得能对照就行。\n" +
@@ -2182,6 +2441,8 @@ export default Plugin.define({
             fresh.lastWake = today
             writeWorld(fresh)
             log(`fallback wake · ${today}`)
+          } else if (gateOn) {
+            releaseGate(home)
           }
         } catch (error) {
           log(`alarm loop failed: ${String(error)}`)
@@ -2193,10 +2454,28 @@ export default Plugin.define({
     // 事件订阅放最后且单独兜底：失败不能影响上面的钩子
     try {
       await ctx.event.subscribe((event: unknown) => {
-        const type = (event as { type?: string })?.type ?? ""
-        if (type === "session.idle" || type === "session.created") {
-          ingest()
+        const payload = event as {
+          type?: string
+          sessionID?: string
+          properties?: { sessionID?: string; session_id?: string }
+          data?: { sessionID?: string }
         }
+        const type = payload?.type ?? ""
+        if (type !== "session.idle" && type !== "session.created") return
+        if (type === "session.idle") {
+          const sessionID = String(
+            payload?.properties?.sessionID ?? payload?.properties?.session_id ?? payload?.sessionID ?? payload?.data?.sessionID ?? "",
+          )
+          if (sessionID) {
+            releaseGate(sessionID)
+          } else {
+            // 有些版本的事件不带 sessionID：按 kind 兜底释放定时/用户租约，避免卡满 TTL
+            if (!idleShapeLogged) { idleShapeLogged = true; log("session.idle without sessionID, releasing by kind") }
+            releaseGateByKind("timer")
+            releaseGateByKind("user")
+          }
+        }
+        ingest()
       })
     } catch (error) {
       log(`event.subscribe failed: ${error instanceof Error ? error.message : String(error)}`)

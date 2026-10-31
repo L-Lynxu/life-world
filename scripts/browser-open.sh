@@ -19,7 +19,7 @@ if [ -z "$CHROME_BIN" ] || [ ! -x "$CHROME_BIN" ]; then
 fi
 
 # 如果已经有一个不带调试口的 Chrome 在跑，新命令只会被转交给它，调试口永远开不出来
-if pgrep -x google-chrome >/dev/null 2>&1 || pgrep -x chrome >/dev/null 2>&1; then
+if pgrep -x google-chrome >/dev/null 2>&1 || pgrep -x chrome >/dev/null 2>&1 || pgrep -x chromium >/dev/null 2>&1; then
   echo "已经有一个 Chrome 开着，但没带调试口。先关掉它再来（不要用 browser-close.sh：它只杀调试口那个实例）。"
   exit 1
 fi

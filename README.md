@@ -127,7 +127,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 
 - `/new`：删除 `qq-chat`，下一条消息或她的 `reach_out` 再新建。
 - **outbox 补发**：投递游标按天记录；桥接启动/重连时会扫最近 3 天，把没送出去的补发（跨天离线也不丢）。
-- 回复按行拆成多条：每个短句一条 QQ 消息，两条之间按下一句长度停顿约 1.5~3 秒（加随机抖动），模拟真人打字。
+- 回复按行拆成多条：每个短句一条 QQ 消息，两条之间按下一句长度停顿约 1.5~5 秒（加随机抖动），模拟真人打字。
 - 若这一轮正文为空、但她调用了 `reach_out`，桥接会把这一轮缓冲的那些行当回复发出去，避免漏回。
 - 开关关闭或桥接离线（心跳超过 90 秒）时，角色会看到「reach_out 不会送达」，不会以为已经通知到你。
 - `life-world.json` 含凭据（token），权限 600，别外传；旧 `qq-bridge.json` 仅作兜底。
@@ -194,10 +194,14 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
   "world": {
     "enabled": true, "running": true, "reviewHour": 23, "fallbackWakeTime": "09:00",
     "resetHour": null, "recentLimit": 80, "summaryLimit": 12000,
-    "alarmStaleHours": 6, "resetCooldownMinutes": 5, "browserPort": 9222,
+    "alarmStaleHours": 6, "resetCooldownMinutes": 5,
     "homeTitle": "life-world home session"
   },
-  "localModel": { "enabled": false, "keepRecent": 20, "foldRecentContext": 6, "resultChars": 300, "foldToolMessages": true, "foldingReasoningTurns": 0, "preferSubagent": true, "debugStats": false },
+  "localModel": {
+    "enabled": false, "keepRecent": 20, "foldRecentContext": 6, "resultChars": 300,
+    "foldToolMessages": true, "foldingReasoningTurns": 0, "preferSubagent": true, "debugStats": false,
+    "concurrency": { "enabled": false, "deferMinutes": 30, "userActiveSeconds": 90, "groupPause": true, "groupMaxAgeMinutes": 10, "leaseTtlMinutes": 10 }
+  },
   "bridge": {
     "enabled": false, "ownerQQ": 0, "ownerName": "", "wsUrl": "ws://127.0.0.1:3001",
     "token": "", "privateSessionTitle": "qq-chat", "location": "",
@@ -208,7 +212,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 
 | 区块 | 主要字段 |
 |---|---|
-| `world` | 总开关 `enabled`、暂停打扰 `running`、回顾 `reviewHour`、早上兜底 `fallbackWakeTime`、夜间重置 `resetHour`、注入/压缩/积压/冷却/浏览器/家会话标题等 |
+| `world` | 总开关 `enabled`、暂停打扰 `running`、回顾 `reviewHour`、早上兜底 `fallbackWakeTime`、夜间重置 `resetHour`、注入/压缩/积压/冷却/家会话标题等 |
 | `localModel` | 本地小模型优化，见下文 |
 | `bridge` | QQ/OneBot 桥接，见下文 QQ 一节 |
 
@@ -230,6 +234,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 - 颜文字数据 `data/kaomoji.json` 为随附资源；发布前请确认其来源与许可证。
 - 权限是提示词软约束，没有 `ctx.permission` 硬拦截（有意为之）。
 - QQ 桥接私聊 / 群聊都已实现；群聊默认关闭。
+- 浏览器脚本复用 `~/.config/google-chrome-agent` 这份资料：首次使用需要先把真实 Chrome 资料迁过去（或按部署 worklog 建软链），否则打开的是空 profile、不带登录态。
 
 ## 本地小模型优化（可选，默认关闭）
 
@@ -262,6 +267,33 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 | `foldingReasoningTurns` | 0 | 保留最近几轮的推理；0 = 全折，-1 = 不折 |
 | `preferSubagent` | `true` | 注入「在线模型子代理」提示：有在线模型时把抓网页/调研这类重活委托过去 |
 | `debugStats` | `false` | 每轮往 debug.log 写一行上下文构成统计（调参用） |
+| `concurrency` | 见下 | 单并发模型闸门，默认关闭 |
+
+### 单并发模型闸门（`localModel.concurrency`）
+
+给「同一时间只能跑一个请求」的本地模型用。**接在线 API 时保持默认关闭**，本功能完全 no-op。
+
+```json
+"concurrency": {
+  "enabled": false,
+  "deferMinutes": 30,
+  "userActiveSeconds": 90,
+  "groupPause": true,
+  "groupMaxAgeMinutes": 10,
+  "leaseTtlMinutes": 10
+}
+```
+
+打开后（且 `localModel.enabled` 也为 true）：
+
+| 规则 | 行为 |
+|---|---|
+| 用户在聊天 | 插件和桥接看到「用户活跃」后，不再发起新的定时/群聊回合 |
+| 定时任务冲突 | 到点的闹钟 `at += deferMinutes`（默认 30 分钟）后放回；回顾/兜底本轮跳过 |
+| QQ 群聊 | 判官和群回复暂停；空闲后只处理最新一批，超过 `groupMaxAgeMinutes` 的旧消息丢弃 |
+| 释放 | 回合结束（`session.idle` / 桥接轮询到回复完成）释放；进程被杀靠 `leaseTtlMinutes` 兜底 |
+
+**边界**：只能阻止**新回合**。已经在跑的那一轮无法被抢断（opencode 的取消接口没有接），用户的请求仍要等它结束；QQ 私聊和 TUI 同时来消息同样只能排队。
 
 **实测**（395 迷你主机 + Qwen3.8-Flash-Next IQ3_XXS，opencode 2.2.5）：同一条会话，每轮请求从 **306 KB / 20 万 token** 降到 **25 KB 上下**，单轮耗时从 145–222 秒降到几十秒。
 

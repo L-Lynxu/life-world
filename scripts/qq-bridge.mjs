@@ -23,6 +23,10 @@ const LIFEWORLD_CONFIG_FILE = join(HOME, ".local/share/life-world/life-world.jso
 /** 旧桥接配置：新 life-world.json 没有 bridge 时兜底 */
 const CONFIG_FILE = join(HOME, ".config/opencode/qq-bridge.json")
 const STATE_FILE = join(HOME, ".local/share/life-world/qq-bridge-state.json")
+/** 单并发模型闸门：与插件共享同一个文件 */
+const GATE_FILE = join(HOME, ".local/share/life-world/worlds/default/model-gate.json")
+const GATE_LOCK_FILE = join(HOME, ".local/share/life-world/worlds/default/.model-gate.lock")
+const INSTANCE_LOCK = join(HOME, ".local/share/life-world/qq-bridge.lock")
 const OUTBOX_DIR = join(HOME, ".local/share/life-world/worlds/default/outbox")
 const JUDGE_SESSION_FILE = join(HOME, ".local/share/life-world/worlds/default/qq-judge-session.json")
 /** 旧版桥接写的判官文件：过渡期双写双删；新版插件也读这个路径兜底 */
@@ -58,7 +62,7 @@ function writeJson(file, data) {
   try {
     mkdirSync(dirname(file), { recursive: true })
     // 落盘后 fsync 再 rename：掉电/磁盘满时不留半截文件，游标不会莫名回退
-    const fd = openSync(tmp, "w")
+    const fd = openSync(tmp, "w", 0o600)
     try {
       writeFileSync(fd, JSON.stringify(data, null, 2))
       try { fsyncSync(fd) } catch { /* 某些文件系统不支持 fsync */ }
@@ -113,6 +117,130 @@ mkdirSync(JUDGE_DIR, { recursive: true })
 let state = readJson(STATE_FILE, {})
 /** 测试模式只读不写：否则会用启动时的旧快照覆盖主桥正在推进的 outbox 游标 */
 function saveState() { if (!TEST_MODE) writeJson(STATE_FILE, state) }
+
+/** 单实例锁：双开会双回复、双补发 outbox */
+function acquireInstanceLock() {
+  const write = () => {
+    const fd = openSync(INSTANCE_LOCK, "wx")
+    writeFileSync(fd, String(process.pid))
+    closeSync(fd)
+    return true
+  }
+  try {
+    return write()
+  } catch (error) {
+    if (error?.code !== "EEXIST") return true // 其他错误不拦启动
+    try {
+      const pid = Number(readFileSync(INSTANCE_LOCK, "utf8").trim())
+      if (pid && pid !== process.pid) {
+        process.kill(pid, 0)
+        log("another bridge is running", pid)
+        return false
+      }
+    } catch { /* 进程已不在 */ }
+    try { unlinkSync(INSTANCE_LOCK) } catch {}
+    try { return write() } catch { return true }
+  }
+}
+
+// ———————————————————————— 单并发模型闸门 ————————————————————————
+// 只有 life-world.json 的 localModel.enabled && localModel.concurrency.enabled
+// 都开着才生效；在线模型 API 保持默认关闭，这里全部是 no-op。
+function concurrencyCfg() {
+  const live = readJson(LIFEWORLD_CONFIG_FILE, null)
+  const lm = live?.localModel
+  if (!lm || lm.enabled !== true) return { enabled: false }
+  const c = lm.concurrency && typeof lm.concurrency === "object" ? lm.concurrency : {}
+  const num = (v, d) => (typeof v === "number" && Number.isFinite(v) ? v : d)
+  return {
+    enabled: c.enabled === true,
+    deferMinutes: num(c.deferMinutes, 30),
+    userActiveSeconds: num(c.userActiveSeconds, 90),
+    groupPause: c.groupPause !== false,
+    groupMaxAgeMinutes: num(c.groupMaxAgeMinutes, 10),
+    leaseTtlMinutes: num(c.leaseTtlMinutes, 10),
+  }
+}
+function readGate() { return readJson(GATE_FILE, {}) }
+function writeGate(gate) { if (!TEST_MODE) writeJson(GATE_FILE, gate) }
+function withGateLock(fn) {
+  const acquire = () => {
+    try {
+      const fd = openSync(GATE_LOCK_FILE, "wx")
+      closeSync(fd)
+      return true
+    } catch (error) {
+      if (error?.code !== "EEXIST") return false
+      try {
+        if (Date.now() - statSync(GATE_LOCK_FILE).mtimeMs > 5000) {
+          unlinkSync(GATE_LOCK_FILE)
+          return acquire()
+        }
+      } catch { return acquire() }
+      return false
+    }
+  }
+  if (!acquire()) return undefined
+  try { return fn() } finally {
+    try { unlinkSync(GATE_LOCK_FILE) } catch {}
+  }
+}
+function gateBusy() {
+  const gate = readGate()
+  const expires = gate.expires ? Date.parse(gate.expires) : 0
+  if (gate.owner && Number.isFinite(expires) && expires > Date.now()) return true
+  const until = gate.userActiveUntil ? Date.parse(gate.userActiveUntil) : 0
+  return Number.isFinite(until) && until > Date.now()
+}
+function acquireGate(owner, kind) {
+  const cfg = concurrencyCfg()
+  if (!cfg.enabled) return true
+  return withGateLock(() => {
+    const gate = readGate()
+    const now = Date.now()
+    const expires = gate.expires ? Date.parse(gate.expires) : 0
+    if (gate.owner === owner) {
+      gate.expires = new Date(now + cfg.leaseTtlMinutes * 60000).toISOString()
+      writeGate(gate)
+      return true
+    }
+    if (gate.owner && Number.isFinite(expires) && expires > now) return false
+    const until = gate.userActiveUntil ? Date.parse(gate.userActiveUntil) : 0
+    if (Number.isFinite(until) && until > now) return false
+    writeGate({ ...gate, owner, kind, since: new Date(now).toISOString(), expires: new Date(now + cfg.leaseTtlMinutes * 60000).toISOString() })
+    return true
+  }) ?? false
+}
+function releaseGate(owner) {
+  if (!owner || !concurrencyCfg().enabled) return
+  withGateLock(() => {
+    const gate = readGate()
+    if (gate.owner !== owner) return
+    delete gate.owner
+    delete gate.kind
+    delete gate.since
+    delete gate.expires
+    writeGate(gate)
+  })
+}
+function markUserActive(owner) {
+  const cfg = concurrencyCfg()
+  if (!cfg.enabled || !owner) return
+  withGateLock(() => {
+    const gate = readGate()
+    const now = Date.now()
+    gate.userActiveUntil = new Date(now + cfg.userActiveSeconds * 1000).toISOString()
+    const expires = gate.expires ? Date.parse(gate.expires) : 0
+    const free = !gate.owner || !Number.isFinite(expires) || expires <= now
+    if (free || gate.owner === owner) {
+      gate.owner = owner
+      gate.kind = "user"
+      gate.since = gate.since ?? new Date().toISOString()
+      gate.expires = new Date(now + cfg.leaseTtlMinutes * 60000).toISOString()
+    }
+    writeGate(gate)
+  })
+}
 
 async function api(path, init = {}) {
   const send = () =>
@@ -197,13 +325,18 @@ async function ensurePrivateNow() {
 }
 
 async function resetBaseline(id) {
-  state.lastSessionId = id
+  // 接口瞬时失败时不拍基线：否则 lastIdle/lastAssistantId 被清空，
+  // 下一轮会把上一条旧回复当成新回复再发一遍。
   const info = await sessionInfo(id)
-  state.lastIdle = info.info?.time?.idle || 0
+  if (info.status !== "ok") return false
   const msgs = await apiJson(`/api/session/${id}/message`)
-  const assistants = Array.isArray(msgs.data?.data) ? msgs.data.data.filter((m) => m?.type === "assistant") : []
+  if (!Array.isArray(msgs.data?.data)) return false
+  const assistants = msgs.data.data.filter((m) => m?.type === "assistant")
+  state.lastSessionId = id
+  state.lastIdle = info.info?.time?.idle || 0
   state.lastAssistantId = assistants.length ? assistants[0].id : undefined
   saveState()
+  return true
 }
 
 async function deletePrivate() {
@@ -385,7 +518,11 @@ async function handlePrivate(msg) {
     return
   }
   const id = await ensurePrivate()
-  if (!id) return
+  if (!id) {
+    // 创建/校验会话失败时别把用户消息无声吞掉（此时 WS 往往还是通的）
+    await call("send_private_msg", { user_id: ownerQQ, message: "（我这边暂时没接上，稍后再发一次试试）" }).catch(() => {})
+    return
+  }
   const annotated = `[私聊｜${nameOf(msg)}（QQ ${msg.user_id}）] ${text}\n（这是 QQ 私聊。像真人发消息一样：每个短句单独一行，每行会作为一条独立的 QQ 消息发出；一次发 1~3 条，最多 4 条；不要写长段落，不要用标题/列表/编号/加粗，不要复述工具或过程。直接回复即可，不要调用 reach_out。）`
   runWindow = { start: Date.now(), end: 0, reaches: [] }
   const res = await api(`/api/session/${id}/prompt`, {
@@ -399,6 +536,8 @@ async function handlePrivate(msg) {
       .catch(() => {})
     return
   }
+  // 私聊是用户回合：让群聊/定时任务立刻让路（闸门关闭时是 no-op）
+  markUserActive(id)
   log("prompt queued", id)
 }
 
@@ -414,6 +553,8 @@ function splitMessages(text, limit = 800) {
       let cut = -1
       for (const mark of marks) cut = Math.max(cut, rest.lastIndexOf(mark, limit))
       cut = cut >= limit * 0.5 ? cut + 1 : limit
+      // 不要从 UTF-16 代理对中间劈开 emoji，否则发出去是乱码
+      if (cut > 0 && /[\uD800-\uDBFF]/.test(rest[cut - 1] || "")) cut -= 1
       out.push(rest.slice(0, cut).trim())
       rest = rest.slice(cut).trim()
     }
@@ -594,6 +735,7 @@ async function deleteGroup(groupId) {
   const window = groupRunWindows.get(key)
   if (window && !window.end) window.end = Date.now()
   groupRunWindows.delete(key)
+  releaseGate(`qq-group:${key}`)
   log("deleted group session", key)
 }
 function timeOf(ms) {
@@ -608,10 +750,15 @@ async function recordGroupContext(key, batch) {
   const id = await ensureGroup(key)
   if (!id) return
   try {
-    await api(`/api/session/${id}/synthetic`, {
+    const res = await api(`/api/session/${id}/synthetic`, {
       method: "POST",
       body: JSON.stringify({ text: `[群聊记录]\n${formatBatch(fresh)}`, description: "group-context", resume: false }),
     })
+    // 非 2xx 不能当成记上了：否则这段群上下文永久丢失且不再重试
+    if (!res.ok) {
+      log("group context record failed", res.status)
+      return
+    }
     fresh.forEach((m) => { m.recorded = true })
     log("group context recorded", key, fresh.length)
   } catch (error) {
@@ -649,7 +796,9 @@ function judgeMarks() {
 }
 /** 写判官标记：id 指向最新一条（兼容只认 id 的旧插件），ids 是完整集合 */
 function writeJudgeMarks(ids) {
-  const list = [...ids].slice(-20)
+  // 上限放宽到 200：删除失败的判官会话要一直留在排除集合里，
+  // 20 条在长跑后会被新的判官挤掉，旧判官消息就会被归档。
+  const list = [...ids].slice(-200)
   for (const file of [JUDGE_SESSION_FILE, LEGACY_JUDGE_SESSION_FILE]) {
     if (list.length === 0) {
       try { unlinkSync(file) } catch {}
@@ -860,8 +1009,31 @@ async function processGroupNow(key) {
   const st = getGroupState(key)
   if (!groupEnabled() || st.buffer.length === 0) return
   const cfg = groupCfg()
+  const conc = concurrencyCfg()
   const now = Date.now()
   st.batchTrigger = false
+
+  // 单并发闸门：暂停期间积压的旧消息超过上限就丢弃，别回一堆过时梗
+  if (conc.enabled && conc.groupMaxAgeMinutes > 0) {
+    const cutoff = Date.now() - conc.groupMaxAgeMinutes * 60000
+    const before = st.buffer.length
+    st.buffer = st.buffer.filter((m) => m.recorded || m.at >= cutoff)
+    if (before !== st.buffer.length) log("group stale dropped", key, before - st.buffer.length)
+    if (st.buffer.length === 0) return
+  }
+  // 用户正在聊天 / 别的回合还在跑：整批暂停，15 秒后再看
+  if (conc.enabled && conc.groupPause && gateBusy()) {
+    st.retryAt = Date.now() + 15000
+    clearTimeout(st.timer)
+    st.timer = setTimeout(() => processGroup(key), 15000)
+    log("group paused (model gate busy)")
+    return
+  }
+
+  // 超过 15 条的旧消息先记进群上下文，别让它们永远挤不进判官视野
+  const unrecorded = st.buffer.filter((m) => !m.recorded)
+  if (unrecorded.length > 15) await recordGroupContext(key, unrecorded.slice(0, unrecorded.length - 15))
+
   // 已记账的消息仍要当上下文：判官是临时会话，看不到群会话历史，砍掉就成了孤句。
   // 但「刚被点名」只看未记账的消息——否则一次 @ 之后，群里任何新消息都会让旧 @ 反复触发。
   const batch = st.buffer.slice(-15)
@@ -894,21 +1066,35 @@ async function processGroupNow(key) {
     await recordGroupContext(key, batch)
     return
   }
+  // 判官也要吃模型：先领闸门，领不到就整批暂停，15 秒后再试
+  const gateOwner = `qq-group:${key}`
+  if (conc.enabled && !acquireGate(gateOwner, "qq-group")) {
+    st.retryAt = Date.now() + 15000
+    clearTimeout(st.timer)
+    st.timer = setTimeout(() => processGroup(key), 15000)
+    log("group paused before judge (model gate busy)")
+    return
+  }
   const verdict = await withJudgeLock(() => runJudge(key, batch))
   if (verdict !== "REPLY") {
     // 被点名还被判官拦下：单独记一笔，方便回头调判官提示词
     if (triggered) log("judge SKIP on triggered batch", { messages: batch.length })
     await recordGroupContext(key, batch)
+    if (conc.enabled) releaseGate(gateOwner)
     return
   }
   const id = await ensureGroup(key)
-  if (!id) return
+  if (!id) {
+    if (conc.enabled) releaseGate(gateOwner)
+    return
+  }
   const { text, files } = await buildGroupPrompt(key, batch)
   st.sessionId = id
   // 提问前先拍水位：这一批送进去之后产生的回复，才算这一次的。
   // 拍不到就不发：没水位时发出去，轮询很可能把上一条旧回复当成新的再发一遍。
   if (!await markGroupWatermark(key, id)) {
     log("group watermark failed, retry later", key)
+    if (conc.enabled) releaseGate(gateOwner)
     scheduleGroup(key, triggered)
     return
   }
@@ -919,12 +1105,19 @@ async function processGroupNow(key) {
   if (!res.ok) {
     log("group prompt failed", res.status, (await res.text()).slice(0, 200))
     const w = groupRunWindows.get(key); if (w) w.end = Date.now()
+    if (conc.enabled) releaseGate(gateOwner)
     return
   }
   fresh.forEach((m) => { m.recorded = true })
   log("group prompt queued", key, id, "files", files.length)
 }
+let pollingGroups = false
 async function pollGroups() {
+  // 定时器每 1.5 秒触发一次，而 sendGroup 的多行回复要停顿 1.5~3.5 秒：
+  // 没有这道重入保护，同一条 assistant 会被并发送 2~4 遍。
+  if (pollingGroups) return
+  pollingGroups = true
+  try {
   for (const [key, st] of groupStates) {
     if (!st.sessionId) continue
     if (st.retryAt && Date.now() < st.retryAt) continue
@@ -939,6 +1132,7 @@ async function pollGroups() {
         st.baseSet = false
         st.lastAssistantId = ""
         saveState()
+        releaseGate(`qq-group:${key}`)
         continue
       }
       if (info.status !== "ok") continue
@@ -954,13 +1148,25 @@ async function pollGroups() {
       const msgs = await apiJson(`/api/session/${st.sessionId}/message`)
       const arr = Array.isArray(msgs.data?.data) ? msgs.data.data : []
       const a = arr.find((m) => m?.type === "assistant" && m?.time?.completed)
-      if (!a) { st.lastIdle = idle; continue }
+      if (!a) {
+        const w = groupRunWindows.get(key)
+        if (w && !w.end && Date.now() - w.start > 45000) {
+          w.end = Date.now()
+          releaseGate(`qq-group:${key}`)
+          log("group no assistant, release gate", key)
+        }
+        st.lastIdle = idle
+        continue
+      }
       if (a.id === st.lastAssistantId) {
         // 新一轮可能还在流式输出：先不推进 idle，等新 assistant 完成；超过 45 秒则放弃
         if (!st.waitSince) st.waitSince = Date.now()
         if (Date.now() - st.waitSince > 45000) {
           st.lastIdle = idle
           st.waitSince = 0
+          const w = groupRunWindows.get(key)
+          if (w && !w.end) w.end = Date.now()
+          releaseGate(`qq-group:${key}`)
           log("group no new assistant, give up", key)
         }
         continue
@@ -984,9 +1190,13 @@ async function pollGroups() {
       st.lastAssistantId = a.id
       const w = groupRunWindows.get(key)
       if (w && !w.end) w.end = Date.now()
+      releaseGate(`qq-group:${key}`)
     } catch (error) {
       log("poll group failed", String(error))
     }
+  }
+  } finally {
+    pollingGroups = false
   }
 }
 function scheduleGroup(groupId, trigger) {
@@ -1018,9 +1228,11 @@ async function handleGroup(msg) {
     await call("send_group_msg", { group_id: groupId, message: "新对话已开，下一条消息开始新会话。" }).catch(() => {})
     return
   }
-  if (!text) return
+  // 只有 @ 不带正文也算被点名；纯表情/媒体消息 groupText 已经给出占位文本
+  const at = isAtBot(msg)
+  if (!text && !at) return
   const st = getGroupState(groupId)
-  const trigger = isAtBot(msg) || keywordMatch(text)
+  const trigger = at || keywordMatch(text)
   st.buffer.push({ sender: nameOf(msg), userId: msg.user_id, text, media: groupMedia(msg), trigger, at: Date.now(), recorded: false })
   if (st.buffer.length > 30) st.buffer.splice(0, st.buffer.length - 30)
   scheduleGroup(groupId, trigger)
@@ -1054,45 +1266,58 @@ async function pollPrivate() {
     const res = await apiJson(`/api/session/${id}/message`)
     if (!res.ok || !Array.isArray(res.data?.data)) return
     const assistants = res.data.data.filter((m) => m?.type === "assistant" && m?.time?.completed)
-    const last = assistants[0]
-    if (!last) return
-    if (last.id === state.lastAssistantId) { state.lastIdle = idle; saveState(); return }
-    const text = (last.content || [])
+    if (assistants.length === 0) return
+    // assistants 最新在前：把 lastAssistantId 之后完成的都按时间正序发掉，
+    // 不能只取最新一条——短时间连发两条时会吞掉前一条回复。
+    let newer
+    if (!state.lastAssistantId) {
+      newer = [assistants[0]]
+    } else {
+      const idx = assistants.findIndex((m) => m.id === state.lastAssistantId)
+      if (idx === 0) { state.lastIdle = idle; saveState(); return }
+      newer = idx > 0 ? assistants.slice(0, idx).reverse() : [assistants[0]]
+    }
+    const textOf = (m) => (m.content || [])
       .filter((p) => p?.type === "text" && p?.text)
       .map((p) => p.text)
       .join("\n")
       .trim()
-    if (text) {
-      const ok = await sendPrivate(text)
-      if (ok) {
+
+    for (let i = 0; i < newer.length; i++) {
+      const message = newer[i]
+      const isLast = i === newer.length - 1
+      const text = textOf(message)
+      if (text) {
+        const ok = await sendPrivate(text)
+        if (!ok) {
+          privateRetryAt = Date.now() + 15000
+          log("reply send failed, will retry")
+          return
+        }
         privateRetryAt = 0
-        state.lastIdle = idle
-        state.lastAssistantId = last.id
-        if (runWindow && !runWindow.end) { runWindow.reaches = []; runWindow.end = Date.now() }
-        saveState()
-      } else {
-        privateRetryAt = Date.now() + 15000
-        log("reply send failed, will retry")
+      } else if (isLast && runWindow && !runWindow.end) {
+        // 最后一条正文为空：她可能把话都写进了 reach_out，把缓冲的行当回复发出去
+        const buffered = [...runWindow.reaches]
+        if (buffered.length) {
+          const ok = await sendPrivate(buffered.join("\n"))
+          if (!ok) {
+            privateRetryAt = Date.now() + 15000
+            log("buffered reply send failed, will retry")
+            return
+          }
+          privateRetryAt = 0
+          runWindow.reaches = []
+          log("reply from reach_out buffer", buffered.length)
+        }
       }
-      return
-    }
-    // 正文为空：这一轮她可能把话都写进了 reach_out，把缓冲的行当回复发出去
-    const buffered = runWindow && !runWindow.end ? [...runWindow.reaches] : []
-    if (buffered.length) {
-      const ok = await sendPrivate(buffered.join("\n"))
-      if (!ok) {
-        privateRetryAt = Date.now() + 15000
-        log("buffered reply send failed, will retry")
-        return
+      state.lastIdle = idle
+      state.lastAssistantId = message.id
+      if (isLast && runWindow && !runWindow.end) {
+        runWindow.reaches = []
+        runWindow.end = Date.now()
       }
-      privateRetryAt = 0
-      runWindow.reaches = []
-      log("reply from reach_out buffer", buffered.length)
+      saveState()
     }
-    state.lastIdle = idle
-    state.lastAssistantId = last.id
-    if (runWindow && !runWindow.end) runWindow.end = Date.now()
-    saveState()
   } catch (error) {
     log("poll failed", String(error))
   } finally {
@@ -1104,6 +1329,9 @@ async function pollPrivate() {
 let outboxBusy = false
 /** outbox 发送失败后的退避：服务端持续拒绝时别每 2 秒打一轮 */
 let outboxRetryAt = 0
+/** 每条 outbox 的连续失败次数：某条永久发不出去时进死信，别饿死后面的消息 */
+const outboxAttempts = new Map()
+const OUTBOX_MAX_ATTEMPTS = 20
 /** 补发范围：最近几天（跨天离线后也能补上） */
 const OUTBOX_DAYS = 3
 
@@ -1144,6 +1372,7 @@ async function pollOutbox() {
     for (const [key, w] of groupRunWindows) {
       if (!w.end && Date.now() - w.start > 5 * 60_000) {
         w.end = Date.now()
+        releaseGate(`qq-group:${key}`)
         log("group run window timeout", key)
       }
     }
@@ -1209,30 +1438,54 @@ async function pollOutbox() {
         let item
         try { item = JSON.parse(line) } catch { consumed += bytes; continue }
         if (item.kind !== "reach" || !item.text) { consumed += bytes; continue }
-        // 群聊运行期间产生的 reach_out：不能发到私聊，跳过
-        const ts = Date.parse(item.t || "")
-        let inGroupRun = false
-        for (const w of groupRunWindows.values()) {
-          if (Number.isFinite(ts) && ts >= w.start - 2000 && ts <= (w.end || Date.now()) + 2000) { inGroupRun = true; break }
-        }
-        if (inGroupRun) {
-          if (runWindow && !runWindow.end) {
-            runWindow.reaches.push(item.text)
-            log("buffer reach_out during qq-chat run", item.text.slice(0, 30))
-          } else {
-            log("suppress reach_out during qq-chat run", item.text.slice(0, 30))
-          }
+        // 按「产生这条 reach_out 的会话」判断，而不是按时间窗口：
+        // 群回合进行中，home 会话的定时主动消息不应该被当成群输出吞掉。
+        const itemSession = typeof item.session === "string" ? item.session : ""
+        const fromGroupSession = Boolean(itemSession) && Object.values(state.groups || {}).includes(itemSession)
+        if (fromGroupSession && [...groupRunWindows.values()].some((w) => !w.end)) {
+          log("suppress reach_out from group session", item.text.slice(0, 30))
           consumed += bytes
           continue
         }
+        if (itemSession && itemSession === state.privateSessionId && runWindow && !runWindow.end) {
+          runWindow.reaches.push(item.text)
+          log("buffer reach_out during qq-chat run", item.text.slice(0, 30))
+          consumed += bytes
+          continue
+        }
+        // 连续失败到上限就进死信并跳过，避免一条永久失败的消息把所有主动消息堵死
+        const lineKey = `${day}:${offset + consumed}`
+        const giveUp = () => {
+          const attempts = (outboxAttempts.get(lineKey) || 0) + 1
+          outboxAttempts.set(lineKey, attempts)
+          if (outboxAttempts.size > 500) outboxAttempts.clear()
+          if (attempts < OUTBOX_MAX_ATTEMPTS) return false
+          try {
+            appendFileSync(join(OUTBOX_DIR, "failed.jsonl"), `${line}\n`, { mode: 0o600 })
+          } catch (error) {
+            log("outbox dead-letter write failed", String(error))
+          }
+          log("outbox dead-letter", lineKey, item.text.slice(0, 30))
+          outboxAttempts.delete(lineKey)
+          return true
+        }
         const id = await ensurePrivate()
-        if (!id) { blocked = true; break }
+        if (!id) {
+          if (giveUp()) { consumed += bytes; continue }
+          blocked = true
+          break
+        }
         await api(`/api/session/${id}/synthetic`, {
           method: "POST",
           body: JSON.stringify({ text: item.text, description: "reach_out", resume: false }),
         }).catch(() => {})
         const ok = await sendPrivate(item.text)
-        if (!ok) { blocked = true; break }
+        if (!ok) {
+          if (giveUp()) { consumed += bytes; continue }
+          blocked = true
+          break
+        }
+        outboxAttempts.delete(lineKey)
         consumed += bytes
       }
       if (consumed > 0) {
@@ -1320,6 +1573,7 @@ if (process.argv[2] === "--test-send") {
   }, 300)
   setTimeout(() => { log("test send timeout"); process.exit(1) }, 20000)
 } else {
+  if (!acquireInstanceLock()) process.exit(1)
   // 首次启动：只初始化新结构（按天游标 + 启用时刻）。
   // 不能在这里塞旧的 { file, offset }——新结构没有 .file 字段，每次重启都会判定「结构不同」
   // 而把按天游标整个冲掉，并把 since 重置成重启时刻，跨天补发随之失效。
