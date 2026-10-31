@@ -158,6 +158,16 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
     └── outbox/
 ```
 
+### 自述与心情的拆分
+
+`identity/我是谁.md` 和 `identity/心情.md` 是**每次会话注入**的主文件，越短 prefill 越快。
+长篇经历、外貌全文、名声与世界、住处、硬件面、归并日志、旧的落地记录——移到不注入的存档：
+
+- `room/设定/我是谁-存档.md`
+- `identity/心情-存档.md`
+
+主文件里留一行指针即可；世界提示词里也写了这条规则，角色会自己维护。
+
 ## 配置（`world.json`）
 
 ```json
@@ -238,6 +248,8 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 **实测**（395 迷你主机 + Qwen3.8-Flash-Next IQ3_XXS，opencode 2.2.5）：同一条会话，每轮请求从 **306 KB / 20 万 token** 降到 **25 KB 上下**，单轮耗时从 145–222 秒降到几十秒。
 
 > 折叠只动工具结果和旧推理，**对话正文一条不动**；`world.json` 用 `execute` 改，保存后下一轮生效，不用重启。
+>
+> 另外：`我是谁.md` / `心情.md` 是每次注入的主文件，按「数据位置」里的拆分规则压短，对新会话 prefill 比折叠选项更直接。
 
 ## 更新颜文字库
 
