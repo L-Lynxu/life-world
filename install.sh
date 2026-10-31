@@ -41,6 +41,8 @@ cp "$SRC/index.ts" "$PLUGIN_DIR/index.ts"
 cp "$SRC/README.md" "$PLUGIN_DIR/README.md"
 cp "$SRC/GUIDE.md" "$PLUGIN_DIR/GUIDE.md"
 cp "$SRC/data/kaomoji.json" "$PLUGIN_DIR/data/kaomoji.json"
+mkdir -p "$PLUGIN_DIR/modules"
+cp -a "$SRC/modules/." "$PLUGIN_DIR/modules/"
 cp "$SRC"/scripts/* "$WORLD_BIN/"
 chmod +x "$WORLD_BIN"/*.sh "$WORLD_BIN"/*.mjs 2>/dev/null || true
 echo "  ✓ 插件本体 → $PLUGIN_DIR"
