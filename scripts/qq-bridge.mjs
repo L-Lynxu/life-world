@@ -23,6 +23,8 @@ const CONFIG_FILE = join(HOME, ".config/opencode/qq-bridge.json")
 const STATE_FILE = join(HOME, ".local/share/life-world/qq-bridge-state.json")
 const OUTBOX_DIR = join(HOME, ".local/share/life-world/worlds/default/outbox")
 const JUDGE_SESSION_FILE = join(HOME, ".local/share/life-world/worlds/default/qq-judge-session.json")
+/** 旧版插件读的判官文件：过渡期双写双删，升级只重启了一边也不至于漏隔离 */
+const LEGACY_JUDGE_SESSION_FILE = join(HOME, ".local/share/life-world/qq-judge-session.json")
 const JUDGE_DIR = join(HOME, ".local/share/life-world/qq-judge")
 const GROUP_TMP_DIR = join(HOME, ".local/share/life-world/tmp")
 const LOG_FILE = join(HOME, ".local/share/life-world/qq-bridge.log")
@@ -547,6 +549,7 @@ async function runJudge(groupId, batch) {
   const sid = res.data?.data?.id
   if (!sid) { log("judge create failed", res.status, JSON.stringify(res.data).slice(0, 160)); return "SKIP" }
   writeJson(JUDGE_SESSION_FILE, { id: sid })
+  writeJson(LEGACY_JUDGE_SESSION_FILE, { id: sid })
   try {
     await api(`/api/session/${sid}/prompt`, { method: "POST", body: JSON.stringify({ text: buildJudgePrompt(groupId, batch) }) })
     const deadline = Date.now() + (Number(cfg.judgeTimeoutMs) || 60000)
@@ -572,6 +575,7 @@ async function runJudge(groupId, batch) {
   } finally {
     await api(`/api/session/${sid}`, { method: "DELETE" }).catch(() => {})
     try { unlinkSync(JUDGE_SESSION_FILE) } catch {}
+    try { unlinkSync(LEGACY_JUDGE_SESSION_FILE) } catch {}
   }
 }
 async function downloadMedia(media) {

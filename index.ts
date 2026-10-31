@@ -120,6 +120,8 @@ const QQ_GROUP_BODY = [
 ].join("\n")
 /** 判官会话的 id 文件：命中就完全跳过 life-world 注入 */
 const JUDGE_SESSION_FILE = join(WORLD, "qq-judge-session.json")
+/** 旧版桥接写的判官文件：升级过渡期也读，桥接没重启时不至于漏隔离 */
+const LEGACY_JUDGE_SESSION_FILE = join(ROOT, "qq-judge-session.json")
 const BRIDGE_CONFIG_FILE = join(HOME, ".config/opencode/qq-bridge.json")
 const BRIDGE_STATE_FILE = join(HOME, ".local/share/life-world/qq-bridge-state.json")
 
@@ -1200,11 +1202,19 @@ export default Plugin.define({
 
     await ctx.session.hook("context", async (event) => {
       try {
-        // 判官会话：绝不注入 life-world 的私密内容（它的上下文会发给在线模型）
-        const judge = (() => {
-          try { return JSON.parse(readFileSync(JUDGE_SESSION_FILE, "utf8")) as { id?: string } } catch { return undefined }
+        // 判官会话：绝不注入 life-world 的私密内容（它的上下文会发给在线模型）。
+        // 新旧两个路径都读：升级后 qq-bridge 是独立进程，可能还在写旧路径。
+        const judgeIds = (() => {
+          const ids = new Set<string>()
+          for (const file of [JUDGE_SESSION_FILE, LEGACY_JUDGE_SESSION_FILE]) {
+            try {
+              const judge = JSON.parse(readFileSync(file, "utf8")) as { id?: unknown }
+              if (typeof judge?.id === "string" && judge.id) ids.add(judge.id)
+            } catch { /* 文件不存在 */ }
+          }
+          return ids
         })()
-        if (judge?.id && String(event.sessionID ?? "") === judge.id) return
+        if (judgeIds.has(String(event.sessionID ?? ""))) return
 
         const now = new Date()
         const system = event.system as AnyPart[]

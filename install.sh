@@ -61,6 +61,12 @@ if [ "${1:-}" = "--service" ]; then
   echo
 fi
 
+if pgrep -f "qq-bridge\.mjs" >/dev/null 2>&1; then
+  echo "⚠ 检测到 qq-bridge 正在运行：升级后请手动重启它，桥接改动才会生效。"
+  echo "  （脚本不会替你杀进程；先停掉旧进程，再按 README/GUIDE 的启动命令起一次）"
+  echo
+fi
+
 echo "== 下一步 =="
 if [ "${1:-}" != "--service" ]; then
   echo "  opencode service restart     # 必须：让共享服务重新加载插件"

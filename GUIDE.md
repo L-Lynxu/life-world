@@ -206,6 +206,7 @@ sent private 1/1 ...
 | 改了插件不生效 | 同上：`opencode service restart` + 重启 TUI |
 | 想彻底关掉 | `life-world.sh off` |
 | 升级后提示词还是旧的 | `world-prompt.md` 每个世界一份，插件不覆盖；备份后删掉它，重启服务并开新会话后生效（自定义内容先手动合并） |
+| 升级后桥接行为没变 | qq-bridge 是独立进程，`install.sh` 不会重启它；升级后先停掉旧进程，再按 §4.4 的启动命令起一次 |
 
 ---
 
