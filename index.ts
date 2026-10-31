@@ -1706,8 +1706,9 @@ export default Plugin.define({
               const fresh = readWorld()
               const ids = new Set(stale.map((alarm) => alarm.id))
               fresh.alarms = (fresh.alarms ?? []).filter((item) => !ids.has(item.id))
-              // 积压清单也算今天叫醒过一次，避免早上兜底再来一条
-              fresh.lastWake = today
+              // 只有积压里含「今天」的安排才算今天叫醒过；跨午夜补发昨天的，
+              // 不能把新的一天标成 lastWake，否则会吃掉当天早上的兜底。
+              if (stale.some((alarm) => dayOf(new Date(alarm.at)) === today)) fresh.lastWake = today
               writeWorld(fresh)
               log(`alarm backlog flushed · ${stale.length}`)
             } else {
