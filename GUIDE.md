@@ -148,6 +148,8 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
   >> ~/.local/share/life-world/qq-bridge.log 2>&1 < /dev/null &
 ```
 
+> 升级重启：先 `pkill -f "[n]ode .*qq-bridge\.mjs"` 停掉旧进程，再执行上面的启动命令；直接再起一个会双实例双回复。
+
 ### 4.5 验证
 
 让他在 QQ 上给你发一句。日志里应该出现：
@@ -206,7 +208,7 @@ sent private 1/1 ...
 | 改了插件不生效 | 同上：`opencode service restart` + 重启 TUI |
 | 想彻底关掉 | `life-world.sh off` |
 | 升级后提示词还是旧的 | `world-prompt.md` 每个世界一份，插件不覆盖；备份后删掉它，重启服务并开新会话后生效（自定义内容先手动合并） |
-| 升级后桥接行为没变 | qq-bridge 是独立进程，`install.sh` 不会重启它；升级后先停掉旧进程，再按 §4.4 的启动命令起一次 |
+| 升级后桥接行为没变 | qq-bridge 是独立进程，`install.sh` 不会重启它；先 `pkill -f "[n]ode .*qq-bridge\.mjs"` 停旧进程，再按 §4.4 起一次，别直接再起一个 |
 
 ---
 

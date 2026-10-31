@@ -23,7 +23,7 @@ const CONFIG_FILE = join(HOME, ".config/opencode/qq-bridge.json")
 const STATE_FILE = join(HOME, ".local/share/life-world/qq-bridge-state.json")
 const OUTBOX_DIR = join(HOME, ".local/share/life-world/worlds/default/outbox")
 const JUDGE_SESSION_FILE = join(HOME, ".local/share/life-world/worlds/default/qq-judge-session.json")
-/** 旧版插件读的判官文件：过渡期双写双删，升级只重启了一边也不至于漏隔离 */
+/** 旧版桥接写的判官文件：过渡期双写双删；新版插件也读这个路径兜底 */
 const LEGACY_JUDGE_SESSION_FILE = join(HOME, ".local/share/life-world/qq-judge-session.json")
 const JUDGE_DIR = join(HOME, ".local/share/life-world/qq-judge")
 const GROUP_TMP_DIR = join(HOME, ".local/share/life-world/tmp")
@@ -549,6 +549,12 @@ async function runJudge(groupId, batch) {
   const sid = res.data?.data?.id
   if (!sid) { log("judge create failed", res.status, JSON.stringify(res.data).slice(0, 160)); return "SKIP" }
   writeJson(JUDGE_SESSION_FILE, { id: sid })
+  // 新路径写失败（磁盘满/权限）就别发判官的私密 prompt 了：
+  // 旧插件只认这个路径，漏了标记等于把私密上下文发给判官模型。
+  if (readJson(JUDGE_SESSION_FILE, null)?.id !== sid) {
+    log("judge mark write failed, skip judge")
+    return "SKIP"
+  }
   writeJson(LEGACY_JUDGE_SESSION_FILE, { id: sid })
   try {
     await api(`/api/session/${sid}/prompt`, { method: "POST", body: JSON.stringify({ text: buildJudgePrompt(groupId, batch) }) })

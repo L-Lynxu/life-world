@@ -63,7 +63,8 @@ fi
 
 if pgrep -f "qq-bridge\.mjs" >/dev/null 2>&1; then
   echo "⚠ 检测到 qq-bridge 正在运行：升级后请手动重启它，桥接改动才会生效。"
-  echo "  （脚本不会替你杀进程；先停掉旧进程，再按 README/GUIDE 的启动命令起一次）"
+  echo "  先停旧进程：pkill -f '[n]ode .*qq-bridge\.mjs'"
+  echo "  再按 README/GUIDE 的启动命令起一次；别直接再起一个"
   echo
 fi
 
