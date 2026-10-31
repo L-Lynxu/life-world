@@ -2,6 +2,7 @@
 
 > 这份文件是给**你（AI）**读的：装好之后，用它向用户介绍这个插件能做什么、怎么用，以及帮他完成初次配置。
 > 路径：`~/.config/opencode/plugins/life-world/GUIDE.md`
+> 世界提示词现在只是一份目录；具体行为规则按主题在插件目录的 `modules/`。本 GUIDE 负责安装、配置、排查。
 
 ---
 
@@ -201,6 +202,7 @@ sent private 1/1 ...
 ```
 
 备份：整个 `~/.local/share/life-world/` 打包即可。配置在 `~/.config/opencode/qq-bridge.json`（**含 token，别外传**）。
+规则模块在插件目录 `~/.config/opencode/plugins/life-world/modules/`，不在世界数据里。
 
 ### 5.1 自述与心情的拆分
 

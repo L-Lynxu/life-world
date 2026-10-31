@@ -49,9 +49,10 @@ git clone <本仓库> life-world && cd life-world
 手动装（等价）：
 
 ```bash
-mkdir -p ~/.config/opencode/plugins/life-world/data ~/.local/share/life-world/bin
+mkdir -p ~/.config/opencode/plugins/life-world/data ~/.config/opencode/plugins/life-world/modules ~/.local/share/life-world/bin
 cp index.ts README.md GUIDE.md ~/.config/opencode/plugins/life-world/
 cp data/kaomoji.json ~/.config/opencode/plugins/life-world/data/
+cp -a modules/. ~/.config/opencode/plugins/life-world/modules/
 cp scripts/* ~/.local/share/life-world/bin/ && chmod +x ~/.local/share/life-world/bin/*
 opencode service restart
 ~/.local/share/life-world/bin/start-tui.sh
@@ -66,6 +67,14 @@ opencode service restart
 注意：`worlds/default/world-prompt.md` 是每个世界一份，插件不会自动覆盖它。想让角色拿到新版默认提示词，先备份再删掉这个文件（或手动把新段落合并进去）；文件会在下次插件加载时用新默认重建，**重启 opencode 服务并开新会话（或等下一次压缩）后生效**。自定义过的提示词请手动合并，别直接删。
 
 QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动重启 qq-bridge**（若在跑）：先 `pkill -f "[n]ode .*qq-bridge\.mjs"` 停掉旧进程，再按下面的启动命令起一次；不要直接再起一个，会双实例双回复。只重启服务/TUI 时，判官隔离由插件侧兼容旧路径兜底，但桥接自身的其余修复仍要等它重启。
+
+## 规则模块
+
+世界提示词只是一份目录；具体规则按主题放在插件目录的 `modules/`：
+
+`first-meeting` / `files` / `profile-mood` / `hands-eyes` / `tools` / `time-plan` / `browser` / `qq` / `gal` / `safety`。
+
+需要时角色会读对应文件，不常驻注入；`install.sh` 会一并安装。
 
 ## 第一次启动
 
