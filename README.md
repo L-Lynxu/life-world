@@ -1,5 +1,7 @@
 # life-world
 
+> 本插件在 [dsh-world](https://github.com/chenkezhen480/dsh-world) 的基础上改造而来，感谢原作者。
+
 给 [opencode](https://opencode.ai) v2 里的陪伴角色一个会记得、会生活的世界：跨会话记忆、自己的时间、每日回顾、心情状态、颜文字和真实浏览器。
 
 这是一个自包含插件：零运行时依赖，靠 opencode v2 的插件钩子、共享服务 HTTP API 和 tmux 工作。
@@ -242,29 +244,6 @@ node ~/.local/share/life-world/bin/kaomoji-update.mjs --check  # 只看版本
 - 仓库里**只有插件代码和文档**，不带任何人的世界数据、日志或凭据。
 - 运行时数据全部落在 `~/.local/share/life-world/`，只在你本机；QQ 桥接的配置 `qq-bridge.json` 权限 600 且被 `.gitignore` 排除。
 - 心情文件里的「可选状态库」只是一份示例，你可以换成任何适合自己角色的状态。
-
-## 出处与致谢
-
-这个插件**不是从零写的**。它最初是 [dsh-world](https://github.com/chenkezhen480/dsh-world)（作者 **chenkezhen480**，MIT）的移植版。
-
-- **dsh-world** 是给 DSH（deepseek-harness）桌面版做的插件，核心想法是「给模型一个会记得、有自己的时间、会过日子的世界」——跨会话记忆、自己的时间线（定时醒来 / 自己安排下一步）、每日回顾、自述、世界提示词、主动找人。**这些骨架都出自它。**
-- 我们要在 opencode v2 上用，而 dsh-world 硬依赖 `@deepseek-ai/cordis` 和 DSH 桌面版，Linux 上跑不起来，所以按它的思路**重写**成了零依赖版本：直读 `opencode.db`、用插件钩子 + 共享服务 HTTP + tmux 实现。
-- 之后陆续加了很多东西——多槽闹钟、家会话自愈、心情与用户画像、颜文字工具、NapCat QQ 桥接（私聊 / 群聊）、gal 模式、世界总开关、一键安装与初次引导、本地小模型优化……但**「会记得、有自己的时间」这个内核，是 dsh-world 给的**。
-
-感谢原作者。如果你只用得上最朴素那套（记忆 + 自己醒 + 写日记），dsh-world 本身也值得一看。
-
-两者的差异大致是：
-
-| 维度 | dsh-world | life-world |
-|---|---|---|
-| 宿主 | DSH 桌面版 | opencode v2 |
-| 依赖 | Cordis + 8 个 dsh-* 包 | **零** |
-| 记忆 | 原文 200 轮 + 日记 + 自述 | 原文 80 条（可调）+ 日记 + 自述 |
-| 归档 | 自己的 `archive.sqlite` | 直读 `opencode.db` |
-| 定时 | 桌面版常驻 | 客户端进程 + tmux |
-| 通知 | Windows Toast + outlets | `outbox` + QQ 桥接 |
-| 权限 | 提示词软约束 | 同样软约束（有意为之） |
-| 额外能力 | — | 颜文字、QQ 桥接、gal 模式、总开关、本地模型优化 |
 
 ## 许可证
 
