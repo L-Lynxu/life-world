@@ -9,7 +9,6 @@
     "summaryLimit": 12000,
     "alarmStaleHours": 6,
     "resetCooldownMinutes": 5,
-    "browserPort": 9222,
     "homeTitle": "life-world home session"
   },
   "localModel": {
@@ -20,7 +19,15 @@
     "foldToolMessages": true,
     "foldingReasoningTurns": 0,
     "preferSubagent": true,
-    "debugStats": false
+    "debugStats": false,
+    "concurrency": {
+      "enabled": false,
+      "deferMinutes": 30,
+      "userActiveSeconds": 90,
+      "groupPause": true,
+      "groupMaxAgeMinutes": 10,
+      "leaseTtlMinutes": 10
+    }
   },
   "bridge": {
     "enabled": false,
@@ -32,7 +39,7 @@
     "location": "",
     "group": {
       "enabled": false,
-      "keywords": ["Qwen", "AI", "deepseek", "claude", "chatgpt"],
+      "keywords": [],
       "interjectChance": 0.05,
       "afterReplyChance": 0.8,
       "probabilityDurationMs": 120000,
