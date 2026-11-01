@@ -19,6 +19,7 @@
     "foldToolMessages": true,
     "foldingReasoningTurns": 0,
     "preferSubagent": true,
+    "subagentPreference": "",
     "debugStats": false,
     "concurrency": {
       "enabled": false,

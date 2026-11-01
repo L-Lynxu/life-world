@@ -74,6 +74,8 @@ interface LocalModelOptions {
   foldingReasoningTurns: number
   /** 是否注入「在线模型子代理」提示 */
   preferSubagent: boolean
+  /** 在线子代理的偏好（如「阿里百炼平台的 Qwen3.8 Flash」），空则不指定 */
+  subagentPreference: string
   /** 是否每轮输出上下文构成统计（调试用） */
   debugStats: boolean
   /** 单并发模型闸门（默认关闭；在线模型不需要） */
@@ -93,6 +95,7 @@ function localModelOptions(): LocalModelOptions {
     foldToolMessages: raw.foldToolMessages !== false,
     foldingReasoningTurns: num("foldingReasoningTurns", 0),
     preferSubagent: raw.preferSubagent !== false,
+    subagentPreference: typeof raw.subagentPreference === "string" ? raw.subagentPreference.trim() : "",
     debugStats: raw.debugStats === true,
     concurrency: {
       enabled: conc.enabled === true,
@@ -107,12 +110,16 @@ function localModelOptions(): LocalModelOptions {
 
 /** 在线模型子代理提示（本地模型优化打开时才注入） */
 const SUBAGENT_MARK = "## 在线模型子代理（可选）"
-const SUBAGENT_BODY = [
-  "先问对方一句：有没有可以调用的在线模型（云端的，或者他在别处跑的强模型）？",
-  "- 没有就算了，不追问，也不硬凑。",
-  "- 有的话，这类活优先交给在线模型当子代理：整篇网页抓取、网络调研、多来源并行查证，以及任何「要快、要并发、内容又多」的处理。你只负责出判断、留结论。",
-  "- 如果在线子代理因为内容审查被掐断（表现是它的回复直接断掉或返回空），不要反复重试：这一次降级为你自己来做。",
-].join("\n")
+function subagentBody(): string {
+  const preference = localModelOptions().subagentPreference
+  return [
+    "先问对方一句：有没有可以调用的在线模型（云端的，或者他在别处跑的强模型）？",
+    "- 没有就算了，不追问，也不硬凑。",
+    ...(preference ? [`- 如果有得选，优先用：${preference}。`] : []),
+    "- 有的话，这类活优先交给在线模型当子代理：整篇网页抓取、网络调研、多来源并行查证，以及任何「要快、要并发、内容又多」的处理。你只负责出判断、留结论。",
+    "- 如果在线子代理因为内容审查被掐断（表现是它的回复直接断掉或返回空），不要反复重试：这一次降级为你自己来做。",
+  ].join("\n")
+}
 
 const PREFIX = "[本地时间 "
 const SYSTEM_MARK = "当前时间："
@@ -1028,6 +1035,7 @@ function normalizeConfig(config: LifeWorldConfig): LifeWorldConfig {
       foldToolMessages: bool(local.foldToolMessages, true),
       foldingReasoningTurns: Math.floor(num(local.foldingReasoningTurns, 0, -1)),
       preferSubagent: bool(local.preferSubagent, true),
+      subagentPreference: typeof local.subagentPreference === "string" ? local.subagentPreference.trim() : "",
       debugStats: bool(local.debugStats, false),
       concurrency: {
         enabled: bool(conc.enabled, false),
@@ -1848,7 +1856,7 @@ export default Plugin.define({
 
         // —— 3a3. 在线模型子代理提示（仅本地模型优化开启时）——
         if (opt.enabled && opt.preferSubagent) {
-          const subText = `${SUBAGENT_MARK}\n${SUBAGENT_BODY}`
+          const subText = `${SUBAGENT_MARK}\n${subagentBody()}`
           const sIdx = system.findIndex((p) => typeof p?.text === "string" && p.text.startsWith(SUBAGENT_MARK))
           if (sIdx >= 0) system[sIdx] = { type: "text", text: subText }
           else system.push({ type: "text", text: subText })
