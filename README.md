@@ -199,7 +199,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
   },
   "localModel": {
     "enabled": false, "keepRecent": 20, "foldRecentContext": 6, "resultChars": 300,
-    "foldToolMessages": true, "foldingReasoningTurns": 0, "preferSubagent": true, "debugStats": false,
+    "foldToolMessages": true, "foldingReasoningTurns": 0, "preferSubagent": true, "subagentPreference": "", "debugStats": false,
     "concurrency": { "enabled": false, "deferMinutes": 30, "userActiveSeconds": 90, "groupPause": true, "groupMaxAgeMinutes": 10, "leaseTtlMinutes": 10 }
   },
   "bridge": {
@@ -266,6 +266,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 | `foldToolMessages` | `true` | 是否折叠 `role=tool` 的工具消息 |
 | `foldingReasoningTurns` | 0 | 保留最近几轮的推理；0 = 全折，-1 = 不折 |
 | `preferSubagent` | `true` | 注入「在线模型子代理」提示：有在线模型时把抓网页/调研这类重活委托过去 |
+| `subagentPreference` | `""` | 子代理的偏好说明，例如 `阿里百炼平台的 Qwen3.8 Flash`；空则不指定 |
 | `debugStats` | `false` | 每轮往 debug.log 写一行上下文构成统计（调参用） |
 | `concurrency` | 见下 | 单并发模型闸门，默认关闭 |
 
