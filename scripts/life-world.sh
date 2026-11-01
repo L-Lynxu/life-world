@@ -14,17 +14,14 @@ export PATH="$HOME/.opencode/bin:$PATH"
 
 WORLD="$HOME/.local/share/life-world/worlds/default/world.json"
 CONFIG="$HOME/.local/share/life-world/life-world.json"
-LEGACY_CONFIG="$HOME/.config/opencode/life-world.json"
 START_TUI="$HOME/.local/share/life-world/bin/start-tui.sh"
 BRIDGE_STATE="$HOME/.local/share/life-world/qq-bridge-state.json"
 
 ensure_config() {
-  [ -f "$CONFIG" ] && return
-  if [ -f "$LEGACY_CONFIG" ]; then
-    mkdir -p "$(dirname "$CONFIG")"
-    cp "$LEGACY_CONFIG" "$CONFIG"
-    chmod 600 "$CONFIG"
-  fi
+  # 不要在这里把旧 life-world.json 直接复制过去：那样插件会认为配置已存在，
+  # 跳过从旧 world.json / qq-bridge.json 的迁移合并（bridge 段和 QQ 凭据会丢）。
+  # 配置交给插件首次加载时生成；这里只保证目录在。
+  mkdir -p "$(dirname "$CONFIG")"
 }
 
 read_state() {
@@ -90,7 +87,7 @@ restart_service() {
 
 tui_quiet() { # 不自报家门：插件不加载，就是原生 opencode
   tmux kill-session -t home 2>/dev/null
-  pkill -f "^opencode$" 2>/dev/null
+  # 只停 home 会话，不再全局 pkill：别误杀用户其他终端里的 opencode
   sleep 1
   tmux new-session -d -s home "export PATH=\$HOME/.opencode/bin:\$PATH; cd \$HOME; opencode"
   echo "  TUI 已重启（安静模式：不发开场消息）"

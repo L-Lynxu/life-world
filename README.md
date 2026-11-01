@@ -30,12 +30,15 @@
 | QQ 桥接（可选） | `scripts/qq-bridge.mjs`：接任意 **OneBot v11 正向 WebSocket**（NapCat、SnowLuma 等）↔ `qq-chat` 会话；每行一条消息、真人节奏；开关状态会注入给角色 |
 | **主动消息 outbox** | `reach_out` 写 `outbox/YYYY-MM-DD.jsonl`；桥接每 2 秒投递，**断线/跨天后自动补发最近 3 天未送出的**；`bin/life-world.sh inbox [天数]` 可回看她主动说过什么 |
 | 压缩 | 只保留对话正文，去掉工具调用过程 |
-| 初次引导 | 首次启用时自己读 `GUIDE.md`：介绍能力、问要不要接 QQ、引导配置 |
-| **本地小模型优化（可选）** | `world.json` 的 `localModel`：折叠工具结果/旧推理、压缩注入条数、提示用在线子模型当子代理。**默认关闭** |
+| 初次引导 | 首次启用时读 `modules/first-meeting.md`：介绍能力、问要不要接 QQ、引导配置 |
+| **本地小模型优化（可选）** | `life-world.json` 的 `localModel`：折叠工具结果/旧推理、压缩注入条数、提示用在线子模型当子代理。**默认关闭** |
 
 ## 安装
 
-要求：opencode v2（`opencode` 在 PATH）、Node.js 20+、tmux。没有别的依赖。
+要求：opencode v2（`opencode` 在 PATH）、**Node.js 22.13+**（推荐 24 LTS）、tmux、Linux。没有别的依赖。
+
+> Node 版本不是随便写的：插件用 `node:sqlite`（22.13 起免 flag），桥接用全局 `WebSocket`（22 起）。Node 20 装得上但插件加载会直接失败。
+> 家会话自愈需要 tmux；浏览器脚本依赖 Linux 的 Chrome 与 X 图形会话。
 
 ```bash
 git clone <本仓库> life-world && cd life-world
@@ -50,8 +53,8 @@ git clone <本仓库> life-world && cd life-world
 
 ```bash
 mkdir -p ~/.config/opencode/plugins/life-world/data ~/.config/opencode/plugins/life-world/modules ~/.local/share/life-world/bin
-cp index.ts README.md GUIDE.md ~/.config/opencode/plugins/life-world/
-cp data/kaomoji.json ~/.config/opencode/plugins/life-world/data/
+cp index.ts README.md GUIDE.md life-world.example.json ~/.config/opencode/plugins/life-world/
+cp data/kaomoji.json data/kaomoji.meta.json ~/.config/opencode/plugins/life-world/data/
 cp -a modules/. ~/.config/opencode/plugins/life-world/modules/
 cp scripts/* ~/.local/share/life-world/bin/ && chmod +x ~/.local/share/life-world/bin/*
 opencode service restart
@@ -66,7 +69,7 @@ opencode service restart
 
 注意：`worlds/default/world-prompt.md` 是每个世界一份，插件不会自动覆盖它。想让角色拿到新版默认提示词，先备份再删掉这个文件（或手动把新段落合并进去）；文件会在下次插件加载时用新默认重建，**重启 opencode 服务并开新会话（或等下一次压缩）后生效**。自定义过的提示词请手动合并，别直接删。
 
-QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动重启 qq-bridge**（若在跑）：先 `pkill -f "[n]ode .*qq-bridge\.mjs"` 停掉旧进程，再按下面的启动命令起一次；不要直接再起一个，会双实例双回复。只重启服务/TUI 时，判官隔离由插件侧兼容旧路径兜底，但桥接自身的其余修复仍要等它重启。
+QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动重启 qq-bridge**（若在跑）：先 `pkill -f "qq-bridge[.]mjs"` 停掉旧进程，再按下面的启动命令起一次；不要直接再起一个，会双实例双回复。只重启服务/TUI 时，判官隔离由插件侧兼容旧路径兜底，但桥接自身的其余修复仍要等它重启。
 
 ## 规则模块
 
@@ -78,9 +81,9 @@ QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动�
 
 ## 第一次启动
 
-第一次跟角色说话时，她会自己读 `GUIDE.md` 给你做一遍引导：能做什么、怎么使唤她、总开关在哪、群聊和 gal 模式怎么玩，最后问你一句要不要接 QQ。引导做完会在 `identity/引导.md` 留一行日期，之后不再重复。
+第一次跟角色说话时，她按 `modules/first-meeting.md` 给你做一遍引导：能做什么、怎么使唤她、总开关在哪、群聊和 gal 模式怎么玩，最后问你一句要不要接 QQ。引导做完会在 `identity/引导.md` 留一行日期，之后不再重复。
 
-`GUIDE.md` 是给 AI 读的操作手册（也是给人看的功能说明），包含：初次配置 QQ / OneBot 服务端（NapCat / SnowLuma 等）的步骤、群聊开关怎么用、gal 模式规则、总开关、数据位置和排查表。
+`GUIDE.md` 是给人看的操作手册（安装 / QQ 配置 / 排查），插件不会自动把它读进上下文；里面的运维步骤请由人来执行。
 
 ## 总开关
 
@@ -90,7 +93,7 @@ QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动�
 ~/.local/share/life-world/bin/life-world.sh on       # 恢复
 ```
 
-关掉时：不注入时间/世界提示词/心情/记忆、不打时间戳、6 个工具一个都不挂、定时器空转——等于没装这个插件。世界数据（日记、计划、记忆、心情、闹钟）原地保留，开回来直接接上。
+关掉时：不注入时间/世界提示词/心情/记忆、不打时间戳、6 个工具一个都不挂、定时器空转——模型看到的上下文和原生 opencode 一样。**归档仍在后台继续**（只写文件、不进上下文），历史不会断；世界数据（日记、计划、记忆、心情、闹钟）原地保留，开回来直接接上。
 
 开关记在 `~/.local/share/life-world/life-world.json` 的 `world.enabled`（不写=开启；旧文件兜底）。脚本改完会重启服务和 TUI：工具与定时器都是进程启动时建的，不重启等于没生效。开关**只认人手**，没有做成给角色调用的工具。
 
@@ -98,15 +101,16 @@ QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动�
 
 ## 可选：QQ 桥接（OneBot v11 正向 WS）
 
-`scripts/qq-bridge.mjs` 是一条可选的 QQ 通道：**任意实现了 OneBot v11 正向 WebSocket 的服务端**都可以——NapCat、SnowLuma 等都行，只要它对外开放（正向）WS 服务器，把地址填进配置即可。链路是：QQ 服务端 WS → 桥接 → `qq-chat` 会话；角色回复后，桥接把最后一条 assistant 文本发回 QQ。
+`scripts/qq-bridge.mjs` 是一条可选的 QQ 通道：**任意实现了 OneBot v11 正向 WebSocket 的服务端**都可以——NapCat、SnowLuma 等都行，只要它对外开放（正向）WS 服务器，把地址填进配置即可。链路是：QQ 服务端 WS → 桥接 → `qq-chat` 会话；角色回复后，桥接把新完成的 assistant 文本按时间顺序发回 QQ（一次积压多条也不会漏）。
 
-当前只做私聊；群聊默认关闭。
+私聊与群聊都已实现；群聊默认关闭。
 
 ```bash
 # 1. 配置：编辑 ~/.local/share/life-world/life-world.json 的 bridge
-#    没有就把仓库的 life-world.example.json 拷过去
-cp life-world.example.json ~/.local/share/life-world/life-world.json
-chmod 600 ~/.local/share/life-world/life-world.json
+#    这个文件由插件首次启动时生成（会从旧 world.json / qq-bridge.json 迁移设置）。
+#    不要用示例文件去覆盖它——尤其老部署，覆盖会截断迁移、丢 enabled / localModel / QQ 凭据。
+#    只有确认它是全新安装、文件还不存在时，才需要手动 cp life-world.example.json 过去。
+chmod 600 ~/.local/share/life-world/life-world.json 2>/dev/null || true
 # 填 bridge.ownerQQ、bridge.wsUrl / token、bridge.location；bridge.enabled 改成 true
 
 # 2. 启动（脱离 tmux，避免家会话重置时被 kill-server 带走）
@@ -116,14 +120,14 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 
 | 字段 | 说明 |
 |---|---|
-| `bridge.enabled` | 总开关；life-world 会把状态注入 system，关闭时 `reach_out` 不会写 outbox |
+| `bridge.enabled` | 总开关；life-world 会把状态注入 system，关闭时 `reach_out` 不会写 outbox。**桥接在启动时读取它**，运行中改需要重启桥接（`group_chat` 写的群开关是实时读取的） |
 | `bridge.ownerQQ` | 唯一允许的私聊用户，也是通知目标 |
-| `bridge.wsUrl` / `token` | 正向 WS 地址与 token（NapCat、SnowLuma 等通用；旧 `qq-bridge.json` 的 `napcat.*` 仍兜底） |
+| `bridge.wsUrl` / `token` | 正向 WS 地址与 token（NapCat、SnowLuma 等通用）。旧的 `~/.config/opencode/qq-bridge.json` 只在 `life-world.json` 完全没有 `bridge` 段时兜底；正常情况改这里。 |
 | `bridge.group.enabled` | 群聊开关，默认 `false`；角色也能用 `group_chat` 工具实时开关 |
 
 - `/new`：删除 `qq-chat`，下一条消息或她的 `reach_out` 再新建。
 - **outbox 补发**：投递游标按天记录；桥接启动/重连时会扫最近 3 天，把没送出去的补发（跨天离线也不丢）。
-- 回复按行拆成多条：每个短句一条 QQ 消息，两条之间按下一句长度停顿约 1.5~3 秒（加随机抖动），模拟真人打字。
+- 回复按行拆成多条：每个短句一条 QQ 消息，两条之间按下一句长度停顿约 1.5~5 秒（加随机抖动），模拟真人打字。
 - 若这一轮正文为空、但她调用了 `reach_out`，桥接会把这一轮缓冲的那些行当回复发出去，避免漏回。
 - 开关关闭或桥接离线（心跳超过 90 秒）时，角色会看到「reach_out 不会送达」，不会以为已经通知到你。
 - `life-world.json` 含凭据（token），权限 600，别外传；旧 `qq-bridge.json` 仅作兜底。
@@ -157,6 +161,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 ~/.local/share/life-world/
 ├── life-world.json      用户配置（600；含 QQ token）
 ├── debug.log
+├── bin/                 配套脚本（life-world.sh / start-tui.sh / browser-* / qq-bridge.mjs …）
 └── worlds/default/
     ├── world.json          运行时状态（闹钟/家会话/last*；不是配置）
     ├── world-prompt.md
@@ -165,7 +170,6 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
     ├── diary/
     ├── plan/
     ├── room/
-    ├── bin/               配套脚本
     └── outbox/
 ```
 
@@ -190,10 +194,14 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
   "world": {
     "enabled": true, "running": true, "reviewHour": 23, "fallbackWakeTime": "09:00",
     "resetHour": null, "recentLimit": 80, "summaryLimit": 12000,
-    "alarmStaleHours": 6, "resetCooldownMinutes": 5, "browserPort": 9222,
+    "alarmStaleHours": 6, "resetCooldownMinutes": 5,
     "homeTitle": "life-world home session"
   },
-  "localModel": { "enabled": false, "keepRecent": 20, "foldRecentContext": 6, "resultChars": 300, "foldToolMessages": true, "foldingReasoningTurns": 0, "preferSubagent": true, "debugStats": false },
+  "localModel": {
+    "enabled": false, "keepRecent": 20, "foldRecentContext": 6, "resultChars": 300,
+    "foldToolMessages": true, "foldingReasoningTurns": 0, "preferSubagent": true, "debugStats": false,
+    "concurrency": { "enabled": false, "deferMinutes": 30, "userActiveSeconds": 90, "groupPause": true, "groupMaxAgeMinutes": 10, "leaseTtlMinutes": 10 }
+  },
   "bridge": {
     "enabled": false, "ownerQQ": 0, "ownerName": "", "wsUrl": "ws://127.0.0.1:3001",
     "token": "", "privateSessionTitle": "qq-chat", "location": "",
@@ -204,7 +212,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 
 | 区块 | 主要字段 |
 |---|---|
-| `world` | 总开关 `enabled`、暂停打扰 `running`、回顾 `reviewHour`、早上兜底 `fallbackWakeTime`、夜间重置 `resetHour`、注入/压缩/积压/冷却/浏览器/家会话标题等 |
+| `world` | 总开关 `enabled`、暂停打扰 `running`、回顾 `reviewHour`、早上兜底 `fallbackWakeTime`、夜间重置 `resetHour`、注入/压缩/积压/冷却/家会话标题等 |
 | `localModel` | 本地小模型优化，见下文 |
 | `bridge` | QQ/OneBot 桥接，见下文 QQ 一节 |
 
@@ -226,6 +234,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 - 颜文字数据 `data/kaomoji.json` 为随附资源；发布前请确认其来源与许可证。
 - 权限是提示词软约束，没有 `ctx.permission` 硬拦截（有意为之）。
 - QQ 桥接私聊 / 群聊都已实现；群聊默认关闭。
+- 浏览器脚本复用 `~/.config/google-chrome-agent` 这份资料：首次使用需要先把真实 Chrome 资料迁过去（或按部署 worklog 建软链），否则打开的是空 profile、不带登录态。
 
 ## 本地小模型优化（可选，默认关闭）
 
@@ -258,6 +267,33 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 | `foldingReasoningTurns` | 0 | 保留最近几轮的推理；0 = 全折，-1 = 不折 |
 | `preferSubagent` | `true` | 注入「在线模型子代理」提示：有在线模型时把抓网页/调研这类重活委托过去 |
 | `debugStats` | `false` | 每轮往 debug.log 写一行上下文构成统计（调参用） |
+| `concurrency` | 见下 | 单并发模型闸门，默认关闭 |
+
+### 单并发模型闸门（`localModel.concurrency`）
+
+给「同一时间只能跑一个请求」的本地模型用。**接在线 API 时保持默认关闭**，本功能完全 no-op。
+
+```json
+"concurrency": {
+  "enabled": false,
+  "deferMinutes": 30,
+  "userActiveSeconds": 90,
+  "groupPause": true,
+  "groupMaxAgeMinutes": 10,
+  "leaseTtlMinutes": 10
+}
+```
+
+打开后（且 `localModel.enabled` 也为 true）：
+
+| 规则 | 行为 |
+|---|---|
+| 用户在聊天 | 插件和桥接看到「用户活跃」后，不再发起新的定时/群聊回合 |
+| 定时任务冲突 | 到点的闹钟 `at += deferMinutes`（默认 30 分钟）后放回；回顾/兜底本轮跳过 |
+| QQ 群聊 | **新回合**暂停（已经在生成的回复照常投递）；空闲后只处理最新一批，超过 `groupMaxAgeMinutes` 的旧消息丢弃 |
+| 释放 | 回合结束（`session.idle`；桥接在群回合完成/放弃、私聊 `/new` 或会话删除时）释放；进程被杀靠 `leaseTtlMinutes` 兜底 |
+
+**边界**：只能阻止**新回合**。已经在跑的那一轮无法被抢断（opencode 的取消接口没有接），用户的请求仍要等它结束；QQ 私聊和 TUI 同时来消息同样只能排队。
 
 **实测**（395 迷你主机 + Qwen3.8-Flash-Next IQ3_XXS，opencode 2.2.5）：同一条会话，每轮请求从 **306 KB / 20 万 token** 降到 **25 KB 上下**，单轮耗时从 145–222 秒降到几十秒。
 
@@ -277,7 +313,7 @@ node ~/.local/share/life-world/bin/kaomoji-update.mjs --check  # 只看版本
 ## 数据与隐私
 
 - 仓库里**只有插件代码和文档**，不带任何人的世界数据、日志或凭据。
-- 运行时数据全部落在 `~/.local/share/life-world/`，只在你本机；QQ 桥接的配置 `qq-bridge.json` 权限 600 且被 `.gitignore` 排除。
+- 运行时数据全部落在 `~/.local/share/life-world/`，只在你本机；QQ 凭据在 `life-world.json`（权限 600，已不在仓库目录内）。
 - 心情文件里的「可选状态库」只是一份示例，你可以换成任何适合自己角色的状态。
 
 ## 许可证
