@@ -318,6 +318,12 @@ function readJudgeIds(): Set<string> {
 
 let sessionColumnWarned = false
 
+/** 工具是否运行在群聊判官会话里（判官的上下文会发给在线模型，不能让群消息诱导它操作） */
+function judgeContext(toolCtx: unknown): boolean {
+  const sessionID = String((toolCtx as { sessionID?: unknown } | undefined)?.sessionID ?? currentSessionID ?? "")
+  return Boolean(sessionID) && readJudgeIds().has(sessionID)
+}
+
 /** 直接从 opencode 的消息库读增量：不依赖 API，assistant 的回复也在。 */
 function scanMessages(afterMs: number, excludeSessions: string[] = []): StoredRow[] {
   if (!existsSync(DB_PATH)) return []
@@ -1183,7 +1189,14 @@ function moveLegacyConfigs(): void {
 function ensureConfig(): void {
   try {
     if (existsSync(CONFIG_FILE)) {
-      moveLegacyConfigs()
+      // 新配置里没有 bridge 段时，保留 ~/.config/opencode/qq-bridge.json 给桥接兜底；
+      // 直接搬走会让桥接下次重启报 config missing。
+      let hasBridge = false
+      try {
+        const raw = JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as { bridge?: unknown }
+        hasBridge = Boolean(raw && typeof raw.bridge === "object")
+      } catch { hasBridge = false }
+      if (hasBridge) moveLegacyConfigs()
       return
     }
     const config = existsSync(LEGACY_LIFE_WORLD_CONFIG)
@@ -1309,6 +1322,13 @@ function markUserActive(owner: string): void {
   withGateLock(() => {
     const state = readGateState()
     const now = Date.now()
+    // 定时器自己发起的回合：它的 context 钩子不能把 kind 改写成 user，
+    // 否则下一拍会把自己的租约当成「用户占着」，把到点闹钟整体推迟 30 分钟。
+    if (state.owner === owner && state.kind === "timer") {
+      state.expires = new Date(now + opt.concurrency.leaseTtlMinutes * 60_000).toISOString()
+      writeGateState(state)
+      return
+    }
     state.userActiveUntil = new Date(now + opt.concurrency.userActiveSeconds * 1000).toISOString()
     const expires = state.expires ? Date.parse(state.expires) : 0
     const free = !state.owner || !Number.isFinite(expires) || expires <= now
@@ -2048,7 +2068,8 @@ export default Plugin.define({
             },
             required: ["note"],
           },
-          execute: async (input: any) => {
+          execute: async (input: any, toolCtx: any) => {
+            if (judgeContext(toolCtx)) return ok("这是群聊判官会话，不能定闹钟。")
             const now = Date.now()
             let target: number | undefined
             if (typeof input?.after_minutes === "number") target = now + input.after_minutes * 60_000
@@ -2098,7 +2119,8 @@ export default Plugin.define({
             type: "object",
             properties: { match: { type: "string", description: "要取消的闹钟的 note 关键词；不传则全取消" } },
           },
-          execute: async (input: any) => {
+          execute: async (input: any, toolCtx: any) => {
+            if (judgeContext(toolCtx)) return ok("这是群聊判官会话，不能改闹钟。")
             const state = readWorld()
             const all = state.alarms ?? []
             if (all.length === 0) return ok("现在没有闹钟可取消。")
@@ -2188,7 +2210,8 @@ export default Plugin.define({
             type: "object",
             properties: { enabled: { type: "boolean", description: "true 开启，false 关闭" } },
           },
-          execute: async (input: any) => {
+          execute: async (input: any, toolCtx: any) => {
+            if (judgeContext(toolCtx)) return ok("这是群聊判官会话，不能开关群聊。")
             if (typeof input?.enabled !== "boolean") return ok("请传 enabled: true 或 false。")
             try {
               const config = readConfig()
@@ -2216,7 +2239,8 @@ export default Plugin.define({
               remember: { type: "boolean", description: "true 就把这几条收进 room/颜文字.md" },
             },
           },
-          execute: async (input: any) => {
+          execute: async (input: any, toolCtx: any) => {
+            if (judgeContext(toolCtx)) return ok("这是群聊判官会话，不能取颜文字。")
             const data = loadKaomoji()
             if (!data) return ok("颜文字库没加载上，看看 debug.log。")
             const scene = String(input?.scene ?? "").trim()
@@ -2334,7 +2358,10 @@ export default Plugin.define({
             if (!gateOn) return false
             const gate = readGateState()
             const expires = gate.expires ? Date.parse(gate.expires) : 0
-            return gate.owner === home && gate.kind === "timer" && Number.isFinite(expires) && expires > Date.now()
+            const until = gate.userActiveUntil ? Date.parse(gate.userActiveUntil) : 0
+            const userActive = Number.isFinite(until) && until > Date.now()
+            // 用户在别的会话活跃时（userActiveUntil 有值），即使是自己的 timer 租约也要让路
+            return gate.owner === home && gate.kind === "timer" && !userActive && Number.isFinite(expires) && expires > Date.now()
           })()
           if (gateOn && gateBusy() && !ownTimerLease) {
             deferDueAlarms()

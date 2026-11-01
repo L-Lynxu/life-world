@@ -290,7 +290,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 |---|---|
 | 用户在聊天 | 插件和桥接看到「用户活跃」后，不再发起新的定时/群聊回合 |
 | 定时任务冲突 | 到点的闹钟 `at += deferMinutes`（默认 30 分钟）后放回；回顾/兜底本轮跳过 |
-| QQ 群聊 | 判官和群回复暂停；空闲后只处理最新一批，超过 `groupMaxAgeMinutes` 的旧消息丢弃 |
+| QQ 群聊 | **新回合**暂停（已经在生成的回复照常投递）；空闲后只处理最新一批，超过 `groupMaxAgeMinutes` 的旧消息丢弃 |
 | 释放 | 回合结束（`session.idle`；桥接在群回合完成/放弃、私聊 `/new` 或会话删除时）释放；进程被杀靠 `leaseTtlMinutes` 兜底 |
 
 **边界**：只能阻止**新回合**。已经在跑的那一轮无法被抢断（opencode 的取消接口没有接），用户的请求仍要等它结束；QQ 私聊和 TUI 同时来消息同样只能排队。

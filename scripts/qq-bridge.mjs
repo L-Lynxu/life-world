@@ -573,6 +573,9 @@ function splitMessages(text, limit = 800) {
   return out
 }
 
+/** 最近一次私聊发送失败的错误文本：用来区分「断线/超时」和「QQ 应用层拒绝」 */
+let lastSendError = ""
+
 async function sendPrivate(text) {
   const messages = splitMessages(text)
   for (let i = 0; i < messages.length; i++) {
@@ -581,6 +584,7 @@ async function sendPrivate(text) {
       await call("send_private_msg", { user_id: ownerQQ, message })
       log(`sent private ${i + 1}/${messages.length}`, message.slice(0, 40))
     } catch (error) {
+      lastSendError = String(error)
       log("send private failed", String(error))
       return false
     }
@@ -591,6 +595,7 @@ async function sendPrivate(text) {
       await new Promise((r) => setTimeout(r, wait))
     }
   }
+  lastSendError = ""
   return true
 }
 
@@ -1123,7 +1128,16 @@ async function processGroupNow(key) {
   groupRunWindows.set(key, { start: Date.now(), end: 0 })
   const body = { text }
   if (files.length) body.files = files
-  const res = await api(`/api/session/${id}/prompt`, { method: "POST", body: JSON.stringify(body) })
+  let res
+  try {
+    res = await api(`/api/session/${id}/prompt`, { method: "POST", body: JSON.stringify(body) })
+  } catch (error) {
+    // 服务不可达时 api() 会抛错：同样要收尾窗口并释放租约
+    log("group prompt failed", String(error))
+    const w = groupRunWindows.get(key); if (w) w.end = Date.now()
+    if (conc.enabled) releaseGate(gateOwner)
+    return
+  }
   if (!res.ok) {
     log("group prompt failed", res.status, (await res.text()).slice(0, 200))
     const w = groupRunWindows.get(key); if (w) w.end = Date.now()
@@ -1185,6 +1199,10 @@ async function pollGroups() {
           releaseGate(`qq-group:${key}`)
           st.lastIdle = idle
           log("group no assistant, give up", key)
+        } else if (w && w.end) {
+          // 窗口已经被其它路径关掉（5 分钟超时 / /new）：别再 2 秒一轮空转
+          st.lastIdle = idle
+          st.waitSince = 0
         } else {
           st.retryAt = Date.now() + 2000
         }
@@ -1315,7 +1333,9 @@ async function pollPrivate() {
     // 不能只取最新一条——短时间连发两条时会吞掉前一条回复。
     let newer
     if (!state.lastAssistantId) {
-      newer = [assistants[0]]
+      // 还没有基线（新会话/刚 /new）：把已经完成的都按时间正序发出去。
+      // 只取最新一条会吞掉同一轮询间隔内先完成的回复。
+      newer = assistants.slice(0, 5).reverse()
     } else {
       const idx = assistants.findIndex((m) => m.id === state.lastAssistantId)
       if (idx === 0) { state.lastIdle = idle; saveState(); return }
@@ -1354,7 +1374,6 @@ async function pollPrivate() {
           log("reply from reach_out buffer", buffered.length)
         }
       }
-      state.lastIdle = idle
       state.lastAssistantId = message.id
       if (isLast && runWindow && !runWindow.end) {
         runWindow.reaches = []
@@ -1362,6 +1381,10 @@ async function pollPrivate() {
       }
       saveState()
     }
+    // 只有这一批全部发完才推进 lastIdle：中途失败时保持旧值，
+    // 下一次轮询才会重新进来重试剩下的回复。
+    state.lastIdle = idle
+    saveState()
   } catch (error) {
     log("poll failed", String(error))
   } finally {
@@ -1415,8 +1438,11 @@ async function pollOutbox() {
   try {
     // 群聊运行窗口兜底收尾：某轮回复始终没完成（openCode 报错/被 /new 打断）时，
     // end 会一直是 0，之后所有 reach_out 都会被当成「群聊期间的输出」吞掉。
+    // 开了闸门时模型一轮可能跑很久：窗口超时跟着租约 TTL 走，别 5 分钟就释放
+    const conc = concurrencyCfg()
+    const windowMs = conc.enabled ? conc.leaseTtlMinutes * 60_000 : 5 * 60_000
     for (const [key, w] of groupRunWindows) {
-      if (!w.end && Date.now() - w.start > 5 * 60_000) {
+      if (!w.end && Date.now() - w.start > windowMs) {
         w.end = Date.now()
         releaseGate(`qq-group:${key}`)
         log("group run window timeout", key)
@@ -1520,7 +1546,7 @@ async function pollOutbox() {
         }
         const id = await ensurePrivate()
         if (!id) {
-          if (giveUp(200)) { consumed += bytes; continue }
+          // 服务不可达属于基础设施问题：不丢消息，保持阻塞，等 opencode 回来继续补发
           blocked = true
           break
         }
@@ -1536,6 +1562,12 @@ async function pollOutbox() {
         }
         const ok = await sendPrivate(item.text)
         if (!ok) {
+          // WS 断开/超时是基础设施问题：不消耗重试次数、不进死信，等重连后补发
+          const infra = /ws not ready|timeout|fetch failed|ECONN|ENOTFOUND|EAI_AGAIN|socket/i.test(lastSendError)
+          if (infra) {
+            blocked = true
+            break
+          }
           if (giveUp()) { consumed += bytes; continue }
           blocked = true
           break
