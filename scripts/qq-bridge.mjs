@@ -14,9 +14,9 @@
  *   node qq-bridge.mjs --test-send [文本]  只发一条测试私聊，然后退出
  */
 
-import { appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
-import { basename, dirname, join } from "node:path"
+import { basename, dirname, join, sep } from "node:path"
 
 const HOME = homedir()
 const LIFEWORLD_CONFIG_FILE = join(HOME, ".local/share/life-world/life-world.json")
@@ -1752,9 +1752,17 @@ function recentDays(n) {
 
 /** 主动发图片/文件：读本地文件 → base64 段 → 发到这条 outbox 所属的私聊/群 */
 async function sendOutboxMedia(item) {
-  const path = String(item.path || "")
+  let path = String(item.path || "")
   if (!path || !existsSync(path)) {
     log("outbound media missing", path)
+    return { ok: false }
+  }
+  // 防御 outbox 被手改：只允许发 world 下 room / 表情包 / tmp 里的文件
+  try { path = realpathSync(path) } catch { return { ok: false } }
+  const worldRoot = dirname(OUTBOX_DIR)
+  const allowed = [join(worldRoot, "room"), join(worldRoot, "表情包"), join(worldRoot, "tmp")]
+  if (!allowed.some((dir) => path === dir || path.startsWith(dir + sep))) {
+    log("outbound media outside allowed dirs", path)
     return { ok: false }
   }
   let size
