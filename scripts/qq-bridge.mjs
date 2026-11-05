@@ -465,11 +465,11 @@ function connect() {
   })
 }
 
-function call(action, params) {
+function call(action, params, timeoutMs = 15000) {
   return new Promise((resolve, reject) => {
     if (!wsReady || !ws) return reject(new Error("ws not ready"))
     const echo = `e-${Date.now()}-${++echoSeq}`
-    const timer = setTimeout(() => { pending.delete(echo); reject(new Error(`${action} timeout`)) }, 15000)
+    const timer = setTimeout(() => { pending.delete(echo); reject(new Error(`${action} timeout`)) }, timeoutMs)
     pending.set(echo, { resolve, reject, timer })
     ws.send(JSON.stringify({ action, params, echo }))
   })
@@ -730,7 +730,20 @@ function splitMessages(text, limit = 800) {
 /** 最近一次私聊发送失败的错误文本：用来区分「断线/超时」和「QQ 应用层拒绝」 */
 let lastSendError = ""
 
-async function sendPrivate(text) {
+/** 同一会话的发送串行：文字、图片、文件不会互相插队 */
+const sendChains = new Map()
+function enqueueSend(key, fn) {
+  const prev = sendChains.get(key) || Promise.resolve()
+  const run = prev.then(fn, fn)
+  sendChains.set(key, run.catch(() => {}))
+  return run
+}
+
+function sendPrivate(text) {
+  return enqueueSend("private", () => sendPrivateNow(text))
+}
+
+async function sendPrivateNow(text) {
   const messages = splitMessages(text)
   for (let i = 0; i < messages.length; i++) {
     const message = messages[i]
@@ -1273,7 +1286,11 @@ async function buildGroupPrompt(groupId, batch) {
   ].join("\n")
   return { text, files }
 }
-async function sendGroup(groupId, text) {
+function sendGroup(groupId, text) {
+  return enqueueSend(`group:${groupId}`, () => sendGroupNow(groupId, text))
+}
+
+async function sendGroupNow(groupId, text) {
   const cfg = groupCfg()
   // 空串/空白关键词会把所有消息都判成命中（includes("") 恒真），先剔掉
   const banned = (Array.isArray(cfg.bannedWords) ? cfg.bannedWords : [])
@@ -1748,35 +1765,49 @@ async function sendOutboxMedia(item) {
     log("outbound media too large", path, size)
     return { ok: false }
   }
-  let b64
-  try { b64 = readFileSync(path).toString("base64") } catch { return { ok: false } }
-  const segment = isImage
-    ? { type: "image", data: { file: `base64://${b64}` } }
-    : { type: "file", data: { file: `base64://${b64}`, name: item.name || basename(path) } }
-  const message = []
-  if (item.text) message.push({ type: "text", data: { text: String(item.text).slice(0, 500) } })
-  message.push(segment)
   const session = String(item.session || "")
   const groupEntry = Object.entries(state.groups || {}).find(([, sid]) => sid === session)
   if (groupEntry && !isImage) {
     log("group file not supported, skipped", item.name || basename(path))
     return { ok: false }
   }
-  try {
-    if (groupEntry) {
-      await call("send_group_msg", { group_id: Number(groupEntry[0]), message })
-      log("sent media", "group", groupEntry[0], item.name || basename(path))
-    } else {
-      await call("send_private_msg", { user_id: ownerQQ, message })
-      log("sent media", "private", item.name || basename(path))
+  const targetKey = groupEntry ? `group:${groupEntry[0]}` : "private"
+  return enqueueSend(targetKey, async () => {
+    let b64
+    try { b64 = readFileSync(path).toString("base64") } catch { return { ok: false } }
+    const imageSegment = { type: "image", data: { file: `base64://${b64}`, summary: "[图片]" } }
+    const fileSegment = { type: "file", data: { file: `base64://${b64}`, name: item.name || basename(path) } }
+    const text = String(item.text || "").slice(0, 500)
+    const timeout = isImage ? 60_000 : 120_000
+    const send = (message, ms) => groupEntry
+      ? call("send_group_msg", { group_id: Number(groupEntry[0]), message }, ms)
+      : call("send_private_msg", { user_id: ownerQQ, message }, ms)
+    try {
+      if (!groupEntry) stopTyping(ownerQQ)
+      if (isImage) {
+        const message = []
+        if (text) message.push({ type: "text", data: { text } })
+        message.push(imageSegment)
+        await send(message, timeout)
+      } else {
+        // 文件单独一个气泡：先发说明，停一下再发文件
+        if (text) {
+          await send([{ type: "text", data: { text } }], 15_000)
+          await sleep(800)
+        }
+        await send([fileSegment], timeout)
+      }
+      log("sent media", groupEntry ? `group ${groupEntry[0]}` : "private", item.name || basename(path))
+      if (!groupEntry && pendingPrivateTurns > 0) startTyping(ownerQQ)
+      return { ok: true }
+    } catch (error) {
+      const message = String(error)
+      log("send media failed", message)
+      // 只有「还没写出去」的 ws not ready 能安全重试；
+      // 超时/断连代表投递未知，重发会产生重复图片/文件，不自动重试。
+      return { ok: false, retryable: /ws not ready/i.test(message) }
     }
-    return { ok: true }
-  } catch (error) {
-    const text = String(error)
-    log("send media failed", text)
-    // WS 断开/超时算基础设施错误，重连后重试；QQ 应用层拒绝才进死信
-    return { ok: false, infra: /ws not ready|timeout|fetch failed|ECONN|ENOTFOUND|EAI_AGAIN|socket/i.test(text) }
-  }
+  })
 }
 
 async function pollOutbox() {
@@ -1883,13 +1914,14 @@ async function pollOutbox() {
             consumed += bytes
             continue
           }
-          if (sent.infra) {
+          if (sent.retryable) {
             blocked = true
             break
           }
-          if (giveUp()) { consumed += bytes; continue }
-          blocked = true
-          break
+          // 超时/应用层失败：投递结果未知，重发会重复，直接消费并记录
+          log("outbound media dropped (not retried)", item.name || "")
+          consumed += bytes
+          continue
         }
 
         if (item.kind !== "reach" || !item.text) { consumed += bytes; continue }
