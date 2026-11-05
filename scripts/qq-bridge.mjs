@@ -522,6 +522,7 @@ const TYPING_INTERVAL = 4000
 const typingTimers = new Map()
 let typingSupported = true
 let typingFailures = 0
+let typingRetryAt = 0
 /** 还没等到回复的私聊回合数：连续发多条时，全部回完才停「正在输入」 */
 let pendingPrivateTurns = 0
 
@@ -529,32 +530,56 @@ async function typingPing(userId) {
   try {
     await call("set_input_status", { user_id: Number(userId), event_type: 1 })
     typingFailures = 0
+    typingRetryAt = 0
     return true
   } catch (error) {
+    const text = String(error)
     // WS 断线不算「不支持」，重连后还能用
-    if (/ws not ready/i.test(String(error))) return false
-    typingFailures += 1
-    if (typingFailures >= 3) {
+    if (/ws not ready/i.test(text)) return false
+    // 只有明确的「动作不存在」才永久禁用；参数错/临时失败只退避
+    if (/not found|unsupported|unknown action|1404|retcode=1404/i.test(text)) {
       typingSupported = false
-      log("typing unsupported, disabled", String(error))
+      log("typing unsupported, disabled", text)
       stopTyping(userId)
+      return false
     }
+    typingRetryAt = Date.now() + 30_000
+    if (typingFailures === 0) log("typing failed, backing off", text)
+    typingFailures += 1
     return false
   }
+}
+
+/** 10 分钟检查一次：还有没完成的回合就续，不硬停 */
+function armTypingGuard(userId) {
+  const key = String(userId)
+  const entry = typingTimers.get(key)
+  if (!entry) return
+  clearTimeout(entry.guard)
+  entry.guard = setTimeout(() => {
+    if (pendingPrivateTurns > 0 && typingTimers.has(key)) return armTypingGuard(userId)
+    stopTyping(userId)
+  }, 10 * 60_000)
+  entry.guard.unref?.()
 }
 
 function startTyping(userId) {
   if (!typingSupported) return
   const key = String(userId)
-  if (typingTimers.has(key)) return
-  const ping = () => { void typingPing(userId) }
+  if (typingTimers.has(key)) {
+    armTypingGuard(userId)
+    return
+  }
+  const ping = () => {
+    if (typingRetryAt && Date.now() < typingRetryAt) return
+    void typingPing(userId)
+  }
   ping()
   const timer = setInterval(ping, TYPING_INTERVAL)
   timer.unref?.()
-  // 模型卡死时别永远显示「正在输入」
-  const guard = setTimeout(() => stopTyping(userId), 10 * 60_000)
-  guard.unref?.()
-  typingTimers.set(key, { timer, guard })
+  const entry = { timer, guard: null }
+  typingTimers.set(key, entry)
+  armTypingGuard(userId)
 }
 
 function stopTyping(userId) {
@@ -582,6 +607,7 @@ function privateMedia(msg) {
         file: d.file || "",
         fileId: d.file_id || d.fileId || "",
         fileHash: d.file_hash || "",
+        fileSize: Number(d.file_size) || 0,
         name: d.file_name || d.file || d.summary || "image.jpg",
       })
     } else if (p?.type === "file") {
@@ -591,6 +617,7 @@ function privateMedia(msg) {
         file: d.file || "",
         fileId: d.file_id || d.fileId || "",
         fileHash: d.file_hash || "",
+        fileSize: Number(d.file_size) || 0,
         name: d.file_name || d.name || d.file || "file",
       })
     }
@@ -620,11 +647,23 @@ async function handlePrivate(msg) {
     return
   }
   const files = []
+  let budget = TOTAL_ATTACHMENT_BUDGET
   for (const item of media) {
-    const resolved = await resolveMedia(item)
-    if (!resolved) continue
-    const path = await downloadMedia(resolved, item.type === "image" ? MAX_MEDIA_BYTES : MAX_FILE_BYTES)
-    if (path) files.push({ uri: `file://${path}`, name: safeLabel(item.name, basename(path)) })
+    if (Number(item.fileSize) > budget) {
+      log("attachment budget exceeded (declared), skipped", item.fileSize)
+      continue
+    }
+    const path = await fetchAttachment(item, item.type === "image" ? MAX_MEDIA_BYTES : MAX_FILE_BYTES)
+    if (!path) continue
+    let size = 0
+    try { size = statSync(path).size } catch { /* 刚写完，读不到就算了 */ }
+    if (size > budget) {
+      try { unlinkSync(path) } catch {}
+      log("attachment budget exceeded (actual), dropped", size)
+      continue
+    }
+    budget -= size
+    files.push({ uri: `file://${path}`, name: safeLabel(item.name, basename(path)) })
   }
   const failedCount = media.length - files.length
   if (media.length > 0) log(`private media ${files.length}/${media.length}${failedCount ? ` (${failedCount} failed)` : ""}`)
@@ -773,8 +812,19 @@ function groupMedia(msg) {
   const out = []
   for (const p of parts) {
     // 群聊只自动收图片；文件/视频不下载，正文里只留 [文件]/[视频] 占位
-    if (p?.type === "image") out.push({ type: "image", url: p?.data?.url || p?.data?.file || "", summary: "" })
-    else if (p?.type === "mface") out.push({ type: "image", url: p?.data?.url || "", summary: p?.data?.summary || "" })
+    const d = p?.data || {}
+    if (p?.type === "image" || p?.type === "mface") {
+      out.push({
+        type: "image",
+        url: /^https?:\/\//i.test(d.url || "") ? d.url : "",
+        file: d.file || "",
+        fileId: d.file_id || d.fileId || "",
+        fileHash: d.file_hash || "",
+        fileSize: Number(d.file_size) || 0,
+        name: d.file_name || d.file || d.summary || "image.jpg",
+        summary: d.summary || "",
+      })
+    }
   }
   return out
 }
@@ -1031,28 +1081,43 @@ async function runJudge(groupId, batch) {
 /** 图片上限 8 MB、文件上限 20 MB：别让大文件或恶意 URL 把桥接撑爆 */
 const MAX_MEDIA_BYTES = 8 * 1024 * 1024
 const MAX_FILE_BYTES = 20 * 1024 * 1024
+/** 一条消息/一批群图的总预算，避免一次发 10 个大文件把磁盘写爆 */
+const TOTAL_ATTACHMENT_BUDGET = 40 * 1024 * 1024
 /**
  * 图片/文件段可能只给 file/file_id（NapCat、SnowLuma 都常见），没有 http 链接。
  * 先向 OneBot 要下载地址或 base64；拿不到才放弃。
  */
 async function resolveMedia(media) {
-  if (media.url) return media
+  const url = String(media.url || "")
+  // 段内/实现返回的 url 可能本身就是 base64:// 或 data: URI
+  if (url.startsWith("base64://")) return { ...media, base64: url.slice(9) }
+  if (/^data:[^;]+;base64,/i.test(url)) return { ...media, base64: url.split(",")[1] }
+  if (/^https?:\/\//i.test(url)) return media
+
   if (media.type === "image") {
     try {
       const params = media.fileId && !media.file ? { file_id: media.fileId } : { file: media.file || media.fileId || "" }
       const res = await call("get_image", params)
       const d = res?.data || {}
-      if (/^https?:\/\//i.test(d.url || "")) return { ...media, url: d.url, name: d.file_name || media.name }
+      const u = String(d.url || "")
+      if (/^https?:\/\//i.test(u)) return { ...media, url: u, name: d.file_name || media.name }
+      if (u.startsWith("base64://")) return { ...media, base64: u.slice(9) }
+      if (/^data:[^;]+;base64,/i.test(u)) return { ...media, base64: u.split(",")[1] }
       const raw = String(d.base64 || d.file || "")
+      if (/^https?:\/\//i.test(raw)) return { ...media, url: raw, name: d.file_name || media.name }
       if (raw.startsWith("base64://")) return { ...media, base64: raw.slice(9) }
       if (/^data:[^;]+;base64,/.test(raw)) return { ...media, base64: raw.split(",")[1] }
+      // 本地路径只在同机部署可用；跨机（PD 的 NapCat）读不到，但先留着
       if (raw && existsSync(raw)) return { ...media, localPath: raw }
+      log("resolve image: no usable url/base64", JSON.stringify(d).slice(0, 200))
     } catch (error) {
       log("resolve image failed", String(error))
     }
     return undefined
   }
-  // 私聊文件：SnowLuma 用 get_private_file_url；其他实现用 get_file
+
+  // 私聊文件：SnowLuma 用 get_private_file_url（需要 file_hash）；NapCat 也支持
+  let actionMissing = false
   try {
     const res = await call("get_private_file_url", {
       user_id: ownerQQ,
@@ -1061,23 +1126,47 @@ async function resolveMedia(media) {
     })
     const d = res?.data || {}
     if (/^https?:\/\//i.test(d.url || "")) return { ...media, url: d.url, name: d.file_name || media.name }
-  } catch { /* 有些实现没有这个动作 */ }
-  try {
-    const res = await call("get_file", { file_id: media.fileId || media.file || "" })
-    const d = res?.data || {}
-    if (/^https?:\/\//i.test(d.url || "")) return { ...media, url: d.url, name: d.file_name || media.name }
     if (typeof d.base64 === "string" && d.base64) return { ...media, base64: d.base64 }
-    const raw = String(d.file || "")
-    if (raw.startsWith("base64://")) return { ...media, base64: raw.slice(9) }
-    if (raw && existsSync(raw)) return { ...media, localPath: raw }
   } catch (error) {
-    log("resolve file failed", String(error))
+    actionMissing = /not found|unsupported|unknown|1404|retcode=1404/i.test(String(error))
+    if (actionMissing) log("get_private_file_url unsupported, trying get_file")
+    else log("resolve private file url failed", String(error))
+  }
+  // 只有「动作不存在」才退回 get_file；SnowLuma 的 get_file 不下载普通文件
+  if (actionMissing) {
+    try {
+      const res = await call("get_file", { file_id: media.fileId || media.file || "" })
+      const d = res?.data || {}
+      if (/^https?:\/\//i.test(d.url || "")) return { ...media, url: d.url, name: d.file_name || media.name }
+      if (typeof d.base64 === "string" && d.base64) return { ...media, base64: d.base64 }
+      const raw = String(d.file || "")
+      if (raw.startsWith("base64://")) return { ...media, base64: raw.slice(9) }
+      if (raw && existsSync(raw)) return { ...media, localPath: raw }
+    } catch (error) {
+      log("resolve file failed", String(error))
+    }
   }
   return undefined
 }
 
-async function downloadMedia(media, maxBytes = MAX_MEDIA_BYTES) {
-  if (!media) return undefined
+/**
+ * 先按段内 url 下载；失败（QQ CDN 的 rkey 会过期）就用 file/file_id 重新解析一次。
+ * 群图和私聊都走这里。
+ */
+async function fetchAttachment(media, maxBytes) {
+  let path = await downloadMedia(media, maxBytes)
+  if (path) return path
+  const refreshed = await resolveMedia({ ...media, url: "", base64: undefined, localPath: undefined })
+  if (!refreshed) return undefined
+  return downloadMedia(refreshed, maxBytes)
+}
+
+async function downloadMedia(input, maxBytes = MAX_MEDIA_BYTES) {
+  if (!input) return undefined
+  const media = { ...input }
+  // 有些实现把 base64/data URI 直接塞在 url 里
+  if (!media.base64 && /^base64:\/\//i.test(media.url || "")) media.base64 = String(media.url).slice(9)
+  if (!media.base64 && /^data:[^;]+;base64,/i.test(media.url || "")) media.base64 = String(media.url).split(",")[1]
   const limit = Math.max(1, Number(maxBytes) || MAX_MEDIA_BYTES)
   try {
     let buf
@@ -1126,10 +1215,27 @@ async function downloadMedia(media, maxBytes = MAX_MEDIA_BYTES) {
       ? urlExt
       : /^\.(png|jpe?g|gif|webp)$/i.test(nameExt) ? nameExt : ".jpg"
     const ext = media.type === "image" ? imageExt : (nameExt || urlExt || ".bin")
+    if (Number(media.fileSize) > 0 && buf.length !== Number(media.fileSize)) {
+      log("media size mismatch", media.fileSize, buf.length)
+    }
     mkdirSync(GROUP_TMP_DIR, { recursive: true, mode: 0o700 })
     try { chmodSync(GROUP_TMP_DIR, 0o700) } catch { /* 已是自己的目录 */ }
     const path = join(GROUP_TMP_DIR, `qq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`)
-    writeFileSync(path, buf, { mode: 0o600 })
+    // .part + rename：中途失败不留半截的「看似合法」附件
+    const tmp = `${path}.part`
+    try {
+      const fd = openSync(tmp, "w", 0o600)
+      try {
+        writeFileSync(fd, buf)
+        try { fsyncSync(fd) } catch { /* 某些文件系统不支持 */ }
+      } finally {
+        closeSync(fd)
+      }
+      renameSync(tmp, path)
+    } catch (error) {
+      try { unlinkSync(tmp) } catch {}
+      throw error
+    }
     return path
   } catch (error) {
     log("download media failed", String(error))
@@ -1139,12 +1245,21 @@ async function downloadMedia(media, maxBytes = MAX_MEDIA_BYTES) {
 async function buildGroupPrompt(groupId, batch) {
   const lines = formatBatch(batch)
   const files = []
+  let budget = TOTAL_ATTACHMENT_BUDGET
   for (const m of batch) {
     for (const media of m.media || []) {
       if (media.type === "image") {
-        const resolved = await resolveMedia(media)
-        const path = resolved ? await downloadMedia(resolved) : undefined
-        if (path) files.push({ uri: `file://${path}`, name: `qq-image-${files.length + 1}` })
+        const path = await fetchAttachment(media, MAX_MEDIA_BYTES)
+        if (!path) continue
+        let size = 0
+        try { size = statSync(path).size } catch { /* 刚写完 */ }
+        if (size > budget) {
+          try { unlinkSync(path) } catch {}
+          log("group attachment budget exceeded, dropped", size)
+          continue
+        }
+        budget -= size
+        files.push({ uri: `file://${path}`, name: `qq-image-${files.length + 1}` })
       }
     }
   }
@@ -1539,6 +1654,8 @@ async function pollPrivate() {
           return
         }
         privateRetryAt = 0
+        // QQ 收到消息会清掉输入状态：还有没回完的回合就立刻补一次
+        if (pendingPrivateTurns > 0) void typingPing(ownerQQ)
       } else if (isLast && runWindow && !runWindow.end) {
         // 最后一条正文为空：她可能把话都写进了 reach_out，把缓冲的行当回复发出去
         const buffered = [...runWindow.reaches]
@@ -1550,6 +1667,7 @@ async function pollPrivate() {
             return
           }
           privateRetryAt = 0
+          if (pendingPrivateTurns > 0) void typingPing(ownerQQ)
           runWindow.reaches = []
           log("reply from reach_out buffer", buffered.length)
         }
