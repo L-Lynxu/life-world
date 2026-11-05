@@ -157,7 +157,7 @@ case "${1:-status}" in
     echo "life-world：打开"
     restart_service
     tui_active
-    echo "  插件会在 TUI 发出第一句话后加载（注入、6 个工具、定时器）"
+    echo "  插件会在 TUI 发出第一句话后加载（注入、7 个工具、定时器）"
     ;;
   off)
     write_enabled false

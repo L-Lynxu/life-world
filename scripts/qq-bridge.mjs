@@ -525,6 +525,8 @@ let typingFailures = 0
 let typingRetryAt = 0
 /** 还没等到回复的私聊回合数：连续发多条时，全部回完才停「正在输入」 */
 let pendingPrivateTurns = 0
+/** 最近一次私聊 prompt 的时间：超过 30 分钟没有产出就不再续「正在输入」 */
+let lastPrivatePromptAt = 0
 
 async function typingPing(userId) {
   try {
@@ -557,7 +559,9 @@ function armTypingGuard(userId) {
   if (!entry) return
   clearTimeout(entry.guard)
   entry.guard = setTimeout(() => {
-    if (pendingPrivateTurns > 0 && typingTimers.has(key)) return armTypingGuard(userId)
+    const stalled = Date.now() - lastPrivatePromptAt > 30 * 60_000
+    if (!stalled && pendingPrivateTurns > 0 && typingTimers.has(key)) return armTypingGuard(userId)
+    if (stalled) pendingPrivateTurns = 0
     stopTyping(userId)
   }, 10 * 60_000)
   entry.guard.unref?.()
@@ -701,6 +705,7 @@ async function handlePrivate(msg) {
   // 私聊是用户回合：让群聊/定时任务立刻让路（闸门关闭时是 no-op）
   markUserActive(id)
   pendingPrivateTurns += 1
+  lastPrivatePromptAt = Date.now()
   startTyping(ownerQQ)
   log("prompt queued", id)
 }
@@ -1660,6 +1665,9 @@ async function pollPrivate() {
       .join("\n")
       .trim()
 
+    // 只按「真正发出去的回复」扣回合：只有工具调用、没有正文的 assistant 不算回合结束
+    let sentTurns = 0
+    let sentBuffered = false
     for (let i = 0; i < newer.length; i++) {
       const message = newer[i]
       const isLast = i === newer.length - 1
@@ -1672,6 +1680,7 @@ async function pollPrivate() {
           return
         }
         privateRetryAt = 0
+        sentTurns += 1
         // QQ 收到消息会清掉输入状态：还有没回完的回合就立刻补一次
         if (pendingPrivateTurns > 0) void typingPing(ownerQQ)
       } else if (isLast && runWindow && !runWindow.end) {
@@ -1685,6 +1694,7 @@ async function pollPrivate() {
             return
           }
           privateRetryAt = 0
+          sentBuffered = true
           if (pendingPrivateTurns > 0) void typingPing(ownerQQ)
           runWindow.reaches = []
           log("reply from reach_out buffer", buffered.length)
@@ -1700,8 +1710,9 @@ async function pollPrivate() {
     // 只有这一批全部发完才推进 lastIdle：中途失败时保持旧值，
     // 下一次轮询才会重新进来重试剩下的回复。
     state.lastIdle = idle
-    // 每发完一条回复扣一个回合；全部扣完才停「正在输入」
-    pendingPrivateTurns = Math.max(0, pendingPrivateTurns - newer.length)
+    // 只有真正发出回复才扣回合；工具调用中间态不算，避免「正在输入」提前熄灭
+    const completed = sentTurns + (sentBuffered ? 1 : 0)
+    if (completed > 0) pendingPrivateTurns = Math.max(0, pendingPrivateTurns - completed)
     if (pendingPrivateTurns === 0) stopTyping(ownerQQ)
     saveState()
   } catch (error) {
@@ -1774,12 +1785,29 @@ async function sendOutboxMedia(item) {
     return { ok: false }
   }
   const session = String(item.session || "")
-  const groupEntry = Object.entries(state.groups || {}).find(([, sid]) => sid === session)
+  const target = item.target && typeof item.target === "object" ? item.target : undefined
+  let groupId = ""
+  if (target && target.kind === "group") {
+    groupId = String(target.id || "")
+    if (!groupId) {
+      log("outbox media group target missing id")
+      return { ok: false }
+    }
+  } else if (!target || target.kind !== "private") {
+    // 旧条目没有 target：按 session 反查；未知会话不默认投私聊，避免群图误投
+    const entry = Object.entries(state.groups || {}).find(([, sid]) => sid === session)
+    if (entry) groupId = entry[0]
+    else if (session && session !== state.privateSessionId) {
+      log("outbox media target unknown, skipped", session)
+      return { ok: false }
+    }
+  }
+  const groupEntry = groupId ? [groupId, ""] : undefined
   if (groupEntry && !isImage) {
     log("group file not supported, skipped", item.name || basename(path))
     return { ok: false }
   }
-  const targetKey = groupEntry ? `group:${groupEntry[0]}` : "private"
+  const targetKey = groupEntry ? `group:${groupId}` : "private"
   return enqueueSend(targetKey, async () => {
     let b64
     try { b64 = readFileSync(path).toString("base64") } catch { return { ok: false } }

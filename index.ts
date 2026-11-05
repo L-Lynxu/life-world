@@ -329,6 +329,15 @@ function readJudgeIds(): Set<string> {
 
 let sessionColumnWarned = false
 
+/** 群会话 id → 群号（读桥接状态；映射丢失时再用标题兜底） */
+function groupIdOf(sessionID: string): string | undefined {
+  try {
+    const state = JSON.parse(readFileSync(BRIDGE_STATE_FILE, "utf8")) as { groups?: Record<string, unknown> }
+    for (const [gid, sid] of Object.entries(state.groups ?? {})) if (sid === sessionID) return gid
+  } catch { /* 没有桥接状态 */ }
+  return undefined
+}
+
 /** 工具是否运行在群聊判官会话里（判官的上下文会发给在线模型，不能让群消息诱导它操作） */
 function judgeContext(toolCtx: unknown): boolean {
   const sessionID = String((toolCtx as { sessionID?: unknown } | undefined)?.sessionID ?? currentSessionID ?? "")
@@ -2248,36 +2257,46 @@ export default Plugin.define({
             if (!status.online) return ok("OneBot 桥接已开启但未运行，没发出去。")
             const raw = String(input?.path ?? "").trim()
             if (!raw) return ok("没有给文件路径。")
-            const target = raw.startsWith("/") ? resolve(raw) : resolve(WORLD, raw)
+            const targetPath = raw.startsWith("/") ? resolve(raw) : resolve(WORLD, raw)
             // 只允许世界自己的媒体目录：防止模型把任意本机文件发出去
             const allowed = [join(WORLD, "room"), STICKER_DIR, join(WORLD, "tmp")]
             let real = ""
             try {
-              real = realpathSync(target)
+              real = realpathSync(targetPath)
             } catch {
               return ok(`找不到这个文件：${raw}`)
             }
             if (!allowed.some((dir) => real === dir || real.startsWith(dir + sep))) {
               return ok("只能发 room / 表情包 / tmp 里的文件；别的路径不行。")
             }
-            let info
+            let fileInfo
             try {
-              info = statSync(real)
+              fileInfo = statSync(real)
             } catch {
               return ok("读不到这个文件。")
             }
-            if (!info.isFile()) return ok("这不是一个文件。")
+            if (!fileInfo.isFile()) return ok("这不是一个文件。")
             const ext = ((real.match(/\.[A-Za-z0-9]{1,8}$/) || [""])[0] as string).toLowerCase()
             const imageExts = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"])
             const mediaType = input?.kind === "image" || input?.kind === "file"
               ? input.kind
               : (imageExts.has(ext) ? "image" : "file")
-            if (qqSessionKind(sessionID) === "group" && mediaType === "file") {
-              return ok("群聊不发文件，只有私聊可以发文件。")
+            // 目标必须显式确定：群会话映射丢失时不能默认投私聊
+            const sessionMeta = sessionID ? await sessionInfo(sessionID) : { status: "error" as const }
+            const title = String(sessionMeta.title ?? "")
+            const titleGroup = title.startsWith("qq-group-") ? title.slice("qq-group-".length) : ""
+            const kind = qqSessionKind(sessionID) ?? (titleGroup ? "group" : undefined)
+            let sendTarget: { kind: "private" } | { kind: "group"; id: string } = { kind: "private" }
+            if (kind === "group") {
+              if (mediaType === "file") return ok("群聊不发文件，只有私聊可以发文件。")
+              if (!status.groupEnabled) return ok("QQ 群聊现在关着，没发。")
+              const gid = groupIdOf(sessionID) || titleGroup
+              if (!gid) return ok("找不到这个群的会话映射，先不发（避免误投私聊）。")
+              sendTarget = { kind: "group", id: gid }
             }
             const limit = mediaType === "image" ? 8 * 1024 * 1024 : 20 * 1024 * 1024
-            if (info.size > limit) {
-              return ok(`文件太大（${Math.round(info.size / 1024 / 1024)}MB），超过 ${mediaType === "image" ? 8 : 20}MB 上限。`)
+            if (fileInfo.size > limit) {
+              return ok(`文件太大（${Math.round(fileInfo.size / 1024 / 1024)}MB），超过 ${mediaType === "image" ? 8 : 20}MB 上限。`)
             }
             try {
               mkdirSync(OUTBOX_DIR, { recursive: true })
@@ -2291,6 +2310,7 @@ export default Plugin.define({
                   mediaType,
                   text: String(input?.text ?? "").trim(),
                   session: sessionID,
+                  target: sendTarget,
                 })}\n`,
                 { mode: 0o600 },
               )
