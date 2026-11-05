@@ -32,7 +32,8 @@ const JUDGE_SESSION_FILE = join(HOME, ".local/share/life-world/worlds/default/qq
 /** 旧版桥接写的判官文件：过渡期双写双删；新版插件也读这个路径兜底 */
 const LEGACY_JUDGE_SESSION_FILE = join(HOME, ".local/share/life-world/qq-judge-session.json")
 const JUDGE_DIR = join(HOME, ".local/share/life-world/qq-judge")
-const GROUP_TMP_DIR = join(HOME, ".local/share/life-world/tmp")
+/** 收到的图片/文件放 world 下的 tmp（和 room 平级）：持久保存、方便手动清，另有 7 天兜底清理 */
+const GROUP_TMP_DIR = join(HOME, ".local/share/life-world/worlds/default/tmp")
 const LOG_FILE = join(HOME, ".local/share/life-world/qq-bridge.log")
 const SERVICE_FILE = join(HOME, ".local/state/opencode/service.json")
 
@@ -1022,7 +1023,7 @@ async function downloadMedia(media, maxBytes = MAX_MEDIA_BYTES) {
     const nameExt = (safeName.match(/\.[A-Za-z0-9]{1,8}$/) || [""])[0]
     const urlExt = (String(media.url).split("?")[0].match(/\.(png|jpe?g|gif|webp|pdf|docx?|xlsx?|pptx?|txt|md|csv|zip|rar|7z|mp3|wav|m4a|mp4|mov)$/i) || [""])[0]
     const ext = nameExt || urlExt || (media.type === "image" ? ".jpg" : ".bin")
-    mkdirSync(GROUP_TMP_DIR, { recursive: true })
+    mkdirSync(GROUP_TMP_DIR, { recursive: true, mode: 0o700 })
     const path = join(GROUP_TMP_DIR, `qq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`)
     writeFileSync(path, buf, { mode: 0o600 })
     return path
@@ -1671,10 +1672,10 @@ async function pollOutbox() {
 }
 
 // ———————————————————————— 启动 ————————————————————————
-/** 清掉一天前的群图片缓存：会话历史里引用的图片一般当天就看完了 */
+/** 清掉 7 天前的临时附件：world/tmp 平时留给人工查看，太久没用的兜底删掉 */
 function cleanupOldMedia() {
   try {
-    const cutoff = Date.now() - 24 * 3600_000
+    const cutoff = Date.now() - 7 * 24 * 3600_000
     for (const name of readdirSync(GROUP_TMP_DIR)) {
       const path = join(GROUP_TMP_DIR, name)
       try { if (statSync(path).mtimeMs < cutoff) unlinkSync(path) } catch {}
