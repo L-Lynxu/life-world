@@ -2292,6 +2292,9 @@ export default Plugin.define({
               if (!status.groupEnabled) return ok("QQ 群聊现在关着，没发。")
               const gid = groupIdOf(sessionID) || titleGroup
               if (!gid) return ok("找不到这个群的会话映射，先不发（避免误投私聊）。")
+              if (real.startsWith(join(WORLD, "tmp") + sep)) {
+                return ok("群聊别发 tmp 里收到的私聊附件；先存进表情包再发。")
+              }
               sendTarget = { kind: "group", id: gid }
             }
             const limit = mediaType === "image" ? 8 * 1024 * 1024 : 20 * 1024 * 1024

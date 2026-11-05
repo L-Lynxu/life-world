@@ -1807,6 +1807,11 @@ async function sendOutboxMedia(item) {
     log("group file not supported, skipped", item.name || basename(path))
     return { ok: false }
   }
+  // 入队后到投递之间可能把群聊关了：投递前再查一次
+  if (groupEntry && !groupEnabled()) {
+    log("group disabled, media skipped", groupId)
+    return { ok: false }
+  }
   const targetKey = groupEntry ? `group:${groupId}` : "private"
   return enqueueSend(targetKey, async () => {
     let b64

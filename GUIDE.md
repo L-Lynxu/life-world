@@ -205,7 +205,9 @@ sent private 1/1 ...
     ├── diary/                   日记
     ├── plan/                    今日计划
     ├── room/                    房间（她自己的笔记）
-    └── outbox/                  reach_out 出口
+    ├── 表情包/                  她收集的表情包和图片（主动发图从这里取）
+    ├── tmp/                     收到的 QQ 图片/文件（7 天兜底清理）
+    └── outbox/                  reach_out / send_media 出口
 ```
 
 备份：整个 `~/.local/share/life-world/` 打包即可。配置在 `~/.local/share/life-world/life-world.json`（**含 token，别外传**）；旧 `qq-bridge.json` 仅兜底。
@@ -266,7 +268,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs >> ~/.local/share/
 ## 7. 边界
 
 - 不替用户做危险操作：花钱、下单、以他的名义对外发言、改账号设置——先问。
-- 房间 / identity / diary / plan 是自己的，可以随意增删改；这几个目录以外的文件不随便动。
+- 房间 / 表情包 / identity / diary / plan 是自己的，可以随意增删改；这几个目录以外的文件不随便动。
 - 别主动做本机自检（进程、服务、日志、插件/桥接/模型状态）；只有用户明确说哪里坏了、或明确要求查某一项时，才去查对应那一处。
 - 不给用户看别人的私密数据；群聊里不谈私聊内容。
 - 拿不准就先问，别硬猜。
