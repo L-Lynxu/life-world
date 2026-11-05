@@ -653,17 +653,17 @@ async function handlePrivate(msg) {
       log("attachment budget exceeded (declared), skipped", item.fileSize)
       continue
     }
-    const path = await fetchAttachment(item, item.type === "image" ? MAX_MEDIA_BYTES : MAX_FILE_BYTES)
-    if (!path) continue
+    const got = await fetchAttachment(item, item.type === "image" ? MAX_MEDIA_BYTES : MAX_FILE_BYTES)
+    if (!got) continue
     let size = 0
-    try { size = statSync(path).size } catch { /* 刚写完，读不到就算了 */ }
+    try { size = statSync(got.path).size } catch { /* 刚写完，读不到就算了 */ }
     if (size > budget) {
-      try { unlinkSync(path) } catch {}
+      try { unlinkSync(got.path) } catch {}
       log("attachment budget exceeded (actual), dropped", size)
       continue
     }
     budget -= size
-    files.push({ uri: `file://${path}`, name: safeLabel(item.name, basename(path)) })
+    files.push({ uri: `file://${got.path}`, name: safeLabel(got.name, basename(got.path)) })
   }
   const failedCount = media.length - files.length
   if (media.length > 0) log(`private media ${files.length}/${media.length}${failedCount ? ` (${failedCount} failed)` : ""}`)
@@ -1105,10 +1105,10 @@ async function resolveMedia(media) {
       if (/^data:[^;]+;base64,/i.test(u)) return { ...media, base64: u.split(",")[1] }
       const raw = String(d.base64 || d.file || "")
       if (/^https?:\/\//i.test(raw)) return { ...media, url: raw, name: d.file_name || media.name }
-      if (raw.startsWith("base64://")) return { ...media, base64: raw.slice(9) }
-      if (/^data:[^;]+;base64,/.test(raw)) return { ...media, base64: raw.split(",")[1] }
+      if (raw.startsWith("base64://")) return { ...media, base64: raw.slice(9), name: d.file_name || media.name }
+      if (/^data:[^;]+;base64,/.test(raw)) return { ...media, base64: raw.split(",")[1], name: d.file_name || media.name }
       // 本地路径只在同机部署可用；跨机（PD 的 NapCat）读不到，但先留着
-      if (raw && existsSync(raw)) return { ...media, localPath: raw }
+      if (raw && existsSync(raw)) return { ...media, localPath: raw, name: d.file_name || media.name }
       log("resolve image: no usable url/base64", JSON.stringify(d).slice(0, 200))
     } catch (error) {
       log("resolve image failed", String(error))
@@ -1155,10 +1155,11 @@ async function resolveMedia(media) {
  */
 async function fetchAttachment(media, maxBytes) {
   let path = await downloadMedia(media, maxBytes)
-  if (path) return path
+  if (path) return { path, name: media.name }
   const refreshed = await resolveMedia({ ...media, url: "", base64: undefined, localPath: undefined })
   if (!refreshed) return undefined
-  return downloadMedia(refreshed, maxBytes)
+  path = await downloadMedia(refreshed, maxBytes)
+  return path ? { path, name: refreshed.name || media.name } : undefined
 }
 
 async function downloadMedia(input, maxBytes = MAX_MEDIA_BYTES) {
@@ -1249,17 +1250,17 @@ async function buildGroupPrompt(groupId, batch) {
   for (const m of batch) {
     for (const media of m.media || []) {
       if (media.type === "image") {
-        const path = await fetchAttachment(media, MAX_MEDIA_BYTES)
-        if (!path) continue
+        const got = await fetchAttachment(media, MAX_MEDIA_BYTES)
+        if (!got) continue
         let size = 0
-        try { size = statSync(path).size } catch { /* 刚写完 */ }
+        try { size = statSync(got.path).size } catch { /* 刚写完 */ }
         if (size > budget) {
-          try { unlinkSync(path) } catch {}
+          try { unlinkSync(got.path) } catch {}
           log("group attachment budget exceeded, dropped", size)
           continue
         }
         budget -= size
-        files.push({ uri: `file://${path}`, name: `qq-image-${files.length + 1}` })
+        files.push({ uri: `file://${got.path}`, name: `qq-image-${files.length + 1}` })
       }
     }
   }
