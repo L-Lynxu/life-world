@@ -15,7 +15,7 @@
 | 消息时间戳 | 用户消息正文前加 `[本地时间 YYYY-MM-DD HH:mm TZ]` |
 | 原文归档 | 读 `~/.local/share/opencode/opencode.db` 的 `session_message`，按天写 `conversations/*.jsonl`，含 assistant |
 | 跨窗口记忆 | 新会话第一次请求时，注入最近 80 条原文（`RECENT_LIMIT`，优化开关打开时可调低）+ 自述 + 日记索引 |
-| 生活线工具 | `plan_next` / `check_alarm` / `cancel_alarm` / `reach_out`（多闹钟，`alarms` 数组）；**只能通过 `execute` 调**（`await tools.plan_next(...)`），不能点名直呼 |
+| 生活线工具 | `plan_next` / `check_alarm` / `cancel_alarm` / `reach_out` / `send_media`（主动发图片/文件；多闹钟，`alarms` 数组）；**只能通过 `execute` 调**（`await tools.plan_next(...)`），不能点名直呼 |
 | 闹钟 | 每 30 秒检查 `world.json`，到点经共享服务 HTTP 接口唤醒家会话；发送成功才移除 |
 | 每日回顾 | 默认 23 点后一天一次，回看、写日记、改写自述、更新用户画像；发送成功才记账 |
 | 世界提示词 | `world-prompt.md`，首次运行生成，可自行改写 |
@@ -75,7 +75,7 @@ QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动�
 
 世界提示词只是一份目录；具体规则按主题放在插件目录的 `modules/`：
 
-`first-meeting` / `files` / `profile-mood` / `hands-eyes` / `tools` / `time-plan` / `browser` / `qq` / `subagent` / `gal` / `safety`。
+`first-meeting` / `files` / `profile-mood` / `hands-eyes` / `tools` / `time-plan` / `browser` / `qq` / `stickers` / `subagent` / `gal` / `safety`。
 
 需要时角色会读对应文件，不常驻注入；`install.sh` 会一并安装。
 
@@ -97,7 +97,7 @@ QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动�
 ~/.local/share/life-world/bin/life-world.sh on       # 恢复
 ```
 
-关掉时：不注入时间/世界提示词/心情/记忆、不打时间戳、6 个工具一个都不挂、定时器空转——模型看到的上下文和原生 opencode 一样。**归档仍在后台继续**（只写文件、不进上下文），历史不会断；世界数据（日记、计划、记忆、心情、闹钟）原地保留，开回来直接接上。
+关掉时：不注入时间/世界提示词/心情/记忆、不打时间戳、7 个工具一个都不挂、定时器空转——模型看到的上下文和原生 opencode 一样。**归档仍在后台继续**（只写文件、不进上下文），历史不会断；世界数据（日记、计划、记忆、心情、闹钟）原地保留，开回来直接接上。
 
 开关记在 `~/.local/share/life-world/life-world.json` 的 `world.enabled`（不写=开启；旧文件兜底）。脚本改完会重启服务和 TUI：工具与定时器都是进程启动时建的，不重启等于没生效。开关**只认人手**，没有做成给角色调用的工具。
 
@@ -135,6 +135,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 - 回复按行拆成多条：每个短句一条 QQ 消息，两条之间按下一句长度停顿约 1.5~5 秒（加随机抖动），模拟真人打字。
 - **私聊接收图片和文件**：下载后作为附件放进这一轮请求（图片 8MB、文件 20MB 上限），模型可以直接看/读。附件存放在 `worlds/default/tmp/`（和 `room` 平级，权限 700），持久保留、方便手动清理；默认超过 7 天自动清掉，可用 `bridge.attachmentCleanup` / `attachmentRetentionDays` 关闭或改天数。
 - **正在输入**：私聊在模型思考和生成期间显示「对方正在输入…」（调用 OneBot 扩展 `set_input_status`；SnowLuma 支持，不支持的实现会自动禁用，不报错）。群聊没有这个标准接口，不显示。
+- **主动发图片/文件**：角色用 `send_media` 把 `room` / `表情包` / `tmp` 里的文件发给你——私聊图片和文件都行，群聊只发图片。文件走 base64 段直接发送，不经过 opencode 会话。
 - 若这一轮正文为空、但她调用了 `reach_out`，桥接会把这一轮缓冲的那些行当回复发出去，避免漏回。
 - 开关关闭或桥接离线（心跳超过 90 秒）时，角色会看到「reach_out 不会送达」，不会以为已经通知到你。
 - `life-world.json` 含凭据（token），权限 600，别外传；旧 `qq-bridge.json` 仅作兜底。
@@ -177,6 +178,8 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
     ├── diary/
     ├── plan/
     ├── room/
+    ├── 表情包/            她收集的表情包和图片（主动发图从这里取）
+    ├── tmp/               收到的 QQ 图片/文件（7 天兜底清理）
     └── outbox/
 ```
 

@@ -1733,6 +1733,52 @@ function recentDays(n) {
   return out
 }
 
+/** 主动发图片/文件：读本地文件 → base64 段 → 发到这条 outbox 所属的私聊/群 */
+async function sendOutboxMedia(item) {
+  const path = String(item.path || "")
+  if (!path || !existsSync(path)) {
+    log("outbound media missing", path)
+    return { ok: false }
+  }
+  let size
+  try { size = statSync(path).size } catch { return { ok: false } }
+  const isImage = item.mediaType === "image" || (!item.mediaType && /\.(png|jpe?g|gif|webp|bmp)$/i.test(path))
+  const limit = isImage ? MAX_MEDIA_BYTES : MAX_FILE_BYTES
+  if (size > limit) {
+    log("outbound media too large", path, size)
+    return { ok: false }
+  }
+  let b64
+  try { b64 = readFileSync(path).toString("base64") } catch { return { ok: false } }
+  const segment = isImage
+    ? { type: "image", data: { file: `base64://${b64}` } }
+    : { type: "file", data: { file: `base64://${b64}`, name: item.name || basename(path) } }
+  const message = []
+  if (item.text) message.push({ type: "text", data: { text: String(item.text).slice(0, 500) } })
+  message.push(segment)
+  const session = String(item.session || "")
+  const groupEntry = Object.entries(state.groups || {}).find(([, sid]) => sid === session)
+  if (groupEntry && !isImage) {
+    log("group file not supported, skipped", item.name || basename(path))
+    return { ok: false }
+  }
+  try {
+    if (groupEntry) {
+      await call("send_group_msg", { group_id: Number(groupEntry[0]), message })
+      log("sent media", "group", groupEntry[0], item.name || basename(path))
+    } else {
+      await call("send_private_msg", { user_id: ownerQQ, message })
+      log("sent media", "private", item.name || basename(path))
+    }
+    return { ok: true }
+  } catch (error) {
+    const text = String(error)
+    log("send media failed", text)
+    // WS 断开/超时算基础设施错误，重连后重试；QQ 应用层拒绝才进死信
+    return { ok: false, infra: /ws not ready|timeout|fetch failed|ECONN|ENOTFOUND|EAI_AGAIN|socket/i.test(text) }
+  }
+}
+
 async function pollOutbox() {
   if (outboxBusy) return
   if (outboxRetryAt && Date.now() < outboxRetryAt) return
@@ -1812,6 +1858,40 @@ async function pollOutbox() {
         if (!line.trim()) { consumed += bytes; continue }
         let item
         try { item = JSON.parse(line) } catch { consumed += bytes; continue }
+        // 连续失败到上限就进死信并跳过，避免一条永久失败的消息把所有主动消息堵死
+        const lineKey = `${day}:${offset + consumed}`
+        const giveUp = (threshold = OUTBOX_MAX_ATTEMPTS) => {
+          const attempts = (outboxAttempts.get(lineKey) || 0) + 1
+          outboxAttempts.set(lineKey, attempts)
+          if (outboxAttempts.size > 500) outboxAttempts.clear()
+          if (attempts < threshold) return false
+          try {
+            appendFileSync(join(OUTBOX_DIR, "failed.jsonl"), `${line}\n`, { mode: 0o600 })
+          } catch (error) {
+            log("outbox dead-letter write failed", String(error))
+          }
+          log("outbox dead-letter", lineKey, String(item.text || item.name || "").slice(0, 30))
+          outboxAttempts.delete(lineKey)
+          return true
+        }
+
+        // 主动发图片/文件：直接按 OneBot 消息段发，不走私聊会话
+        if (item.kind === "media") {
+          const sent = await sendOutboxMedia(item)
+          if (sent.ok) {
+            outboxAttempts.delete(lineKey)
+            consumed += bytes
+            continue
+          }
+          if (sent.infra) {
+            blocked = true
+            break
+          }
+          if (giveUp()) { consumed += bytes; continue }
+          blocked = true
+          break
+        }
+
         if (item.kind !== "reach" || !item.text) { consumed += bytes; continue }
         // 按「产生这条 reach_out 的会话」判断，而不是按时间窗口：
         // 群回合进行中，home 会话的定时主动消息不应该被当成群输出吞掉。
@@ -1827,24 +1907,6 @@ async function pollOutbox() {
           log("buffer reach_out during qq-chat run", item.text.slice(0, 30))
           consumed += bytes
           continue
-        }
-        // 连续失败到上限就进死信并跳过，避免一条永久失败的消息把所有主动消息堵死
-        const lineKey = `${day}:${offset + consumed}`
-        // 服务暂时不可达（ensurePrivate 失败）不能按「QQ 永久拒绝」处理：
-        // 那种情况给 200 次（约 50 分钟）机会，别把用户的主动消息直接丢进死信。
-        const giveUp = (threshold = OUTBOX_MAX_ATTEMPTS) => {
-          const attempts = (outboxAttempts.get(lineKey) || 0) + 1
-          outboxAttempts.set(lineKey, attempts)
-          if (outboxAttempts.size > 500) outboxAttempts.clear()
-          if (attempts < threshold) return false
-          try {
-            appendFileSync(join(OUTBOX_DIR, "failed.jsonl"), `${line}\n`, { mode: 0o600 })
-          } catch (error) {
-            log("outbox dead-letter write failed", String(error))
-          }
-          log("outbox dead-letter", lineKey, item.text.slice(0, 30))
-          outboxAttempts.delete(lineKey)
-          return true
         }
         const id = await ensurePrivate()
         if (!id) {

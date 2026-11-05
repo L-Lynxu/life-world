@@ -44,7 +44,7 @@
 ~/.local/share/life-world/bin/life-world.sh off      # 关掉
 ```
 
-- **关掉 = 上下文完全退回原生 opencode**：不注入时间/记忆/心情、不挂 6 个工具、定时器不动、压缩也交回宿主；后台归档仍继续（只写文件，不进上下文），历史不断。
+- **关掉 = 上下文完全退回原生 opencode**：不注入时间/记忆/心情、不挂 7 个工具、定时器不动、压缩也交回宿主；后台归档仍继续（只写文件，不进上下文），历史不断。
 - **数据原地保留**：日记、计划、记忆、心情、闹钟都还在，`on` 回来无缝接上。
 - **开关只认人手**：你没有开/关它的工具，也别自己改配置；开关在 `~/.local/share/life-world/life-world.json` 的 `world.enabled`。
 - **QQ 桥接是独立进程**，不跟开关走；要一起停得单独停桥接（见 §4）。
@@ -80,7 +80,7 @@
 
 ### 调用的正确姿势：必须走 `execute`
 
-**这六个工具不会出现在可以点名调用的工具列表里。** 直接喊 `plan_next` / `check_alarm` 一定得到：
+**这七个工具不会出现在可以点名调用的工具列表里。** 直接喊 `plan_next` / `check_alarm` 一定得到：
 
 ```
 No tool named "plan_next" is currently available
@@ -101,9 +101,10 @@ return await tools.plan_next({ note: "…", at: "2026-10-30T09:00:00+08:00" })
 // 取消（不传 match 就全清，先 check_alarm 看一眼）
 return await tools.cancel_alarm({ match: "闲书" })
 
-// 主动找人 / 开关群聊 / 颜文字
+// 主动找人 / 开关群聊 / 发图 / 颜文字
 return await tools.reach_out({ text: "…" })
 return await tools.group_chat({ enabled: true })
+return await tools.send_media({ path: "表情包/开心.gif", text: "给你看这个" })  // 群聊只发图片；私聊图片和文件都行
 return await tools.kaomoji({ scene: "害羞", count: 3 })
 ```
 
@@ -235,7 +236,7 @@ sent private 1/1 ...
 | 群聊总不回 | 看日志 `group skip probability` / `judge SKIP` / `cooldown` / `rate limit`——都是设计内的；**被 @/点名/关键词 不会被冷却和上限拦**，只可能被判官 SKIP。开了单并发闸门时，暂停期间超过 `groupMaxAgeMinutes` 的旧 @ 会被丢弃（避免回过时消息） |
 | 群聊双回复 | 同账号还有别的 bot 在管群，先关掉那边 |
 | 家会话被删了 | 插件会自动重启 tmux 重建，标题固定 `life-world home session` |
-| **工具全报 `No tool named xxx`** | **不是坏了**：六个工具只能通过 `execute` 调用（`tools.plan_next(...)`），不能直接点名。见 §2 的「调用的正确姿势」 |
+| **工具全报 `No tool named xxx`** | **不是坏了**：七个工具只能通过 `execute` 调用（`tools.plan_next(...)`），不能直接点名。见 §2 的「调用的正确姿势」 |
 | 装了插件但工具一个都没有 | 装完必须 `opencode service restart` + 重启 TUI——钩子会被热加载，**工具注册表不会**，这就是「注入有、工具没有」 |
 | 改了插件不生效 | 同上：`opencode service restart` + 重启 TUI |
 | 想彻底关掉 | `life-world.sh off` |
