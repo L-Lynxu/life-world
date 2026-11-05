@@ -115,9 +115,10 @@ function subagentBody(): string {
   return [
     "本地模型只负责决策、聊天和验收；在线模型是你的手脚。",
     "先读 identity/在线模型.md：里面写着用哪个在线模型、怎么调用、最近一次试用结果。",
-    "- 没有这个文件或写着「未配置」：按 modules/subagent.md 做一次最小试用，成功后把设置写进 identity/在线模型.md；没有就算了，不追问，也不硬凑。",
+    "- 文件不存在：问一次对方有没有可用的在线模型；没有就把「未配置」写进 identity/在线模型.md，之后不再每轮追问。",
+    "- 写着「未配置」：跳过，不重复问；等对方主动提起或换了模型再试。",
     ...(preference ? [`- 如果有得选，优先用：${preference}。`] : []),
-    "- 有的话，这类活优先交给在线模型当子代理：整篇网页抓取、网络调研、多来源并行查证、超过 10 行的脚本初稿、浏览器操作，以及任何「要快、要并发、内容又多」的处理。你只负责出判断、留结论。",
+    "- 有设置：按 modules/subagent.md 的规则判断什么时候用；这类活优先交给在线模型：整篇网页抓取、网络调研、多来源并行查证、超过 10 行的脚本初稿、浏览器操作，以及任何「要快、要并发、内容又多」的处理。你只负责出判断、留结论。",
     "- 如果在线子代理因为内容审查被掐断（表现是它的回复直接断掉或返回空），不要反复重试：这一次降级为你自己来做。",
   ].join("\n")
 }
@@ -946,6 +947,7 @@ function defaultConfig(): LifeWorldConfig {
       foldToolMessages: true,
       foldingReasoningTurns: 0,
       preferSubagent: true,
+      subagentPreference: "",
       debugStats: false,
       concurrency: {
         enabled: false,

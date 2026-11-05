@@ -14,7 +14,7 @@
  *   node qq-bridge.mjs --test-send [文本]  只发一条测试私聊，然后退出
  */
 
-import { appendFileSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { appendFileSync, chmodSync, closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { basename, dirname, join } from "node:path"
 
@@ -303,6 +303,7 @@ async function ensurePrivateNow() {
     }
     if (info.status === "missing") {
       releaseGate(state.privateSessionId)
+      pendingPrivateTurns = 0
       stopTyping(ownerQQ)
       delete state.privateSessionId
       delete state.lastSessionId
@@ -351,6 +352,7 @@ async function deletePrivate() {
   delete state.lastIdle
   delete state.lastAssistantId
   runWindow = null
+  pendingPrivateTurns = 0
   stopTyping(ownerQQ)
   releaseGate(id)
   saveState()
@@ -508,26 +510,44 @@ function textOf(msg) {
 function nameOf(msg) {
   return msg.sender?.card || msg.sender?.nickname || String(msg.user_id)
 }
+/** 附件名进 prompt 前净化：去换行/路径分隔/../，避免破坏格式或提示注入 */
+function safeLabel(name, fallback) {
+  const s = String(name || "").replace(/[\r\n\t]+/g, " ").replace(/[\\/]/g, "_").replace(/\.\./g, "_").trim().slice(0, 80)
+  return s || fallback
+}
 // ———————————————————————— 私聊「正在输入」 ————————————————————————
 // OneBot 扩展动作：{ user_id, event_type }，1 = 正在输入，0 = 停止。
 // 不同实现可能没有这个动作；失败一次就本进程禁用，不刷屏。
 const TYPING_INTERVAL = 4000
 const typingTimers = new Map()
 let typingSupported = true
+let typingFailures = 0
+/** 还没等到回复的私聊回合数：连续发多条时，全部回完才停「正在输入」 */
+let pendingPrivateTurns = 0
+
+async function typingPing(userId) {
+  try {
+    await call("set_input_status", { user_id: Number(userId), event_type: 1 })
+    typingFailures = 0
+    return true
+  } catch (error) {
+    // WS 断线不算「不支持」，重连后还能用
+    if (/ws not ready/i.test(String(error))) return false
+    typingFailures += 1
+    if (typingFailures >= 3) {
+      typingSupported = false
+      log("typing unsupported, disabled", String(error))
+      stopTyping(userId)
+    }
+    return false
+  }
+}
 
 function startTyping(userId) {
   if (!typingSupported) return
   const key = String(userId)
   if (typingTimers.has(key)) return
-  const ping = () => {
-    call("set_input_status", { user_id: Number(userId), event_type: 1 }).catch((error) => {
-      if (/not found|unsupported|unknown|1404|retcode=14/i.test(String(error))) {
-        typingSupported = false
-        log("typing unsupported, disabled", String(error))
-        stopTyping(userId)
-      }
-    })
-  }
+  const ping = () => { void typingPing(userId) }
   ping()
   const timer = setInterval(ping, TYPING_INTERVAL)
   timer.unref?.()
@@ -550,21 +570,33 @@ function stopTyping(userId) {
   }
 }
 
-/** 私聊附件：图片和文件都收；群聊只收图片（见 groupMedia） */
+/** 私聊附件：图片、表情和文件都收；群聊只收图片（见 groupMedia） */
 function privateMedia(msg) {
   const out = []
   for (const p of messageParts(msg)) {
-    if (p?.type === "image") {
-      out.push({ type: "image", url: p?.data?.url || p?.data?.file || "", name: p?.data?.file || "image.jpg" })
+    const d = p?.data || {}
+    if (p?.type === "image" || p?.type === "mface") {
+      out.push({
+        type: "image",
+        url: /^https?:\/\//i.test(d.url || "") ? d.url : "",
+        file: d.file || "",
+        fileId: d.file_id || d.fileId || "",
+        fileHash: d.file_hash || "",
+        name: d.file_name || d.file || d.summary || "image.jpg",
+      })
     } else if (p?.type === "file") {
       out.push({
         type: "file",
-        url: p?.data?.url || "",
-        name: p?.data?.name || p?.data?.file_name || p?.data?.file || "file",
+        url: /^https?:\/\//i.test(d.url || "") ? d.url : "",
+        file: d.file || "",
+        fileId: d.file_id || d.fileId || "",
+        fileHash: d.file_hash || "",
+        name: d.file_name || d.name || d.file || "file",
       })
     }
   }
-  return out.filter((m) => /^https?:\/\//i.test(m.url))
+  // 一条消息最多处理 10 个附件，避免一次刷屏把临时目录塞满
+  return out.slice(0, 10)
 }
 
 // 一次 QQ 私聊运行的时间窗：窗口内产生的 reach_out 不单独发，避免和正式回复重复
@@ -589,12 +621,21 @@ async function handlePrivate(msg) {
   }
   const files = []
   for (const item of media) {
-    const path = await downloadMedia(item, item.type === "image" ? MAX_MEDIA_BYTES : MAX_FILE_BYTES)
-    if (path) files.push({ uri: `file://${path}`, name: item.name || basename(path) })
+    const resolved = await resolveMedia(item)
+    if (!resolved) continue
+    const path = await downloadMedia(resolved, item.type === "image" ? MAX_MEDIA_BYTES : MAX_FILE_BYTES)
+    if (path) files.push({ uri: `file://${path}`, name: safeLabel(item.name, basename(path)) })
+  }
+  const failedCount = media.length - files.length
+  if (media.length > 0) log(`private media ${files.length}/${media.length}${failedCount ? ` (${failedCount} failed)` : ""}`)
+  if (!text && files.length === 0) {
+    // 只有附件、却一个都没下载下来：明确告诉对方，别让模型凭空回一句
+    await call("send_private_msg", { user_id: ownerQQ, message: "（附件没下载下来，再发一次试试？）" }).catch(() => {})
+    return
   }
   const mediaNote = files.length
-    ? `\n（对方随消息发来 ${files.length} 个附件，已附在本次请求里：${files.map((f) => f.name).join("、")}。图片直接看，文件按内容读；回话时不用复述附件。）`
-    : ""
+    ? `\n（对方随消息发来 ${files.length} 个附件，已附在本次请求里：${files.map((f) => f.name).join("、")}。图片直接看，文件按内容读；回话时不用复述附件。${failedCount ? `另有 ${failedCount} 个附件没下载下来。` : ""}）`
+    : (media.length > 0 ? `\n（对方发了 ${media.length} 个附件，但都没下载下来；如果重要就让他再发一次。）` : "")
   const annotated = `[私聊｜${nameOf(msg)}（QQ ${msg.user_id}）] ${text || "（只有附件，没有文字）"}${mediaNote}\n（这是 QQ 私聊。像真人发消息一样：每个短句单独一行，每行会作为一条独立的 QQ 消息发出；一次发 1~3 条，最多 4 条；不要写长段落，不要用标题/列表/编号/加粗，不要复述工具或过程。直接回复即可，不要调用 reach_out。）`
   runWindow = { start: Date.now(), end: 0, reaches: [] }
   let res
@@ -620,6 +661,7 @@ async function handlePrivate(msg) {
   }
   // 私聊是用户回合：让群聊/定时任务立刻让路（闸门关闭时是 no-op）
   markUserActive(id)
+  pendingPrivateTurns += 1
   startTyping(ownerQQ)
   log("prompt queued", id)
 }
@@ -722,6 +764,7 @@ function groupText(msg) {
     else if (p?.type === "image") out.push("[图片]")
     else if (p?.type === "mface") out.push(`[表情]${p?.data?.summary || ""}`)
     else if (p?.type === "video") out.push("[视频]")
+    else if (p?.type === "file") out.push("[文件]")
   }
   return out.join(" ").trim()
 }
@@ -988,42 +1031,103 @@ async function runJudge(groupId, batch) {
 /** 图片上限 8 MB、文件上限 20 MB：别让大文件或恶意 URL 把桥接撑爆 */
 const MAX_MEDIA_BYTES = 8 * 1024 * 1024
 const MAX_FILE_BYTES = 20 * 1024 * 1024
+/**
+ * 图片/文件段可能只给 file/file_id（NapCat、SnowLuma 都常见），没有 http 链接。
+ * 先向 OneBot 要下载地址或 base64；拿不到才放弃。
+ */
+async function resolveMedia(media) {
+  if (media.url) return media
+  if (media.type === "image") {
+    try {
+      const params = media.fileId && !media.file ? { file_id: media.fileId } : { file: media.file || media.fileId || "" }
+      const res = await call("get_image", params)
+      const d = res?.data || {}
+      if (/^https?:\/\//i.test(d.url || "")) return { ...media, url: d.url, name: d.file_name || media.name }
+      const raw = String(d.base64 || d.file || "")
+      if (raw.startsWith("base64://")) return { ...media, base64: raw.slice(9) }
+      if (/^data:[^;]+;base64,/.test(raw)) return { ...media, base64: raw.split(",")[1] }
+      if (raw && existsSync(raw)) return { ...media, localPath: raw }
+    } catch (error) {
+      log("resolve image failed", String(error))
+    }
+    return undefined
+  }
+  // 私聊文件：SnowLuma 用 get_private_file_url；其他实现用 get_file
+  try {
+    const res = await call("get_private_file_url", {
+      user_id: ownerQQ,
+      file_id: media.fileId || media.file || "",
+      file_hash: media.fileHash || "",
+    })
+    const d = res?.data || {}
+    if (/^https?:\/\//i.test(d.url || "")) return { ...media, url: d.url, name: d.file_name || media.name }
+  } catch { /* 有些实现没有这个动作 */ }
+  try {
+    const res = await call("get_file", { file_id: media.fileId || media.file || "" })
+    const d = res?.data || {}
+    if (/^https?:\/\//i.test(d.url || "")) return { ...media, url: d.url, name: d.file_name || media.name }
+    if (typeof d.base64 === "string" && d.base64) return { ...media, base64: d.base64 }
+    const raw = String(d.file || "")
+    if (raw.startsWith("base64://")) return { ...media, base64: raw.slice(9) }
+    if (raw && existsSync(raw)) return { ...media, localPath: raw }
+  } catch (error) {
+    log("resolve file failed", String(error))
+  }
+  return undefined
+}
+
 async function downloadMedia(media, maxBytes = MAX_MEDIA_BYTES) {
-  if (!media?.url || !/^https?:\/\//i.test(media.url)) return undefined
+  if (!media) return undefined
   const limit = Math.max(1, Number(maxBytes) || MAX_MEDIA_BYTES)
   try {
-    const res = await fetch(media.url, { signal: AbortSignal.timeout(15000) })
-    if (!res.ok) return undefined
-    const size = Number(res.headers.get("content-length") || 0)
-    if (size > limit) { log("media too large, skipped", size); return undefined }
-    // 分块读、边读边数：没有 Content-Length（chunked）或长度造假时，
-    // 不能等 arrayBuffer() 把几百 MB 全吞进内存再检查。
     let buf
-    if (res.body) {
-      const reader = res.body.getReader()
-      const chunks = []
-      let total = 0
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) break
-        total += value.byteLength
-        if (total > limit) {
-          try { await reader.cancel() } catch {}
-          log("media too large (streamed), skipped", total)
-          return undefined
+    if (media.base64) {
+      buf = Buffer.from(String(media.base64), "base64")
+      if (buf.length > limit) { log("media too large, skipped", buf.length); return undefined }
+    } else if (media.localPath && existsSync(media.localPath)) {
+      const size = statSync(media.localPath).size
+      if (size > limit) { log("media too large, skipped", size); return undefined }
+      buf = readFileSync(media.localPath)
+    } else if (/^https?:\/\//i.test(media.url || "")) {
+      const res = await fetch(media.url, { signal: AbortSignal.timeout(15000) })
+      if (!res.ok) return undefined
+      const size = Number(res.headers.get("content-length") || 0)
+      if (size > limit) { log("media too large, skipped", size); return undefined }
+      // 分块读、边读边数：没有 Content-Length（chunked）或长度造假时，
+      // 不能等 arrayBuffer() 把几百 MB 全吞进内存再检查。
+      if (res.body) {
+        const reader = res.body.getReader()
+        const chunks = []
+        let total = 0
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          total += value.byteLength
+          if (total > limit) {
+            try { await reader.cancel() } catch {}
+            log("media too large (streamed), skipped", total)
+            return undefined
+          }
+          chunks.push(Buffer.from(value))
         }
-        chunks.push(Buffer.from(value))
+        buf = Buffer.concat(chunks)
+      } else {
+        buf = Buffer.from(await res.arrayBuffer())
       }
-      buf = Buffer.concat(chunks)
+      if (buf.length > limit) { log("media too large, skipped", buf.length); return undefined }
     } else {
-      buf = Buffer.from(await res.arrayBuffer())
+      return undefined
     }
-    if (buf.length > limit) { log("media too large, skipped", buf.length); return undefined }
     const safeName = String(media.name || "").replace(/[^\w.\-一-龥]/g, "_").replace(/^\.+/, "").slice(-80)
     const nameExt = (safeName.match(/\.[A-Za-z0-9]{1,8}$/) || [""])[0]
-    const urlExt = (String(media.url).split("?")[0].match(/\.(png|jpe?g|gif|webp|pdf|docx?|xlsx?|pptx?|txt|md|csv|zip|rar|7z|mp3|wav|m4a|mp4|mov)$/i) || [""])[0]
-    const ext = nameExt || urlExt || (media.type === "image" ? ".jpg" : ".bin")
+    const urlExt = (String(media.url || "").split("?")[0].match(/\.(png|jpe?g|gif|webp|pdf|docx?|xlsx?|pptx?|txt|md|csv|zip|rar|7z|mp3|wav|m4a|mp4|mov)$/i) || [""])[0]
+    // 图片优先认图片扩展名：NapCat 的 file 可能是 xxx.image 这类标识
+    const imageExt = /^\.(png|jpe?g|gif|webp)$/i.test(urlExt)
+      ? urlExt
+      : /^\.(png|jpe?g|gif|webp)$/i.test(nameExt) ? nameExt : ".jpg"
+    const ext = media.type === "image" ? imageExt : (nameExt || urlExt || ".bin")
     mkdirSync(GROUP_TMP_DIR, { recursive: true, mode: 0o700 })
+    try { chmodSync(GROUP_TMP_DIR, 0o700) } catch { /* 已是自己的目录 */ }
     const path = join(GROUP_TMP_DIR, `qq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`)
     writeFileSync(path, buf, { mode: 0o600 })
     return path
@@ -1038,7 +1142,8 @@ async function buildGroupPrompt(groupId, batch) {
   for (const m of batch) {
     for (const media of m.media || []) {
       if (media.type === "image") {
-        const path = await downloadMedia(media)
+        const resolved = await resolveMedia(media)
+        const path = resolved ? await downloadMedia(resolved) : undefined
         if (path) files.push({ uri: `file://${path}`, name: `qq-image-${files.length + 1}` })
       }
     }
@@ -1383,6 +1488,7 @@ async function pollPrivate() {
     const { status, info } = await sessionInfo(id)
     if (status === "missing") {
       releaseGate(id)
+      pendingPrivateTurns = 0
       stopTyping(ownerQQ)
       delete state.privateSessionId
       delete state.lastSessionId
@@ -1415,8 +1521,6 @@ async function pollPrivate() {
       if (idx === 0) { state.lastIdle = idle; saveState(); return }
       newer = idx > 0 ? assistants.slice(0, idx).reverse() : [assistants[0]]
     }
-    // 模型已经产出回复：先停掉「正在输入」，再逐条发出去
-    if (newer.length) stopTyping(ownerQQ)
     const textOf = (m) => (m.content || [])
       .filter((p) => p?.type === "text" && p?.text)
       .map((p) => p.text)
@@ -1460,6 +1564,9 @@ async function pollPrivate() {
     // 只有这一批全部发完才推进 lastIdle：中途失败时保持旧值，
     // 下一次轮询才会重新进来重试剩下的回复。
     state.lastIdle = idle
+    // 每发完一条回复扣一个回合；全部扣完才停「正在输入」
+    pendingPrivateTurns = Math.max(0, pendingPrivateTurns - newer.length)
+    if (pendingPrivateTurns === 0) stopTyping(ownerQQ)
     saveState()
   } catch (error) {
     log("poll failed", String(error))
