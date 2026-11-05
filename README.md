@@ -75,13 +75,17 @@ QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动�
 
 世界提示词只是一份目录；具体规则按主题放在插件目录的 `modules/`：
 
-`first-meeting` / `files` / `profile-mood` / `hands-eyes` / `tools` / `time-plan` / `browser` / `qq` / `gal` / `safety`。
+`first-meeting` / `files` / `profile-mood` / `hands-eyes` / `tools` / `time-plan` / `browser` / `qq` / `subagent` / `gal` / `safety`。
 
 需要时角色会读对应文件，不常驻注入；`install.sh` 会一并安装。
 
+### 在线子代理（本地模型的手脚）
+
+本地模型只负责决策、聊天和验收；在线模型负责浏览器操作、脚本初稿、网络调研、批量整理这类「要快、要并发、内容多」的活。规则在 `modules/subagent.md`，实际设置由角色在首次引导试用成功后写进 `identity/在线模型.md`（模型名、调用方式、适用场景、试用日期）；以后每轮用之前先读那个文件。`localModel.subagentPreference` 只是给一个默认偏好，不替代试用记录。
+
 ## 第一次启动
 
-第一次跟角色说话时，她按 `modules/first-meeting.md` 给你做一遍引导：能做什么、怎么使唤她、总开关在哪、群聊和 gal 模式怎么玩，最后问你一句要不要接 QQ。引导做完会在 `identity/引导.md` 留一行日期，之后不再重复。
+第一次跟角色说话时，她按 `modules/first-meeting.md` 给你做一遍引导：能做什么、怎么使唤她、总开关在哪、群聊和 gal 模式怎么玩，问你一句要不要接 QQ；如果你跑的是本地模型，还会问有没有在线模型，有就试一次并把设置写进 `identity/在线模型.md`。引导做完会在 `identity/引导.md` 留一行日期，之后不再重复。
 
 `GUIDE.md` 是给人看的操作手册（安装 / QQ 配置 / 排查），插件不会自动把它读进上下文；里面的运维步骤请由人来执行。
 
@@ -128,6 +132,8 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 - `/new`：删除 `qq-chat`，下一条消息或她的 `reach_out` 再新建。
 - **outbox 补发**：投递游标按天记录；桥接启动/重连时会扫最近 3 天，把没送出去的补发（跨天离线也不丢）。
 - 回复按行拆成多条：每个短句一条 QQ 消息，两条之间按下一句长度停顿约 1.5~5 秒（加随机抖动），模拟真人打字。
+- **私聊接收图片和文件**：下载后作为附件放进这一轮请求（图片 8MB、文件 20MB 上限），模型可以直接看/读。
+- **正在输入**：私聊在模型思考和生成期间显示「对方正在输入…」（调用 OneBot 扩展 `set_input_status`；SnowLuma 支持，不支持的实现会自动禁用，不报错）。群聊没有这个标准接口，不显示。
 - 若这一轮正文为空、但她调用了 `reach_out`，桥接会把这一轮缓冲的那些行当回复发出去，避免漏回。
 - 开关关闭或桥接离线（心跳超过 90 秒）时，角色会看到「reach_out 不会送达」，不会以为已经通知到你。
 - `life-world.json` 含凭据（token），权限 600，别外传；旧 `qq-bridge.json` 仅作兜底。
@@ -141,7 +147,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 - **保留原人格和记忆**，额外注入「QQ 群聊模式」：把对方当普通朋友，不用情侣/伴侣称呼、不谈亲密关系/私聊内容。
 - **两段式读空气**：@/点名/关键词直接进判官；其余消息每批按 `interjectChance`（默认 0.05）掷骰；判官调用 `judgeModel`（默认 `default`，跟随主聊天默认模型），只输出 `REPLY`/`SKIP`。回复后短时把概率提到 `afterReplyChance`。
 - 判官会话（标题 `qq-judge`）会跳过 life-world 注入，避免私聊记忆发给外部模型。
-- 图片/表情/视频链接只在判官 `REPLY` 后才下载/附给群会话；`SKIP` 不处理。
+- 群聊只自动接收图片/表情（判官 `REPLY` 后下载并附给群会话）；**文件和视频不自动接收**，正文里只留 `[文件]`/`[视频]` 占位，`SKIP` 不处理。私聊的图片和文件都会下载并附上。
 - 群聊回复按行拆成多条，中间按下一句长度停顿；`bannedWords` 是群聊出站黑名单，命中整行丢弃。
 
 | 字段 | 说明 |
