@@ -128,11 +128,12 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 | `bridge.ownerQQ` | 唯一允许的私聊用户，也是通知目标 |
 | `bridge.wsUrl` / `token` | 正向 WS 地址与 token（NapCat、SnowLuma 等通用）。旧的 `~/.config/opencode/qq-bridge.json` 只在 `life-world.json` 完全没有 `bridge` 段时兜底；正常情况改这里。 |
 | `bridge.group.enabled` | 群聊开关，默认 `false`；角色也能用 `group_chat` 工具实时开关 |
+| `bridge.attachmentCleanup` / `attachmentRetentionDays` | 是否自动清理 `worlds/default/tmp` 里的附件，默认 `true` / 7 天；设 `false` 则永久保留，手动清理 |
 
 - `/new`：删除 `qq-chat`，下一条消息或她的 `reach_out` 再新建。
 - **outbox 补发**：投递游标按天记录；桥接启动/重连时会扫最近 3 天，把没送出去的补发（跨天离线也不丢）。
 - 回复按行拆成多条：每个短句一条 QQ 消息，两条之间按下一句长度停顿约 1.5~5 秒（加随机抖动），模拟真人打字。
-- **私聊接收图片和文件**：下载后作为附件放进这一轮请求（图片 8MB、文件 20MB 上限），模型可以直接看/读。附件存放在 `worlds/default/tmp/`（和 `room` 平级，权限 700），持久保留、方便手动清理；超过 7 天的自动清掉。
+- **私聊接收图片和文件**：下载后作为附件放进这一轮请求（图片 8MB、文件 20MB 上限），模型可以直接看/读。附件存放在 `worlds/default/tmp/`（和 `room` 平级，权限 700），持久保留、方便手动清理；默认超过 7 天自动清掉，可用 `bridge.attachmentCleanup` / `attachmentRetentionDays` 关闭或改天数。
 - **正在输入**：私聊在模型思考和生成期间显示「对方正在输入…」（调用 OneBot 扩展 `set_input_status`；SnowLuma 支持，不支持的实现会自动禁用，不报错）。群聊没有这个标准接口，不显示。
 - 若这一轮正文为空、但她调用了 `reach_out`，桥接会把这一轮缓冲的那些行当回复发出去，避免漏回。
 - 开关关闭或桥接离线（心跳超过 90 秒）时，角色会看到「reach_out 不会送达」，不会以为已经通知到你。
@@ -211,6 +212,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
   "bridge": {
     "enabled": false, "ownerQQ": 0, "ownerName": "", "wsUrl": "ws://127.0.0.1:3001",
     "token": "", "privateSessionTitle": "qq-chat", "location": "",
+    "attachmentCleanup": true, "attachmentRetentionDays": 7,
     "group": { "enabled": false, "keywords": [], "interjectChance": 0.05, "afterReplyChance": 0.8, "probabilityDurationMs": 120000, "judgeModel": "default", "judgeTimeoutMs": 60000, "debounceMs": 10000, "triggerDebounceMs": 1200, "maxBatchWaitMs": 60000, "cooldownMs": 8000, "maxPer10Min": 0, "bannedWords": [] }
   }
 }

@@ -1672,10 +1672,22 @@ async function pollOutbox() {
 }
 
 // ———————————————————————— 启动 ————————————————————————
-/** 清掉 7 天前的临时附件：world/tmp 平时留给人工查看，太久没用的兜底删掉 */
+/** 附件清理配置：默认开启、保留 7 天；可在 life-world.json 里关掉 */
+function attachmentCleanupCfg() {
+  const live = readJson(LIFEWORLD_CONFIG_FILE, null)
+  const bridge = live?.bridge || {}
+  const days = typeof bridge.attachmentRetentionDays === "number" && bridge.attachmentRetentionDays > 0
+    ? bridge.attachmentRetentionDays
+    : 7
+  return { enabled: bridge.attachmentCleanup !== false, days }
+}
+
+/** 清掉过期临时附件：world/tmp 平时留给人工查看，太久没用的兜底删掉 */
 function cleanupOldMedia() {
+  const cfg = attachmentCleanupCfg()
+  if (!cfg.enabled) return
   try {
-    const cutoff = Date.now() - 7 * 24 * 3600_000
+    const cutoff = Date.now() - cfg.days * 24 * 3600_000
     for (const name of readdirSync(GROUP_TMP_DIR)) {
       const path = join(GROUP_TMP_DIR, name)
       try { if (statSync(path).mtimeMs < cutoff) unlinkSync(path) } catch {}
@@ -1745,7 +1757,9 @@ if (process.argv[2] === "--test-send") {
     state.outbox = { offsets: {}, since: new Date().toISOString() }
     saveState()
   }
+  if (!attachmentCleanupCfg().enabled) log("attachment cleanup disabled (bridge.attachmentCleanup=false)")
   cleanupOldMedia()
+  setInterval(cleanupOldMedia, 6 * 3600_000).unref?.()
   connect()
   setInterval(pollPrivate, 1500)
   setInterval(pollGroups, 1500)

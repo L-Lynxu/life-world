@@ -894,6 +894,10 @@ interface BridgeSettings {
   token: string
   privateSessionTitle: string
   location: string
+  /** 是否自动清理 world/tmp 里的收到的附件（默认开启） */
+  attachmentCleanup?: boolean
+  /** 附件保留天数（默认 7 天） */
+  attachmentRetentionDays?: number
   group: BridgeGroupSettings
 }
 
@@ -960,6 +964,8 @@ function defaultConfig(): LifeWorldConfig {
       token: "",
       privateSessionTitle: "qq-chat",
       location: "",
+      attachmentCleanup: true,
+      attachmentRetentionDays: 7,
       group: {
         enabled: false,
         keywords: [],
@@ -1057,6 +1063,8 @@ function normalizeConfig(config: LifeWorldConfig): LifeWorldConfig {
       token: typeof bridge.token === "string" ? bridge.token : "",
       privateSessionTitle: str(bridge.privateSessionTitle, base.bridge.privateSessionTitle),
       location: typeof bridge.location === "string" ? bridge.location : "",
+      attachmentCleanup: bool(bridge.attachmentCleanup, true),
+      attachmentRetentionDays: Math.floor(num(bridge.attachmentRetentionDays, 7, 1)),
       group: {
         ...group,
         enabled: bool(group.enabled, false),

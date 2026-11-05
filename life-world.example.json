@@ -38,6 +38,8 @@
     "token": "",
     "privateSessionTitle": "qq-chat",
     "location": "",
+    "attachmentCleanup": true,
+    "attachmentRetentionDays": 7,
     "group": {
       "enabled": false,
       "keywords": [],
