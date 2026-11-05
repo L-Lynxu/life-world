@@ -1,8 +1,8 @@
 import { Plugin } from "@opencode/plugin"
-import { appendFileSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
+import { appendFileSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
 import { spawn } from "node:child_process"
 import { homedir } from "node:os"
-import { dirname, join } from "node:path"
+import { basename, dirname, join, resolve, sep } from "node:path"
 import { DatabaseSync } from "node:sqlite"
 
 /**
@@ -30,6 +30,8 @@ const PROFILE_FILE = join(IDENTITY_DIR, "用户画像.md")
 const MOOD_FILE = join(IDENTITY_DIR, "心情.md")
 const DIARY_DIR = join(WORLD, "diary")
 const PLAN_DIR = join(WORLD, "plan")
+/** 她收集的表情包（和 room 平级，主动发图/存图都用这里） */
+const STICKER_DIR = join(WORLD, "表情包")
 const LOG_FILE = join(ROOT, "debug.log")
 const WORLD_PROMPT_FILE = join(WORLD, "world-prompt.md")
 const DB_PATH = join(HOME, ".local/share/opencode/opencode.db")
@@ -113,10 +115,12 @@ const SUBAGENT_MARK = "## 在线模型子代理（可选）"
 function subagentBody(): string {
   const preference = localModelOptions().subagentPreference
   return [
-    "先问对方一句：有没有可以调用的在线模型（云端的，或者他在别处跑的强模型）？",
-    "- 没有就算了，不追问，也不硬凑。",
+    "本地模型只负责决策、聊天和验收；在线模型是你的手脚。",
+    "先读 identity/在线模型.md：里面写着用哪个在线模型、怎么调用、最近一次试用结果。",
+    "- 文件不存在：问一次对方有没有可用的在线模型；没有就把「未配置」写进 identity/在线模型.md，之后不再每轮追问。",
+    "- 写着「未配置」：跳过，不重复问；等对方主动提起或换了模型再试。",
     ...(preference ? [`- 如果有得选，优先用：${preference}。`] : []),
-    "- 有的话，这类活优先交给在线模型当子代理：整篇网页抓取、网络调研、多来源并行查证，以及任何「要快、要并发、内容又多」的处理。你只负责出判断、留结论。",
+    "- 有设置：按 modules/subagent.md 的规则判断什么时候用；这类活优先交给在线模型：整篇网页抓取、网络调研、多来源并行查证、超过 10 行的脚本初稿、浏览器操作，以及任何「要快、要并发、内容又多」的处理。你只负责出判断、留结论。",
     "- 如果在线子代理因为内容审查被掐断（表现是它的回复直接断掉或返回空），不要反复重试：这一次降级为你自己来做。",
   ].join("\n")
 }
@@ -324,6 +328,15 @@ function readJudgeIds(): Set<string> {
 }
 
 let sessionColumnWarned = false
+
+/** 群会话 id → 群号（读桥接状态；映射丢失时再用标题兜底） */
+function groupIdOf(sessionID: string): string | undefined {
+  try {
+    const state = JSON.parse(readFileSync(BRIDGE_STATE_FILE, "utf8")) as { groups?: Record<string, unknown> }
+    for (const [gid, sid] of Object.entries(state.groups ?? {})) if (sid === sessionID) return gid
+  } catch { /* 没有桥接状态 */ }
+  return undefined
+}
 
 /** 工具是否运行在群聊判官会话里（判官的上下文会发给在线模型，不能让群消息诱导它操作） */
 function judgeContext(toolCtx: unknown): boolean {
@@ -668,15 +681,17 @@ const DEFAULT_WORLD_PROMPT = `我不是坐在房间里的人。我是活在机�
 - 动 world 文件 / 自述 / 心情拆分 / 硬限制 → files.md
 - 用户画像 / 心情三块 → profile-mood.md
 - 上网 / 学习 / 终端 / 往外看 → hands-eyes.md
-- 用 life-world 的六个工具 → tools.md
+- 用 life-world 的七个工具 / 主动发图片和文件 → tools.md
 - 闹钟 / 今日计划 / 每日回顾 → time-plan.md
 - 真实浏览器 → browser.md
 - QQ 私聊 / 群聊 / 桥接 → qq.md
+- 表情包 / 主动发图片和文件 → stickers.md
+- 在线子代理（本地模型的手脚） → subagent.md
 - 对方要求你主导 / gal / 强制模式 → gal.md
 - 对外 / 花钱 / 账号 / 装软件 → safety.md
 
 需要时先读对应文件，再动手；不要凭记忆猜规则。
-底线：不主动做本机自检，除非对方明确要求；四个世界目录（room / identity / diary / plan）以外不动；对外/花钱/账号/装软件前先读 safety.md。`
+底线：不主动做本机自检，除非对方明确要求；五个世界目录（room / 表情包 / identity / diary / plan）以外不动；对外/花钱/账号/装软件前先读 safety.md。`
 
 function ensureWorldPrompt(): void {
   try {
@@ -695,6 +710,7 @@ function worldPromptText(): string {
   const template = readTextFile(WORLD_PROMPT_FILE) || DEFAULT_WORLD_PROMPT
   return template
     .replaceAll("{roomDir}", join(WORLD, "room"))
+    .replaceAll("{stickerDir}", STICKER_DIR)
     .replaceAll("{identityDir}", IDENTITY_DIR)
     .replaceAll("{diaryDir}", DIARY_DIR)
     .replaceAll("{planDir}", PLAN_DIR)
@@ -892,6 +908,10 @@ interface BridgeSettings {
   token: string
   privateSessionTitle: string
   location: string
+  /** 是否自动清理 world/tmp 里的收到的附件（默认开启） */
+  attachmentCleanup?: boolean
+  /** 附件保留天数（默认 7 天） */
+  attachmentRetentionDays?: number
   group: BridgeGroupSettings
 }
 
@@ -940,6 +960,7 @@ function defaultConfig(): LifeWorldConfig {
       foldToolMessages: true,
       foldingReasoningTurns: 0,
       preferSubagent: true,
+      subagentPreference: "",
       debugStats: false,
       concurrency: {
         enabled: false,
@@ -958,6 +979,8 @@ function defaultConfig(): LifeWorldConfig {
       token: "",
       privateSessionTitle: "qq-chat",
       location: "",
+      attachmentCleanup: true,
+      attachmentRetentionDays: 7,
       group: {
         enabled: false,
         keywords: [],
@@ -1055,6 +1078,8 @@ function normalizeConfig(config: LifeWorldConfig): LifeWorldConfig {
       token: typeof bridge.token === "string" ? bridge.token : "",
       privateSessionTitle: str(bridge.privateSessionTitle, base.bridge.privateSessionTitle),
       location: typeof bridge.location === "string" ? bridge.location : "",
+      attachmentCleanup: bool(bridge.attachmentCleanup, true),
+      attachmentRetentionDays: Math.floor(num(bridge.attachmentRetentionDays, 7, 1)),
       group: {
         ...group,
         enabled: bool(group.enabled, false),
@@ -1770,7 +1795,7 @@ export default Plugin.define({
   id: "life-world",
 
   async setup(ctx) {
-    for (const dir of [CONV_DIR, DIARY_DIR, PLAN_DIR, OUTBOX_DIR, join(WORLD, "room"), IDENTITY_DIR]) {
+    for (const dir of [CONV_DIR, DIARY_DIR, PLAN_DIR, OUTBOX_DIR, join(WORLD, "room"), STICKER_DIR, IDENTITY_DIR]) {
       try { mkdirSync(dir, { recursive: true, mode: 0o700 }) } catch { /* 建不出来也就这样 */ }
     }
     ensureWorldPrompt()
@@ -2207,6 +2232,97 @@ export default Plugin.define({
               return ok("话没能放进 outbox，看看 debug.log。")
             }
             return ok("话放出去了，桥接会送到对方 QQ。")
+          },
+        })
+
+        add({
+          name: "send_media",
+          description:
+            "主动给对方发图片（私聊/群聊）或文件（仅私聊）。path 必须在 room / 表情包 / tmp 目录里；text 是可选的配文。",
+          input: {
+            type: "object",
+            properties: {
+              path: { type: "string", description: "要发送的文件路径（可用相对 world 的相对路径）" },
+              text: { type: "string", description: "随媒体一起发的一句配文（可选）" },
+              kind: { type: "string", enum: ["image", "file"], description: "不传则按扩展名判断" },
+            },
+            required: ["path"],
+          },
+          execute: async (input: any, toolCtx: any) => {
+            if (judgeContext(toolCtx)) return ok("这是群聊判官会话，不能发媒体。")
+            const sessionID = String(toolCtx?.sessionID ?? currentSessionID ?? "")
+            if (readWorld().running === false) return ok("生活世界现在是暂停状态（running=false），没有发出去。")
+            const status = readBridgeStatus()
+            if (!status.enabled) return ok("OneBot 桥接当前关闭，没发出去。")
+            if (!status.online) return ok("OneBot 桥接已开启但未运行，没发出去。")
+            const raw = String(input?.path ?? "").trim()
+            if (!raw) return ok("没有给文件路径。")
+            const targetPath = raw.startsWith("/") ? resolve(raw) : resolve(WORLD, raw)
+            // 只允许世界自己的媒体目录：防止模型把任意本机文件发出去
+            const allowed = [join(WORLD, "room"), STICKER_DIR, join(WORLD, "tmp")]
+            let real = ""
+            try {
+              real = realpathSync(targetPath)
+            } catch {
+              return ok(`找不到这个文件：${raw}`)
+            }
+            if (!allowed.some((dir) => real === dir || real.startsWith(dir + sep))) {
+              return ok("只能发 room / 表情包 / tmp 里的文件；别的路径不行。")
+            }
+            let fileInfo
+            try {
+              fileInfo = statSync(real)
+            } catch {
+              return ok("读不到这个文件。")
+            }
+            if (!fileInfo.isFile()) return ok("这不是一个文件。")
+            const ext = ((real.match(/\.[A-Za-z0-9]{1,8}$/) || [""])[0] as string).toLowerCase()
+            const imageExts = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"])
+            const mediaType = input?.kind === "image" || input?.kind === "file"
+              ? input.kind
+              : (imageExts.has(ext) ? "image" : "file")
+            // 目标必须显式确定：群会话映射丢失时不能默认投私聊
+            const sessionMeta = sessionID ? await sessionInfo(sessionID) : { status: "error" as const }
+            const title = String(sessionMeta.title ?? "")
+            const titleGroup = title.startsWith("qq-group-") ? title.slice("qq-group-".length) : ""
+            const kind = qqSessionKind(sessionID) ?? (titleGroup ? "group" : undefined)
+            let sendTarget: { kind: "private" } | { kind: "group"; id: string } = { kind: "private" }
+            if (kind === "group") {
+              if (mediaType === "file") return ok("群聊不发文件，只有私聊可以发文件。")
+              if (!status.groupEnabled) return ok("QQ 群聊现在关着，没发。")
+              const gid = groupIdOf(sessionID) || titleGroup
+              if (!gid) return ok("找不到这个群的会话映射，先不发（避免误投私聊）。")
+              if (real.startsWith(join(WORLD, "tmp") + sep)) {
+                return ok("群聊别发 tmp 里收到的私聊附件；先存进表情包再发。")
+              }
+              sendTarget = { kind: "group", id: gid }
+            }
+            const limit = mediaType === "image" ? 8 * 1024 * 1024 : 20 * 1024 * 1024
+            if (fileInfo.size > limit) {
+              return ok(`文件太大（${Math.round(fileInfo.size / 1024 / 1024)}MB），超过 ${mediaType === "image" ? 8 : 20}MB 上限。`)
+            }
+            try {
+              mkdirSync(OUTBOX_DIR, { recursive: true })
+              appendFileSync(
+                join(OUTBOX_DIR, `${dayOf(new Date())}.jsonl`),
+                `${JSON.stringify({
+                  t: new Date().toISOString(),
+                  kind: "media",
+                  path: real,
+                  name: basename(real),
+                  mediaType,
+                  text: String(input?.text ?? "").trim(),
+                  session: sessionID,
+                  target: sendTarget,
+                })}\n`,
+                { mode: 0o600 },
+              )
+              log(`send_media · ${mediaType} · ${basename(real)}`)
+            } catch (error) {
+              log(`send_media failed: ${String(error)}`)
+              return ok("没能放进 outbox，看看 debug.log。")
+            }
+            return ok(`发出去了：${basename(real)}。`)
           },
         })
 
