@@ -54,6 +54,8 @@ const RECENT_LIMIT = 80
  */
 /** 单并发模型闸门：只在 localModel.enabled 且 concurrency.enabled 时生效 */
 interface ConcurrencyOptions {
+  /** 给人看的说明（JSON 不支持注释）；插件只读不写 */
+  _说明?: string
   enabled: boolean
   /** 用户聊天冲突时，定时任务直接延期多少分钟 */
   deferMinutes: number
@@ -68,6 +70,8 @@ interface ConcurrencyOptions {
 }
 
 interface LocalModelOptions {
+  /** 给人看的说明（JSON 不支持注释）；插件只读不写 */
+  _说明?: string
   enabled: boolean
   /** 新会话注入的历史条数（0 = 不注入） */
   keepRecent: number
@@ -1365,6 +1369,8 @@ interface HydrateOptions {
 }
 
 interface WorldSettings {
+  /** 给人看的说明（JSON 不支持注释）；插件只读不写 */
+  _说明?: string
   enabled: boolean
   running: boolean
   reviewHour: number
@@ -1379,6 +1385,8 @@ interface WorldSettings {
 }
 
 interface BridgeGroupSettings {
+  /** 给人看的说明（JSON 不支持注释）；插件只读不写 */
+  _说明?: string
   enabled?: boolean
   keywords?: string[]
   interjectChance?: number
@@ -1395,6 +1403,8 @@ interface BridgeGroupSettings {
 }
 
 interface BridgeSettings {
+  /** 给人看的说明（JSON 不支持注释）；插件只读不写 */
+  _说明?: string
   enabled: boolean
   ownerQQ: number
   ownerName: string
@@ -1406,10 +1416,19 @@ interface BridgeSettings {
   attachmentCleanup?: boolean
   /** 附件保留天数（默认 7 天） */
   attachmentRetentionDays?: number
+  afterglow?: {
+    /** 给人看的说明（JSON 不支持注释）；插件只读不写 */
+    _说明?: string
+    enabled: boolean
+    delayMs: number
+    maxRounds: number
+  }
   group: BridgeGroupSettings
 }
 
 interface LifeWorldConfig {
+  /** 给人看的说明（JSON 不支持注释）；插件只读不写 */
+  _说明?: string
   world: WorldSettings
   localModel: LocalModelOptions
   bridge: BridgeSettings
@@ -1434,7 +1453,9 @@ function deepMerge<T>(base: T, over: unknown): T {
 
 function defaultConfig(): LifeWorldConfig {
   return {
+    _说明: "life-world 配置。改完下一轮生效（世界提示词和模块除外）。JSON 不支持注释，带下划线的 _说明 只是给人看的，插件和桥接会忽略。",
     world: {
+      _说明: "生活世界：总开关、暂停打扰、每日回顾、早上叫醒、夜间重置、新会话记忆注入。",
       enabled: true,
       running: true,
       reviewHour: 23,
@@ -1448,6 +1469,7 @@ function defaultConfig(): LifeWorldConfig {
       hydrate: { mode: "budget", hours: 48, chars: 2000, mapDays: 3 },
     },
     localModel: {
+      _说明: "本地小模型的上下文折叠与单并发闸门；接在线 API 时保持全部关闭。",
       enabled: false,
       keepRecent: 20,
       foldRecentContext: 6,
@@ -1458,6 +1480,7 @@ function defaultConfig(): LifeWorldConfig {
       subagentPreference: "",
       debugStats: false,
       concurrency: {
+        _说明: "单并发模型闸门：用户聊天时让定时任务和群聊让路；只对本地单并发模型有意义。",
         enabled: false,
         deferMinutes: 30,
         userActiveSeconds: 90,
@@ -1467,6 +1490,7 @@ function defaultConfig(): LifeWorldConfig {
       },
     },
     bridge: {
+      _说明: "QQ / OneBot 桥接：开关、账号、WS 地址、媒体、私聊余波与群聊。",
       enabled: false,
       ownerQQ: 0,
       ownerName: "",
@@ -1476,7 +1500,14 @@ function defaultConfig(): LifeWorldConfig {
       location: "",
       attachmentCleanup: true,
       attachmentRetentionDays: 7,
+      afterglow: {
+        _说明: "私聊余波：她发完话没人回时，过多久补一句、最多补几轮；0 轮 = 关闭。",
+        enabled: true,
+        delayMs: 30000,
+        maxRounds: 2,
+      },
       group: {
+        _说明: "QQ 群聊：总开关、触发词、读空气概率、判官模型、冷却与出站黑名单。",
         enabled: false,
         keywords: [],
         interjectChance: 0.05,
@@ -1519,6 +1550,7 @@ function normalizeConfig(config: LifeWorldConfig): LifeWorldConfig {
   const conc = obj(local.concurrency)
   const bridge = obj(config?.bridge)
   const group = obj(bridge.group)
+  const afterglow = obj(bridge.afterglow)
   const wake = str(world.fallbackWakeTime, base.world.fallbackWakeTime)
   const groupBase = base.bridge.group
 
@@ -1526,8 +1558,12 @@ function normalizeConfig(config: LifeWorldConfig): LifeWorldConfig {
     // 保留 schema 之外的键（bridge.napcat / private、用户自加字段等）：
     // 读时带上、写回时就不会被抹掉。
     ...(config && typeof config === "object" ? (config as unknown as Record<string, unknown>) : {}),
+    _说明: typeof (config as { _说明?: unknown } | undefined)?._说明 === "string"
+      ? String((config as { _说明?: string })._说明)
+      : base._说明,
     world: {
       ...world,
+      _说明: typeof world._说明 === "string" ? world._说明 : base.world._说明,
       enabled: bool(world.enabled, base.world.enabled),
       running: bool(world.running, base.world.running),
       reviewHour: Math.floor(num(world.reviewHour, base.world.reviewHour, 0, 23)),
@@ -1553,6 +1589,7 @@ function normalizeConfig(config: LifeWorldConfig): LifeWorldConfig {
     },
     localModel: {
       ...local,
+      _说明: typeof local._说明 === "string" ? local._说明 : base.localModel._说明,
       enabled: bool(local.enabled, false),
       keepRecent: Math.floor(num(local.keepRecent, 20, 0)),
       foldRecentContext: Math.floor(num(local.foldRecentContext, 6, 0)),
@@ -1563,6 +1600,7 @@ function normalizeConfig(config: LifeWorldConfig): LifeWorldConfig {
       subagentPreference: typeof local.subagentPreference === "string" ? local.subagentPreference.trim() : "",
       debugStats: bool(local.debugStats, false),
       concurrency: {
+        _说明: typeof conc._说明 === "string" ? conc._说明 : base.localModel.concurrency._说明,
         enabled: bool(conc.enabled, false),
         deferMinutes: Math.floor(num(conc.deferMinutes, 30, 1)),
         userActiveSeconds: Math.floor(num(conc.userActiveSeconds, 90, 5)),
@@ -1573,6 +1611,7 @@ function normalizeConfig(config: LifeWorldConfig): LifeWorldConfig {
     },
     bridge: {
       ...bridge,
+      _说明: typeof bridge._说明 === "string" ? bridge._说明 : base.bridge._说明,
       enabled: bool(bridge.enabled, false),
       ownerQQ: Math.floor(num(bridge.ownerQQ, 0, 0)),
       ownerName: str(bridge.ownerName, ""),
@@ -1582,8 +1621,17 @@ function normalizeConfig(config: LifeWorldConfig): LifeWorldConfig {
       location: typeof bridge.location === "string" ? bridge.location : "",
       attachmentCleanup: bool(bridge.attachmentCleanup, true),
       attachmentRetentionDays: Math.floor(num(bridge.attachmentRetentionDays, 7, 1)),
+      afterglow: {
+        ...base.bridge.afterglow,
+        ...afterglow,
+        _说明: typeof afterglow._说明 === "string" ? afterglow._说明 : base.bridge.afterglow?._说明,
+        enabled: bool(afterglow.enabled, true),
+        delayMs: Math.floor(num(afterglow.delayMs, 30000, 1000, 300_000)),
+        maxRounds: Math.floor(num(afterglow.maxRounds, 2, 0, 5)),
+      },
       group: {
         ...group,
+        _说明: typeof group._说明 === "string" ? group._说明 : base.bridge.group._说明,
         enabled: bool(group.enabled, false),
         keywords: Array.isArray(group.keywords) ? group.keywords.map((k) => String(k)) : groupBase.keywords,
         interjectChance: num(group.interjectChance, groupBase.interjectChance ?? 0.05, 0, 1),
@@ -1742,6 +1790,40 @@ function ensureConfig(): void {
     log(`config created · ${CONFIG_FILE}`)
   } catch (error) {
     log(`ensureConfig failed: ${String(error)}`)
+  }
+}
+
+/**
+ * 给已有配置补上 _说明 字段（JSON 不支持注释）。
+ * 只加不改：用户自己写的 _说明 原样保留；全部齐全时不写盘。
+ */
+function ensureConfigDocs(): void {
+  try {
+    if (!existsSync(CONFIG_FILE)) return
+    const raw = JSON.parse(readFileSync(CONFIG_FILE, "utf8")) as Record<string, any>
+    if (!raw || typeof raw !== "object") return
+    const base = defaultConfig()
+    let changed = false
+    const set = (obj: any, text?: string): void => {
+      if (!obj || typeof obj !== "object" || typeof text !== "string") return
+      if (typeof obj._说明 !== "string") {
+        obj._说明 = text
+        changed = true
+      }
+    }
+    set(raw, base._说明)
+    set(raw.world, base.world._说明)
+    set(raw.localModel, base.localModel._说明)
+    set(raw.localModel?.concurrency, base.localModel.concurrency._说明)
+    set(raw.bridge, base.bridge._说明)
+    set(raw.bridge?.afterglow, base.bridge.afterglow?._说明)
+    set(raw.bridge?.group, base.bridge.group._说明)
+    if (changed) {
+      atomicWrite(CONFIG_FILE, JSON.stringify(raw, null, 2), 0o600)
+      log("config docs added")
+    }
+  } catch (error) {
+    log(`ensureConfigDocs failed: ${String(error)}`)
   }
 }
 
@@ -2303,6 +2385,7 @@ export default Plugin.define({
     ensureWorldPrompt()
     ensureMood()
     ensureConfig()
+    ensureConfigDocs()
     loadArchive()
     // 全新世界（没有任何归档）不要从宿主库最老的消息开始往回灌：那会把很久以前的对话
     // 当成「最近说过的话」注入，而且大库要几十次请求才追得上。从现在开始记。

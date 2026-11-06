@@ -1,5 +1,7 @@
 {
+  "_说明": "life-world 配置。改完下一轮生效（世界提示词和模块除外）。JSON 不支持注释，带下划线的 _说明 只是给人看的，插件和桥接会忽略。",
   "world": {
+    "_说明": "生活世界：总开关、暂停打扰、每日回顾、早上叫醒、夜间重置、新会话记忆注入。",
     "enabled": true,
     "running": true,
     "reviewHour": 23,
@@ -11,6 +13,7 @@
     "resetCooldownMinutes": 5,
     "homeTitle": "life-world home session",
     "hydrate": {
+      "_说明": "新会话第一次请求注入多少记忆：默认只给最近 48 小时、总字数 2000 的原文，再附最近 3 天的记忆地图；更早的用 memory_* 工具按需翻。",
       "mode": "budget",
       "hours": 48,
       "chars": 2000,
@@ -18,6 +21,7 @@
     }
   },
   "localModel": {
+    "_说明": "本地小模型的上下文折叠与单并发闸门；接在线 API 时保持全部关闭。",
     "enabled": false,
     "keepRecent": 20,
     "foldRecentContext": 6,
@@ -28,6 +32,7 @@
     "subagentPreference": "",
     "debugStats": false,
     "concurrency": {
+      "_说明": "单并发模型闸门：用户聊天时让定时任务和群聊让路；只对本地单并发模型有意义。",
       "enabled": false,
       "deferMinutes": 30,
       "userActiveSeconds": 90,
@@ -37,6 +42,7 @@
     }
   },
   "bridge": {
+    "_说明": "QQ / OneBot 桥接：开关、账号、WS 地址、媒体、私聊余波与群聊。",
     "enabled": false,
     "ownerQQ": 0,
     "ownerName": "",
@@ -45,6 +51,7 @@
     "privateSessionTitle": "qq-chat",
     "location": "",
     "afterglow": {
+      "_说明": "私聊余波：她发完话没人回时，过多久补一句、最多补几轮；0 轮 = 关闭。她会自己判断该不该说，只回 [SILENT] 就不发。",
       "enabled": true,
       "delayMs": 30000,
       "maxRounds": 2
@@ -52,6 +59,7 @@
     "attachmentCleanup": true,
     "attachmentRetentionDays": 7,
     "group": {
+      "_说明": "QQ 群聊：总开关、触发词、读空气概率、判官模型、冷却与出站黑名单。",
       "enabled": false,
       "keywords": [],
       "interjectChance": 0.05,
