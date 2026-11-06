@@ -298,17 +298,22 @@ async function ensurePrivateNow() {
   if (state.privateSessionId) {
     const info = await sessionInfo(state.privateSessionId)
     if (info.status === "ok") {
-      if (state.lastSessionId !== state.privateSessionId) await resetBaseline(state.privateSessionId)
+      if (state.lastSessionId !== state.privateSessionId || state.baseSet !== true) {
+        await resetBaseline(state.privateSessionId)
+      }
       return state.privateSessionId
     }
     if (info.status === "missing") {
       releaseGate(state.privateSessionId)
+      promptQueue.length = 0
       pendingPrivateTurns = 0
       stopTyping(ownerQQ)
       delete state.privateSessionId
       delete state.lastSessionId
       delete state.lastIdle
       delete state.lastAssistantId
+      delete state.lastAssistantAt
+      delete state.baseSet
       saveState()
       log("private session missing, recreate")
     } else {
@@ -332,13 +337,19 @@ async function resetBaseline(id) {
   // 接口瞬时失败时不拍基线：否则 lastIdle/lastAssistantId 被清空，
   // 下一轮会把上一条旧回复当成新回复再发一遍。
   const info = await sessionInfo(id)
-  if (info.status !== "ok") return false
+  if (info.status !== "ok") { state.baseSet = false; return false }
   const msgs = await apiJson(`/api/session/${id}/message`)
-  if (!Array.isArray(msgs.data?.data)) return false
+  if (!Array.isArray(msgs.data?.data)) { state.baseSet = false; return false }
   const assistants = msgs.data.data.filter((m) => m?.type === "assistant")
+  // 如果已经有 prompt 在队里，基线只能拍到它之前——否则这条 prompt 的回复会被当成旧消息跳过
+  const oldestTurn = promptQueue.find((t) => !t.done)
+  const cutoff = oldestTurn ? oldestTurn.at - 100 : Number.MAX_SAFE_INTEGER
+  const baseline = assistants.find((m) => (m.time?.created || 0) < cutoff) || null
   state.lastSessionId = id
   state.lastIdle = info.info?.time?.idle || 0
-  state.lastAssistantId = assistants.length ? assistants[0].id : undefined
+  state.lastAssistantId = baseline ? baseline.id : undefined
+  state.lastAssistantAt = baseline ? (baseline.time?.created || 0) : 0
+  state.baseSet = true
   saveState()
   return true
 }
@@ -351,12 +362,15 @@ async function deletePrivate() {
   delete state.lastSessionId
   delete state.lastIdle
   delete state.lastAssistantId
+  delete state.lastAssistantAt
+  delete state.baseSet
   runWindow = null
+  promptQueue.length = 0
   pendingPrivateTurns = 0
   stopTyping(ownerQQ)
   userReturned()
   afterglow.inFlight = false
-  afterglow.counted = false
+  afterglow.turn = null
   releaseGate(id)
   saveState()
   log("deleted private session", id)
@@ -526,10 +540,63 @@ const typingTimers = new Map()
 let typingSupported = true
 let typingFailures = 0
 let typingRetryAt = 0
-/** 还没等到回复的私聊回合数：连续发多条时，全部回完才停「正在输入」 */
+/** 还没等到回复的私聊回合数：由 promptQueue 派生，不再手工加减 */
 let pendingPrivateTurns = 0
 /** 最近一次私聊 prompt 的时间：超过 30 分钟没有产出就不再续「正在输入」 */
 let lastPrivatePromptAt = 0
+
+/**
+ * 私聊回合队列：每发一次 prompt 入队一条，回合结束（哪怕空正文 / 报错）出队。
+ * pendingPrivateTurns 由队列长度派生——空正文回合也必须能出队，
+ * 否则一次 provider 报错就会把余波永久钉死。
+ */
+const promptQueue = []
+let promptSeq = 0
+
+function syncPendingTurns() {
+  pendingPrivateTurns = promptQueue.reduce((n, turn) => n + (turn.done ? 0 : 1), 0)
+}
+
+function trackPrompt(kind, window) {
+  const turn = { id: ++promptSeq, kind, at: Date.now(), done: false, window }
+  promptQueue.push(turn)
+  syncPendingTurns()
+  return turn
+}
+
+/** 这条 assistant 回复属于哪一次 prompt：取创建之前最近的一次（只留 100ms 时钟容差） */
+function promptForTime(created) {
+  for (let i = promptQueue.length - 1; i >= 0; i--) {
+    if (promptQueue[i].at <= created + 100) return promptQueue[i]
+  }
+  return null
+}
+
+function finishTurn(turn) {
+  if (!turn || turn.done) return
+  turn.done = true
+  if (turn.window && !turn.window.end) {
+    turn.window.reaches = []
+    turn.window.end = Date.now()
+  }
+  syncPendingTurns()
+}
+
+/** 超过 10 分钟还没等到回复的回合直接收掉，避免队列/窗口永久挂着 */
+function prunePromptQueue() {
+  const cutoff = Date.now() - 10 * 60_000
+  for (let i = promptQueue.length - 1; i >= 0; i--) {
+    const turn = promptQueue[i]
+    if (!turn.done && turn.at >= cutoff) continue
+    if (!turn.done) {
+      turn.done = true
+      if (turn.window && !turn.window.end) turn.window.end = Date.now()
+      log("prompt turn timeout", turn.kind)
+    }
+    if (turn.done && turn.at < cutoff) promptQueue.splice(i, 1)
+  }
+  syncPendingTurns()
+}
 
 async function typingPing(userId) {
   try {
@@ -611,8 +678,8 @@ const afterglow = {
   /** 这一轮用户消息已经用完几拍余波；只有用户再说话才清零 */
   spent: 0,
   inFlight: false,
-  /** inFlight 这一拍是否已经计进 pendingPrivateTurns */
-  counted: false,
+  /** 这一拍对应的回合（在 promptQueue 里） */
+  turn: null,
   seq: 0,
   userSeq: 0,
   watchdog: null,
@@ -629,7 +696,7 @@ function afterglowCfg() {
     typeof v === "number" && Number.isFinite(v) ? Math.min(max, Math.max(min, Math.floor(v))) : d
   return {
     enabled: a.enabled !== false,
-    delayMs: num(a.delayMs, 30000, 1000, 300_000),
+    delayMs: num(a.delayMs, 60000, 1000, 300_000),
     maxRounds: num(a.maxRounds, 2, 0, 5),
   }
 }
@@ -673,17 +740,14 @@ function armAfterglow(round) {
   afterglow.timer.unref?.()
 }
 
-/** 余波这一拍没发成：清状态、还回 pending、收掉窗口；只在没有别的回合时停打字 */
+/** 余波这一拍没发成：清状态、收掉自己的窗口；只在没有别的回合时停打字 */
 function abortAfterglow(reason) {
   clearAfterglowWatchdog()
-  const counted = afterglow.counted
-  afterglow.counted = false
   afterglow.inFlight = false
-  if (counted) pendingPrivateTurns = Math.max(0, pendingPrivateTurns - 1)
-  if (pendingPrivateTurns === 0) {
-    stopTyping(ownerQQ)
-    if (runWindow && !runWindow.end) runWindow.end = Date.now()
-  }
+  const turn = afterglow.turn
+  afterglow.turn = null
+  if (turn) finishTurn(turn)
+  if (pendingPrivateTurns === 0) stopTyping(ownerQQ)
   afterglow.round = afterglow.spent
   log("afterglow aborted", reason)
 }
@@ -691,18 +755,26 @@ function abortAfterglow(reason) {
 async function fireAfterglow(round) {
   const cfg = afterglowCfg()
   if (!cfg.enabled || cfg.maxRounds <= 0) return
+  // 60 秒内把 maxRounds 调小也要拦住
+  if (round > cfg.maxRounds) { afterglow.round = afterglow.spent; return }
   // 计时期间用户回过话 / 已有余波在跑：这一拍作废
   if (afterglow.seq !== afterglow.userSeq || afterglow.inFlight) return
-  // 有别的回合在排队、或上一轮窗口还没收尾：不插队
-  if (pendingPrivateTurns > 0 || (runWindow && !runWindow.end)) return
+  // 还有回合没答完就不插队（空正文/报错回合也会正常出队）
+  syncPendingTurns()
+  if (pendingPrivateTurns > 0) return
   const id = state.privateSessionId
   if (!id) return
   // 先占住 inFlight，避免 sessionInfo 的 await 期间被第二个计时器再发一次
   afterglow.inFlight = true
   const info = await sessionInfo(id)
   // await 期间用户可能回来了、或有新回合进来：再验一次
-  if (info.status !== "ok" || afterglow.seq !== afterglow.userSeq || pendingPrivateTurns > 0) {
+  if (info.status !== "ok" || afterglow.seq !== afterglow.userSeq) {
     abortAfterglow("stale")
+    return
+  }
+  syncPendingTurns()
+  if (pendingPrivateTurns > 0) {
+    abortAfterglow("busy")
     return
   }
   const text = [
@@ -712,34 +784,9 @@ async function fireAfterglow(round) {
     "如果觉得这会儿不该说、没什么要补的，就只回 [SILENT]，这条不会发出去。",
     "直接写正文，不要调用 reach_out。",
   ].join("\n")
-  runWindow = { start: Date.now(), end: 0, reaches: [] }
-  pendingPrivateTurns += 1
-  afterglow.counted = true
-  lastPrivatePromptAt = Date.now()
-  startTyping(ownerQQ)
-  // 看门狗：模型一轮跑太久/只出工具不出正文时，别让 inFlight/pending 一直挂着。
-  // 放弃时只记 abandonedSeq，不动 spent——迟到的回复不会再从第 1 轮续。
-  clearAfterglowWatchdog()
-  afterglow.watchdog = setTimeout(() => {
-    afterglow.watchdog = null
-    if (!afterglow.inFlight) return
-    const sameTurn = afterglow.seq === afterglow.userSeq
-    afterglow.inFlight = false
-    // 只有这一轮还没被用户的新消息取代，才记「迟到回复」；否则不能影响新回合
-    if (sameTurn) afterglow.abandonedSeq = afterglow.userSeq
-    if (afterglow.counted) {
-      afterglow.counted = false
-      pendingPrivateTurns = Math.max(0, pendingPrivateTurns - 1)
-    }
-    if (sameTurn && pendingPrivateTurns === 0) {
-      stopTyping(ownerQQ)
-      if (runWindow && !runWindow.end) runWindow.end = Date.now()
-    }
-    log("afterglow watchdog, give up", sameTurn ? "" : "(superseded)")
-  }, 180_000)
-  afterglow.watchdog.unref?.()
+  let res
   try {
-    const res = await api(`/api/session/${id}/prompt`, { method: "POST", body: JSON.stringify({ text }) })
+    res = await api(`/api/session/${id}/prompt`, { method: "POST", body: JSON.stringify({ text }) })
     if (!res.ok) {
       const body = await res.text().catch(() => "")
       log("afterglow prompt failed", res.status, body.slice(0, 200))
@@ -751,7 +798,31 @@ async function fireAfterglow(round) {
     abortAfterglow("error")
     return
   }
-  log("afterglow prompt queued", round, id)
+  // POST 成功后才建窗口/入队：失败时不算一个回合
+  const window = { start: Date.now(), end: 0, reaches: [] }
+  runWindow = window
+  const turn = trackPrompt("afterglow", window)
+  afterglow.turn = turn
+  lastPrivatePromptAt = Date.now()
+  startTyping(ownerQQ)
+  // 看门狗：模型一轮跑太久/只出工具不出正文时，别让 inFlight/pending 一直挂着。
+  // 放弃时只记 abandonedSeq，不动 spent——迟到的回复不会再从第 1 轮续。
+  clearAfterglowWatchdog()
+  afterglow.watchdog = setTimeout(() => {
+    afterglow.watchdog = null
+    if (!afterglow.inFlight || afterglow.turn !== turn) return
+    const sameTurn = afterglow.seq === afterglow.userSeq
+    afterglow.inFlight = false
+    // 只有这一轮还没被用户的新消息取代，才记「迟到回复」；否则不能影响新回合
+    if (sameTurn) afterglow.abandonedSeq = afterglow.userSeq
+    turn.abandoned = true
+    finishTurn(turn)
+    afterglow.turn = null
+    if (pendingPrivateTurns === 0) stopTyping(ownerQQ)
+    log("afterglow watchdog, give up", sameTurn ? "" : "(superseded)")
+  }, 180_000)
+  afterglow.watchdog.unref?.()
+  log("afterglow prompt queued", round, id, "turn", turn.id)
 }
 
 /** 私聊附件：图片、表情和文件都收；群聊只收图片（见 groupMedia） */
@@ -837,7 +908,6 @@ async function handlePrivate(msg) {
     ? `\n（对方随消息发来 ${files.length} 个附件，已附在本次请求里：${files.map((f) => f.name).join("、")}。图片直接看，文件按内容读；回话时不用复述附件。${failedCount ? `另有 ${failedCount} 个附件没下载下来。` : ""}）`
     : (media.length > 0 ? `\n（对方发了 ${media.length} 个附件，但都没下载下来；如果重要就让他再发一次。）` : "")
   const annotated = `[私聊｜${nameOf(msg)}（QQ ${msg.user_id}）] ${text || "（只有附件，没有文字）"}${mediaNote}\n（这是 QQ 私聊：按 system 里的《QQ 私聊回复方式》回复；直接写正文，不要调用 reach_out。）`
-  runWindow = { start: Date.now(), end: 0, reaches: [] }
   let res
   try {
     const body = { text: annotated }
@@ -861,10 +931,13 @@ async function handlePrivate(msg) {
   }
   // 私聊是用户回合：让群聊/定时任务立刻让路（闸门关闭时是 no-op）
   markUserActive(id)
-  pendingPrivateTurns += 1
+  // POST 成功后才建窗口/入队：失败时不覆盖上一轮还没收尾的窗口
+  const window = { start: Date.now(), end: 0, reaches: [] }
+  runWindow = window
+  const turn = trackPrompt("user", window)
   lastPrivatePromptAt = Date.now()
   startTyping(ownerQQ)
-  log("prompt queued", id)
+  log("prompt queued", id, "turn", turn.id)
 }
 
 // 每行一条消息；超长行再按标点/长度切，避免一条长墙
@@ -1783,15 +1856,19 @@ async function pollPrivate() {
     const { status, info } = await sessionInfo(id)
     if (status === "missing") {
       releaseGate(id)
+      promptQueue.length = 0
       pendingPrivateTurns = 0
       stopTyping(ownerQQ)
       userReturned()
       afterglow.inFlight = false
-      afterglow.counted = false
+      afterglow.turn = null
+      runWindow = null
       delete state.privateSessionId
       delete state.lastSessionId
       delete state.lastIdle
       delete state.lastAssistantId
+      delete state.lastAssistantAt
+      delete state.baseSet
       saveState()
       log("private session missing (poll), clear")
       return
@@ -1805,47 +1882,51 @@ async function pollPrivate() {
       privateRetryAt = Date.now() + 3000
       return
     }
+    // 基线没拍过（升级/重启后的旧 state）：先对齐，别把旧回复当新回复重播
+    if (state.baseSet !== true) {
+      const ok = await resetBaseline(id)
+      if (!ok) { privateRetryAt = Date.now() + 3000; return }
+      // 不 return：baseline 已经拍在待答 prompt 之前，继续用这份消息列表处理
+    }
     const assistants = res.data.data.filter((m) => m?.type === "assistant" && m?.time?.completed)
     if (assistants.length === 0) return
-    // assistants 最新在前：把 lastAssistantId 之后完成的都按时间正序发掉，
-    // 不能只取最新一条——短时间连发两条时会吞掉前一条回复。
+    // 用时间水位找新回复：lastAssistantId 可能不在 completed 列表里（报错/流式中间态）
+    if (typeof state.lastAssistantAt !== "number" && state.lastAssistantId) {
+      const found = res.data.data.find((m) => m?.id === state.lastAssistantId)
+      state.lastAssistantAt = found?.time?.created || 0
+    }
+    const lastAt = typeof state.lastAssistantAt === "number" ? state.lastAssistantAt : undefined
     let newer
-    if (!state.lastAssistantId) {
-      // 还没有基线（新会话/刚 /new）：把已经完成的都按时间正序发出去。
-      // 只取最新一条会吞掉同一轮询间隔内先完成的回复。
+    if (lastAt === undefined) {
+      // 还没有基线（新会话/刚 /new）：只把最近完成的几条按时间正序发出去
       newer = assistants.slice(0, 5).reverse()
     } else {
-      const idx = assistants.findIndex((m) => m.id === state.lastAssistantId)
-      if (idx === 0) { state.lastIdle = idle; saveState(); return }
-      newer = idx > 0 ? assistants.slice(0, idx).reverse() : [assistants[0]]
+      newer = assistants.filter((m) => (m.time?.created || 0) > lastAt).reverse()
     }
+    if (newer.length === 0) { state.lastIdle = idle; saveState(); return }
     const textOf = (m) => (m.content || [])
       .filter((p) => p?.type === "text" && p?.text)
       .map((p) => p.text)
       .join("\n")
       .trim()
 
-    // 只按「真正发出去的回复」扣回合：只有工具调用、没有正文的 assistant 不算回合结束
-    let sentTurns = 0
-    let sentBuffered = false
-    let silentTurns = 0
-    for (let i = 0; i < newer.length; i++) {
-      const message = newer[i]
-      const isLast = i === newer.length - 1
+    // 归属：这条 assistant 属于它创建前最近的一次 prompt（余波 prompt 或用户 prompt）
+    const assignments = newer.map((message) => {
+      const created = message.time?.created || 0
+      return { message, created, turn: promptForTime(created) }
+    })
+    const lastForTurn = new Map()
+    assignments.forEach((a, i) => { if (a.turn) lastForTurn.set(a.turn.id, i) })
+    let lastAfterglowResult = null
+    for (let i = 0; i < assignments.length; i++) {
+      const { message, turn } = assignments[i]
+      const isTurnEnd = turn ? lastForTurn.get(turn.id) === i : i === assignments.length - 1
       const text = textOf(message)
-      // 余波允许她判断「这会儿不该说」：只回 [SILENT] 就不发，也不续下一轮
-      if (text && /^\[SILENT\]$/i.test(text.trim()) && afterglow.inFlight) {
-        silentTurns += 1
-        afterglow.silent = true
-        state.lastAssistantId = message.id
-        if (isLast && runWindow && !runWindow.end) {
-          runWindow.reaches = []
-          runWindow.end = Date.now()
-        }
-        saveState()
-        continue
-      }
-      if (text) {
+      const silent = text !== "" && /^\[SILENT\]$/i.test(text.trim())
+      if (silent) {
+        // 私聊里 [SILENT] 一律不发；余波回合记下来，后面停止续
+        if (turn?.kind === "afterglow") afterglow.silent = true
+      } else if (text) {
         const ok = await sendPrivate(text)
         if (!ok) {
           privateRetryAt = Date.now() + 15000
@@ -1853,12 +1934,11 @@ async function pollPrivate() {
           return
         }
         privateRetryAt = 0
-        sentTurns += 1
         // QQ 收到消息会清掉输入状态：还有没回完的回合就立刻补一次
         if (pendingPrivateTurns > 0) void typingPing(ownerQQ)
-      } else if (isLast && runWindow && !runWindow.end) {
-        // 最后一条正文为空：她可能把话都写进了 reach_out，把缓冲的行当回复发出去
-        const buffered = [...runWindow.reaches]
+      } else if (isTurnEnd && turn?.window && !turn.window.end) {
+        // 空正文：她可能把话都写进了 reach_out，把这一轮窗口里缓冲的行发出去
+        const buffered = [...turn.window.reaches]
         if (buffered.length) {
           const ok = await sendPrivate(buffered.join("\n"))
           if (!ok) {
@@ -1867,56 +1947,60 @@ async function pollPrivate() {
             return
           }
           privateRetryAt = 0
-          sentBuffered = true
-          if (pendingPrivateTurns > 0) void typingPing(ownerQQ)
-          runWindow.reaches = []
+          turn.window.reaches = []
           log("reply from reach_out buffer", buffered.length)
         }
       }
+      // 推进水位：按 created 走，空正文/报错回合也算这一轮结束
+      state.lastAssistantAt = Math.max(state.lastAssistantAt || 0, (message.time?.created || 0))
       state.lastAssistantId = message.id
-      if (isLast && runWindow && !runWindow.end) {
-        runWindow.reaches = []
-        runWindow.end = Date.now()
+      if (isTurnEnd && turn) {
+        if (turn.kind === "afterglow") {
+          // 先收掉这一拍的状态；是否续由批次末尾决定
+          clearAfterglowWatchdog()
+          afterglow.inFlight = false
+          afterglow.turn = null
+          const superseded = afterglow.seq !== afterglow.userSeq
+          const abandoned = turn.abandoned === true
+          if (!superseded && !abandoned) afterglow.spent = Math.max(afterglow.spent, afterglow.round)
+          lastAfterglowResult = { silent: afterglow.silent, superseded, abandoned }
+          afterglow.silent = false
+        }
+        finishTurn(turn)
       }
       saveState()
     }
     // 只有这一批全部发完才推进 lastIdle：中途失败时保持旧值，
     // 下一次轮询才会重新进来重试剩下的回复。
     state.lastIdle = idle
-    // 只有真正发出回复才扣回合；工具调用中间态不算，避免「正在输入」提前熄灭
-    const completed = sentTurns + (sentBuffered ? 1 : 0) + silentTurns
-    if (completed > 0) pendingPrivateTurns = Math.max(0, pendingPrivateTurns - completed)
     if (pendingPrivateTurns === 0) stopTyping(ownerQQ)
-    // 余波：只有真的发出东西才处理
-    if (completed > 0) {
-      if (afterglow.inFlight) {
-        // fire 时已确保没有别的回合排队，这条完成就是余波回合的
-        clearAfterglowWatchdog()
-        afterglow.inFlight = false
-        afterglow.counted = false
-        const cfg = afterglowCfg()
-        if (afterglow.silent) {
-          // 她自己判断这会儿不该说：到此为止，不再续
-          afterglow.silent = false
-          afterglow.spent = Math.max(afterglow.spent, afterglow.round)
-          afterglow.round = afterglow.spent
-        } else if (afterglow.seq === afterglow.userSeq) {
-          afterglow.spent = Math.max(afterglow.spent, afterglow.round)
-          if (cfg.enabled && afterglow.spent < cfg.maxRounds) armAfterglow(afterglow.spent + 1)
-          else afterglow.round = afterglow.spent
-        } else {
-          // 用户中途回来了：这一条余波照发，但不再续
-          afterglow.round = afterglow.spent
-        }
-      } else if (afterglow.abandonedSeq === afterglow.userSeq) {
-        // 看门狗放弃后才落地的迟到回复：收尾，不再从第 1 轮续
-        afterglow.abandonedSeq = -1
+    // 余波续拍：只由这一批的最后一条回合决定
+    const lastTurn = assignments[assignments.length - 1]?.turn || null
+    const pendingUser = promptQueue.some((t) => !t.done && t.kind === "user")
+    const pendingAfterglow = promptQueue.some((t) => !t.done && t.kind === "afterglow")
+    if (lastTurn && lastTurn.kind === "afterglow") {
+      const cfg = afterglowCfg()
+      const result = lastAfterglowResult || { silent: false, superseded: false, abandoned: false }
+      if (result.abandoned) {
+        // 看门狗放弃后才落地的迟到回复：照发，但不再续
         afterglow.round = afterglow.spent
-      } else if (pendingPrivateTurns === 0) {
-        // 正常回复：从这一轮用户消息开始算余波（armAfterglow 会顶掉旧计时）
-        armAfterglow(afterglow.spent + 1)
+      } else if (result.superseded) {
+        // 用户中途回来了：这一条余波照发，但不再续。
+        // 如果用户那一轮已经答完、也没别的回合在排队，给他补上这一轮自己的余波。
+        if (!pendingUser && !pendingAfterglow) armAfterglow(afterglow.spent + 1)
+        else afterglow.round = afterglow.spent
+      } else if (result.silent) {
+        afterglow.round = afterglow.spent
+      } else if (afterglow.seq === afterglow.userSeq) {
+        if (cfg.enabled && afterglow.spent < cfg.maxRounds) armAfterglow(afterglow.spent + 1)
+        else afterglow.round = afterglow.spent
+      } else {
+        afterglow.round = afterglow.spent
       }
+    } else if (lastTurn && lastTurn.kind === "user") {
+      if (!pendingUser && !pendingAfterglow) armAfterglow(afterglow.spent + 1)
     }
+    prunePromptQueue()
     saveState()
   } catch (error) {
     log("poll failed", String(error))
@@ -2342,6 +2426,36 @@ if (process.argv[2] === "--test-send") {
     setTimeout(() => process.exit(0), 600)
   }, 300)
   setTimeout(() => { log("test send timeout"); process.exit(1) }, 20000)
+} else if (process.argv[2] === "--test-user") {
+  // 测试用：模拟 owner 发一条私聊，跑真实的服务投递 / 轮询 / 余波链路。
+  // 需要先停掉正式桥接（单实例锁），结束后进程自动退出。
+  if (!acquireInstanceLock()) process.exit(1)
+  const text = process.argv[3] || "在吗"
+  connect()
+  const sendFake = (content) => {
+    const fake = {
+      user_id: ownerQQ,
+      self_id: 0,
+      message: [{ type: "text", data: { text: content } }],
+      sender: { nickname: "测试" },
+    }
+    handlePrivate(fake).catch((error) => log("test user failed", String(error)))
+  }
+  const kick = setInterval(() => {
+    if (!wsReady) return
+    clearInterval(kick)
+    sendFake(text)
+    setInterval(pollPrivate, 1500)
+    setInterval(pollOutbox, 2000)
+    log("test user started", text)
+    if (process.env.TEST_SECOND) {
+      setTimeout(() => {
+        sendFake(process.env.TEST_SECOND)
+        log("test user second", process.env.TEST_SECOND)
+      }, Number(process.env.TEST_SECOND_MS || 8000))
+    }
+  }, 300)
+  setTimeout(() => { log("test user done"); process.exit(0) }, Number(process.env.TEST_MS || 90000))
 } else {
   if (!acquireInstanceLock()) process.exit(1)
   // 首次启动：只初始化新结构（按天游标 + 启用时刻）。

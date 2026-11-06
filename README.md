@@ -46,7 +46,7 @@
 | **QQ 桥接（可选）** | `scripts/qq-bridge.mjs`：接任意 **OneBot v11 正向 WebSocket**（NapCat、SnowLuma 等）↔ `qq-chat` 会话；每行一条消息、真人节奏 |
 | **主动消息 outbox** | `reach_out` 写 `outbox/YYYY-MM-DD.jsonl`；桥接每 2 秒投递，断线 / 跨天后自动补发最近 3 天 |
 | **语音** | 不内置 TTS：外部 TTS 把音频放进 `语音/`，`send_media({ kind: "voice" })` 以 OneBot `record` 段发送；私聊 / 群聊都支持 |
-| **私聊余波** | 她发完话 30 秒没人回 → 补一轮；再 30 秒 → 再补一轮（默认最多 2 轮）；她也可以只回 `[SILENT]` 选择不说 |
+| **私聊余波** | 她发完话 60 秒没人回 → 补一轮；再 60 秒 → 再补一轮（默认最多 2 轮）；她也可以只回 `[SILENT]` 选择不说 |
 | **gal 模式（强制模式）** | 纯提示词：她当导演，每回合「一段叙事正文 + 一次 `question` 单选闸门」 |
 | **总开关** | `bin/life-world.sh on｜off｜status`；关掉即完全退回原生 opencode，数据不动 |
 | **本地小模型优化** | 折叠工具结果 / 旧推理、压缩注入条数、单并发闸门。接在线模型时保持关闭 |
@@ -208,8 +208,8 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 
 她发完最后一句话、且没有别的回合排队时，桥接开始计时：
 
-1. 30 秒没有你的消息 → 发一条带 `【余波】` 标记的回合，让她补一句没说完的 / 解释一下 / 问一句怎么不说话；
-2. 再过 30 秒还没有 → 再补一轮；
+1. 60 秒没有你的消息 → 发一条带 `【余波】` 标记的回合，让她补一句没说完的 / 解释一下 / 问一句怎么不说话；
+2. 再过 60 秒还没有 → 再补一轮；
 3. 最多 `maxRounds` 轮（默认 2）就停，直到你再次说话。
 
 规则：
@@ -270,7 +270,7 @@ JSON 不支持注释，所以每个区块都有一个 `_说明` 字符串，**�
 | `wsUrl` / `token` | OneBot 正向 WS 地址与 token；同一台机器用 `127.0.0.1` |
 | `privateSessionTitle` | 私聊会话标题，默认 `qq-chat` |
 | `location` | 新会话的工作目录 |
-| `afterglow` | 私聊余波：`enabled` / `delayMs`（默认 30000）/ `maxRounds`（默认 2） |
+| `afterglow` | 私聊余波：`enabled` / `delayMs`（默认 60000）/ `maxRounds`（默认 2） |
 | `attachmentCleanup` / `attachmentRetentionDays` | `tmp/` 附件自动清理，默认 `true` / 7 天 |
 | `group` | 群聊：`enabled`、`keywords`、`interjectChance`、`afterReplyChance`、`judgeModel`、`judgeTimeoutMs`、`bannedWords` 等 |
 

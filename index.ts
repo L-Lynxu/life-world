@@ -1503,7 +1503,7 @@ function defaultConfig(): LifeWorldConfig {
       afterglow: {
         _说明: "私聊余波：她发完话没人回时，过多久补一句、最多补几轮；0 轮 = 关闭。",
         enabled: true,
-        delayMs: 30000,
+        delayMs: 60000,
         maxRounds: 2,
       },
       group: {
@@ -1626,7 +1626,7 @@ function normalizeConfig(config: LifeWorldConfig): LifeWorldConfig {
         ...afterglow,
         _说明: typeof afterglow._说明 === "string" ? afterglow._说明 : base.bridge.afterglow?._说明,
         enabled: bool(afterglow.enabled, true),
-        delayMs: Math.floor(num(afterglow.delayMs, 30000, 1000, 300_000)),
+        delayMs: Math.floor(num(afterglow.delayMs, 60000, 1000, 300_000)),
         maxRounds: Math.floor(num(afterglow.maxRounds, 2, 0, 5)),
       },
       group: {

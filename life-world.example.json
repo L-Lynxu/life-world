@@ -53,7 +53,7 @@
     "afterglow": {
       "_说明": "私聊余波：她发完话没人回时，过多久补一句、最多补几轮；0 轮 = 关闭。她会自己判断该不该说，只回 [SILENT] 就不发。",
       "enabled": true,
-      "delayMs": 30000,
+      "delayMs": 60000,
       "maxRounds": 2
     },
     "attachmentCleanup": true,
