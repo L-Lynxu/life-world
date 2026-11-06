@@ -130,7 +130,7 @@ prompt_cmd() { # $1 = status | diff | apply | reset
   local dir="$HOME/.local/share/life-world/worlds/default"
   local file="$dir/world-prompt.md"
   local next
-  next="$(ls -1 "$dir"/world-prompt.v*.new.md 2>/dev/null | tail -1)"
+  next="$(ls -1v "$dir"/world-prompt.v*.new.md 2>/dev/null | tail -1)"
   case "${1:-status}" in
     status)
       if [ ! -f "$file" ]; then

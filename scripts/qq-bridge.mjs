@@ -618,6 +618,8 @@ const afterglow = {
   watchdog: null,
   /** 看门狗放弃时记下当时的 userSeq：迟到的回复不再从第 1 轮续 */
   abandonedSeq: -1,
+  /** 这一拍余波她选择不说话（只回了 [SILENT]）：不发送，也不再续下一轮 */
+  silent: false,
 }
 
 function afterglowCfg() {
@@ -652,6 +654,7 @@ function userReturned() {
   afterglow.round = 0
   afterglow.spent = 0
   afterglow.abandonedSeq = -1
+  afterglow.silent = false
   clearAfterglowTimer()
   // 不摘看门狗：生成中的余波若一直不出正文，还要靠它把 inFlight/pending 收回来。
   // 看门狗自己会比对 userSeq，不会动用户新回合的窗口和「正在输入」。
@@ -706,6 +709,7 @@ async function fireAfterglow(round) {
     "【余波】对方还没回你，已经过了一会儿。",
     "不要假装他说话了，也不要重新打招呼。",
     "如果上一轮还有没说完的、想补一句解释、或者想问一句怎么不说话——现在补一句；一两句就够。",
+    "如果觉得这会儿不该说、没什么要补的，就只回 [SILENT]，这条不会发出去。",
     "直接写正文，不要调用 reach_out。",
   ].join("\n")
   runWindow = { start: Date.now(), end: 0, reaches: [] }
@@ -1824,10 +1828,23 @@ async function pollPrivate() {
     // 只按「真正发出去的回复」扣回合：只有工具调用、没有正文的 assistant 不算回合结束
     let sentTurns = 0
     let sentBuffered = false
+    let silentTurns = 0
     for (let i = 0; i < newer.length; i++) {
       const message = newer[i]
       const isLast = i === newer.length - 1
       const text = textOf(message)
+      // 余波允许她判断「这会儿不该说」：只回 [SILENT] 就不发，也不续下一轮
+      if (text && /^\[SILENT\]$/i.test(text.trim()) && afterglow.inFlight) {
+        silentTurns += 1
+        afterglow.silent = true
+        state.lastAssistantId = message.id
+        if (isLast && runWindow && !runWindow.end) {
+          runWindow.reaches = []
+          runWindow.end = Date.now()
+        }
+        saveState()
+        continue
+      }
       if (text) {
         const ok = await sendPrivate(text)
         if (!ok) {
@@ -1867,7 +1884,7 @@ async function pollPrivate() {
     // 下一次轮询才会重新进来重试剩下的回复。
     state.lastIdle = idle
     // 只有真正发出回复才扣回合；工具调用中间态不算，避免「正在输入」提前熄灭
-    const completed = sentTurns + (sentBuffered ? 1 : 0)
+    const completed = sentTurns + (sentBuffered ? 1 : 0) + silentTurns
     if (completed > 0) pendingPrivateTurns = Math.max(0, pendingPrivateTurns - completed)
     if (pendingPrivateTurns === 0) stopTyping(ownerQQ)
     // 余波：只有真的发出东西才处理
@@ -1878,7 +1895,12 @@ async function pollPrivate() {
         afterglow.inFlight = false
         afterglow.counted = false
         const cfg = afterglowCfg()
-        if (afterglow.seq === afterglow.userSeq) {
+        if (afterglow.silent) {
+          // 她自己判断这会儿不该说：到此为止，不再续
+          afterglow.silent = false
+          afterglow.spent = Math.max(afterglow.spent, afterglow.round)
+          afterglow.round = afterglow.spent
+        } else if (afterglow.seq === afterglow.userSeq) {
           afterglow.spent = Math.max(afterglow.spent, afterglow.round)
           if (cfg.enabled && afterglow.spent < cfg.maxRounds) armAfterglow(afterglow.spent + 1)
           else afterglow.round = afterglow.spent
@@ -1952,7 +1974,9 @@ async function sendOutboxMedia(item) {
   // 防御 outbox 被手改：只允许发 world 下 room / 表情包 / tmp 里的文件
   try { path = realpathSync(path) } catch { return { ok: false } }
   const worldRoot = dirname(OUTBOX_DIR)
-  const allowed = [join(worldRoot, "room"), join(worldRoot, "表情包"), join(worldRoot, "语音"), join(worldRoot, "tmp")]
+  // 白名单目录也 realpath 化：数据目录是软链接时不能把合法文件全拒了
+  const realDir = (dir) => { try { return realpathSync(dir) } catch { return dir } }
+  const allowed = [join(worldRoot, "room"), join(worldRoot, "表情包"), join(worldRoot, "语音"), join(worldRoot, "tmp")].map(realDir)
   if (!allowed.some((dir) => path === dir || path.startsWith(dir + sep))) {
     log("outbound media outside allowed dirs", path)
     return { ok: false }
