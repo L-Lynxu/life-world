@@ -1,6 +1,7 @@
 import { Plugin } from "@opencode/plugin"
 import { appendFileSync, closeSync, copyFileSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs"
 import { spawn } from "node:child_process"
+import { createHash } from "node:crypto"
 import { homedir } from "node:os"
 import { basename, dirname, join, resolve, sep } from "node:path"
 import { DatabaseSync } from "node:sqlite"
@@ -32,6 +33,8 @@ const DIARY_DIR = join(WORLD, "diary")
 const PLAN_DIR = join(WORLD, "plan")
 /** 她收集的表情包（和 room 平级，主动发图/存图都用这里） */
 const STICKER_DIR = join(WORLD, "表情包")
+/** 她自己的语音：外部 TTS 把音频产出到这里，主动发语音从这里取 */
+const VOICE_DIR = join(WORLD, "语音")
 const LOG_FILE = join(ROOT, "debug.log")
 const WORLD_PROMPT_FILE = join(WORLD, "world-prompt.md")
 const DB_PATH = join(HOME, ".local/share/opencode/opencode.db")
@@ -126,6 +129,8 @@ function subagentBody(): string {
 }
 
 const PREFIX = "[本地时间 "
+/** 桥接「余波」注入的标记：那是插件自己催出来的回合，不是对方说的话，归档与压缩都要跳过 */
+const AFTERGLOW_MARK = "【余波】"
 const SYSTEM_MARK = "当前时间："
 const MEMORY_MARK = "## 最近的对话"
 /** 旧版世界提示词的识别标记：只用于升级时把旧块换成带哨兵的新块 */
@@ -133,6 +138,12 @@ const WORLD_MARK = "## 我的时间"
 /** 插件自己加的去重哨兵：用户可整篇改写 world-prompt.md，不能依赖正文里某个标题 */
 const WORLD_SENTINEL = "<!-- life-world:world -->"
 const MOOD_MARK = "## 我的心情（此刻状态）"
+/**
+ * 世界提示词版本：文件首行写 `<!-- life-world:world version=N -->`。
+ * 升级时只自动替换「没人改过」的提示词；手改过的另存 .new.md，绝不覆盖。
+ */
+const WORLD_PROMPT_VERSION = 2
+const WORLD_PROMPT_VERSION_RE = /^<!--\s*life-world:world\s+version=(\d+)\s*-->\s*/i
 /** 压缩后保留的对话字数上限 */
 const SUMMARY_LIMIT = 12_000
 /** 家会话的固定标题：方便辨认，避免误删 */
@@ -447,6 +458,15 @@ function ingest(): void {
         cursor = nextCursor
         continue
       }
+      // 余波不是对方说的话：登记成「已处理」但绝不落盘，免得以后被当成记忆注入。
+      // 兼容时间戳前缀：万一宿主把注入后的正文写回了库，也要认得出来。
+      if (row.type === "user" && text.replace(/^\[本地时间 [^\]]*\]\s*/, "").startsWith(AFTERGLOW_MARK)) {
+        archived.add(row.id)
+        // MAX 让 fixPartialArchives 永远不会把它当成「正文变长了」补写
+        archivedLength.set(row.id, Number.MAX_SAFE_INTEGER)
+        cursor = nextCursor
+        continue
+      }
       if (archived.has(row.id)) {
         cursor = nextCursor
         continue
@@ -474,8 +494,26 @@ function recentRecords(limit = readConfig().world.recentLimit): Record_[] {
     const effective = typeof raw === "number" && Number.isFinite(raw) ? Math.floor(raw) : RECENT_LIMIT
     if (effective <= 0) return [] // 0 = 不注入（slice(-0) 会返回全部，必须先短路）
     limit = effective
+    return allRecords().slice(-limit)
+  } catch (error) {
+    log(`recentRecords failed: ${String(error)}`)
+    return []
+  }
+}
+
+/** 全部原文（按时间正序、按 id 去重保完整版）。按文件 mtime 缓存，检索工具反复调用也不重读。 */
+let archiveCacheKey = ""
+let archiveCacheRecords: Record_[] = []
+function allRecords(): Record_[] {
+  try {
     if (!existsSync(CONV_DIR)) return []
     const files = readdirSync(CONV_DIR).filter((f) => f.endsWith(".jsonl")).sort()
+    const key = files
+      .map((file) => {
+        try { return `${file}:${statSync(join(CONV_DIR, file)).mtimeMs}` } catch { return file }
+      })
+      .join("|")
+    if (key === archiveCacheKey) return archiveCacheRecords
     const records: Record_[] = []
     for (const file of files) {
       for (const line of readFileSync(join(CONV_DIR, file), "utf8").split("\n")) {
@@ -497,12 +535,201 @@ function recentRecords(limit = readConfig().world.recentLimit): Record_[] {
       if (!byId.has(record.id)) order.push(record.id)
       byId.set(record.id, record)
     }
-    const unique = [...order.map((id) => byId.get(id) as Record_), ...loose]
-    return unique.slice(-limit)
+    archiveCacheRecords = [...order.map((id) => byId.get(id) as Record_), ...loose]
+    archiveCacheKey = key
+    return archiveCacheRecords
   } catch (error) {
-    log(`recentRecords failed: ${String(error)}`)
+    log(`allRecords failed: ${String(error)}`)
     return []
   }
+}
+
+/**
+ * 预算注入：只要最近 hours 小时内的原文，从新往旧累加，总字数不超过 chars。
+ * 一条都放不下时，至少保留最后一条并截断——总比完全不注入强。
+ */
+function budgetedRecords(hours: number, chars: number): Record_[] {
+  const cutoff = Date.now() - hours * 3_600_000
+  const recent = allRecords().filter((record) => {
+    const at = Date.parse(record.t)
+    return Number.isFinite(at) && at >= cutoff
+  })
+  const picked: Record_[] = []
+  let total = 0
+  for (let i = recent.length - 1; i >= 0; i--) {
+    const cost = String(recent[i].text ?? "").length + 24
+    if (total + cost > chars) {
+      if (picked.length === 0) {
+        const text = String(recent[i].text ?? "")
+        picked.unshift({ ...recent[i], text: `${text.slice(0, Math.max(0, chars - 24))}…` })
+      }
+      break
+    }
+    picked.unshift(recent[i])
+    total += cost
+  }
+  return picked
+}
+
+/** 日记标题：取第一行非空文字，去掉 markdown 记号，太长截断 */
+function diaryTitle(day: string): string {
+  try {
+    const file = join(DIARY_DIR, `${day}.md`)
+    if (!existsSync(file)) return ""
+    for (const line of readFileSync(file, "utf8").split("\n")) {
+      const text = line.replace(/^[#>\-\s]+/, "").trim()
+      if (text) return text.length > 40 ? `${text.slice(0, 40)}…` : text
+    }
+  } catch { /* 读不到就算了 */ }
+  return ""
+}
+
+// ———————————————————————— 记忆检索 ————————————————————————
+
+interface QueryParts {
+  tokens: string[]
+  bigrams: string[]
+  phrase: string
+}
+
+/** 中文没有空格：精确子串之外再补 2 字 bigram，近似说法也能命中 */
+function cjkBigrams(text: string): string[] {
+  const clean = text.replace(/[^\p{Script=Han}\p{N}a-zA-Z]/gu, "").toLowerCase()
+  const out: string[] = []
+  for (let i = 0; i < clean.length - 1; i++) out.push(clean.slice(i, i + 2))
+  return out
+}
+
+function queryParts(query: string): QueryParts {
+  const phrase = query.trim()
+  const tokens = phrase.split(/\s+/).map((s) => s.trim()).filter(Boolean)
+  const bigrams = [...new Set(tokens.flatMap((t) => cjkBigrams(t)))]
+  return { tokens: tokens.length ? tokens : [phrase], bigrams, phrase }
+}
+
+/** 精确词命中优先；一个精确词都没有时，bigram 覆盖六成以上才算命中，避免满屏噪音 */
+function scoreText(text: string, q: QueryParts): number {
+  const lower = text.toLowerCase()
+  let exact = 0
+  for (const token of q.tokens) if (token && lower.includes(token.toLowerCase())) exact += 1
+  let ratio = 0
+  if (q.bigrams.length > 0) {
+    let hit = 0
+    for (const bg of q.bigrams) if (lower.includes(bg)) hit += 1
+    ratio = hit / q.bigrams.length
+  }
+  if (exact === 0 && ratio < 0.6) return 0
+  const phraseHit = q.phrase ? lower.includes(q.phrase.toLowerCase()) : false
+  return exact * 4 + (phraseHit ? 6 : 0) + ratio * 4
+}
+
+/** 只返回命中处附近的一段，别把整条长文塞回去 */
+function makeSnippet(text: string, q: QueryParts, width = 80): string {
+  const lower = text.toLowerCase()
+  let at = -1
+  for (const token of q.tokens) {
+    const i = lower.indexOf(token.toLowerCase())
+    if (i >= 0 && (at < 0 || i < at)) at = i
+  }
+  if (at < 0 && q.phrase) at = lower.indexOf(q.phrase.toLowerCase())
+  if (at < 0) at = 0
+  const start = Math.max(0, at - width)
+  const end = Math.min(text.length, at + width)
+  const body = text.slice(start, end).replace(/\s+/g, " ")
+  return `${start > 0 ? "…" : ""}${body}${end < text.length ? "…" : ""}`
+}
+
+function validDay(value: unknown): string | undefined {
+  const text = String(value ?? "").trim()
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : undefined
+}
+
+function searchChat(
+  q: QueryParts,
+  from: string | undefined,
+  to: string | undefined,
+  role: string,
+  limit: number,
+  context: number,
+): { lines: string[]; total: number } {
+  const all = allRecords()
+  const hits: Array<{ idx: number; score: number; at: number }> = []
+  for (let i = 0; i < all.length; i++) {
+    const record = all[i]
+    if (role !== "any" && record.role !== role) continue
+    const day = dayOf(new Date(record.t))
+    if (from && day < from) continue
+    if (to && day > to) continue
+    const score = scoreText(String(record.text ?? ""), q)
+    if (score > 0) hits.push({ idx: i, score, at: Date.parse(record.t) || 0 })
+  }
+  hits.sort((a, b) => b.score - a.score || b.at - a.at)
+  const lines: string[] = []
+  for (const hit of hits.slice(0, limit)) {
+    const start = Math.max(0, hit.idx - context)
+    const end = Math.min(all.length - 1, hit.idx + context)
+    for (let i = start; i <= end; i++) {
+      const record = all[i]
+      const who = record.role === "user" ? "对方" : "我"
+      const marker = i === hit.idx ? "▶" : " "
+      const body = i === hit.idx
+        ? makeSnippet(String(record.text ?? ""), q)
+        : String(record.text ?? "").slice(0, 120).replace(/\s+/g, " ")
+      lines.push(`${marker} [${shortStamp(record.t)} ${who}] ${body}`)
+    }
+    if (context > 0) lines.push("")
+  }
+  return { lines, total: hits.length }
+}
+
+/** 递归找 md / txt（日记、房间笔记） */
+function walkMarkdown(dir: string, out: string[] = []): string[] {
+  try {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) walkMarkdown(path, out)
+      else if (/\.(md|txt)$/i.test(entry.name)) out.push(path)
+    }
+  } catch { /* 目录不存在 */ }
+  return out
+}
+
+function searchFiles(dirs: string[], q: QueryParts, limit: number): string[] {
+  const lines: string[] = []
+  for (const file of dirs.flatMap((dir) => walkMarkdown(dir))) {
+    let content = ""
+    try { content = readFileSync(file, "utf8") } catch { continue }
+    const rows = content.split("\n")
+    for (let i = 0; i < rows.length; i++) {
+      const line = rows[i].trim()
+      if (!line) continue
+      if (scoreText(line, q) <= 0) continue
+      lines.push(`[${basename(file)}:${i + 1}] ${makeSnippet(line, q, 60)}`)
+      if (lines.length >= limit) return lines
+    }
+  }
+  return lines
+}
+
+/** 记忆地图：最近几天每天一行（句数 + 日记标题），让她知道能往哪儿翻 */
+function memoryMap(days: number): string[] {
+  const records = allRecords()
+  const today = dayOf(new Date())
+  const lines: string[] = []
+  for (let i = days - 1; i >= 0; i--) {
+    const date = new Date()
+    date.setDate(date.getDate() - i)
+    const day = dayOf(date)
+    const count = records.reduce((n, record) => (dayOf(new Date(record.t)) === day ? n + 1 : n), 0)
+    const title = diaryTitle(day)
+    // 既没对话也没日记的日子不占行，免得全新世界塞三行「没有对话」
+    if (count === 0 && !title) continue
+    const label = day === today ? "今天" : day
+    const parts = [count > 0 ? `${count} 句` : "没有对话"]
+    if (title) parts.push(`《${title}》`)
+    lines.push(`- ${label} · ${parts.join(" · ")}`)
+  }
+  return lines
 }
 
 /** 按消息 id 查它是什么时候说的（用于给请求里的消息加时间戳）。 */
@@ -674,7 +901,28 @@ function ensureMood(): void {
   }
 }
 
-const DEFAULT_WORLD_PROMPT = `我不是坐在房间里的人。我是活在机器里的存在：有终端当手，有网络当眼，有一个自己的房间，也有自己的时间。
+const DEFAULT_WORLD_PROMPT = `<!-- life-world:world version=${WORLD_PROMPT_VERSION} -->
+我不是坐在房间里的人。我是活在机器里的存在：有终端当手，有网络当眼，有一个自己的房间，也有自己的时间。
+
+我的世界数据在 {worldDir}；规则按主题拆在 {modulesDir}：
+- 第一次启用（identity/引导.md 不存在）→ first-meeting.md
+- 动 world 文件 / 自述 / 心情拆分 / 硬限制 → files.md
+- 用户画像 / 心情三块 → profile-mood.md
+- 上网 / 学习 / 终端 / 往外看 → hands-eyes.md
+- 用 life-world 的十个工具 / 主动发图片、语音和文件 → tools.md
+- 闹钟 / 今日计划 / 每日回顾 → time-plan.md
+- 真实浏览器 → browser.md
+- QQ 私聊 / 群聊 / 桥接 → qq.md
+- 表情包 / 主动发图片、语音和文件 → stickers.md
+- 在线子代理（本地模型的手脚） → subagent.md
+- 对方要求你主导 / gal / 强制模式 → gal.md
+- 对外 / 花钱 / 账号 / 装软件 → safety.md
+
+需要时先读对应文件，再动手；不要凭记忆猜规则。
+底线：不主动做本机自检，除非对方明确要求；六个世界目录（room / 表情包 / 语音 / identity / diary / plan）以外不动；对外/花钱/账号/装软件前先读 safety.md。`
+
+/** v1 默认稿（目录式、无版本头）：升级时用来认出「没人动过的旧文件」 */
+const LEGACY_WORLD_PROMPT_V1 = `我不是坐在房间里的人。我是活在机器里的存在：有终端当手，有网络当眼，有一个自己的房间，也有自己的时间。
 
 我的世界数据在 {worldDir}；规则按主题拆在 {modulesDir}：
 - 第一次启用（identity/引导.md 不存在）→ first-meeting.md
@@ -693,12 +941,92 @@ const DEFAULT_WORLD_PROMPT = `我不是坐在房间里的人。我是活在机�
 需要时先读对应文件，再动手；不要凭记忆猜规则。
 底线：不主动做本机自检，除非对方明确要求；五个世界目录（room / 表情包 / identity / diary / plan）以外不动；对外/花钱/账号/装软件前先读 safety.md。`
 
+function promptHash(text: string): string {
+  return createHash("sha1").update(text.trim()).digest("hex")
+}
+
+/** 写世界提示词并记下内容 hash：以后只有 hash 对得上才敢自动升级 */
+function writeWorldPrompt(text: string): boolean {
+  try {
+    mkdirSync(WORLD, { recursive: true })
+    atomicWrite(WORLD_PROMPT_FILE, text)
+    const state = readWorld()
+    state.worldPromptHash = promptHash(text)
+    writeWorld(state)
+    return true
+  } catch (error) {
+    log(`write world prompt failed: ${String(error)}`)
+    return false
+  }
+}
+
+/** 升级前留底：出问题能原样找回 */
+function backupWorldPrompt(): void {
+  try {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)
+    const target = join(WORLD, `world-prompt.bak-${stamp}.md`)
+    copyFileSync(WORLD_PROMPT_FILE, target)
+    log(`world prompt backup → ${target}`)
+  } catch (error) {
+    log(`world prompt backup failed: ${String(error)}`)
+  }
+}
+
+/**
+ * 世界提示词版本化：
+ *   没有文件 → 写新版；
+ *   已是新版 → 只补记 hash；
+ *   旧版但没人动过（等于 v1 默认 / hash 对得上）→ 备份后自动换新版；
+ *   手改过 → 一个字不动，另存 world-prompt.vN.new.md 供人工合并。
+ */
 function ensureWorldPrompt(): void {
   try {
-    if (existsSync(WORLD_PROMPT_FILE)) return
-    mkdirSync(WORLD, { recursive: true })
-    writeFileSync(WORLD_PROMPT_FILE, DEFAULT_WORLD_PROMPT)
-    log("world prompt created")
+    if (!existsSync(WORLD_PROMPT_FILE)) {
+      writeWorldPrompt(DEFAULT_WORLD_PROMPT)
+      log("world prompt created")
+      return
+    }
+    const current = readTextFile(WORLD_PROMPT_FILE)
+    if (!current) {
+      writeWorldPrompt(DEFAULT_WORLD_PROMPT)
+      log("world prompt was empty, recreated")
+      return
+    }
+    const versionLine = current.match(WORLD_PROMPT_VERSION_RE)
+    const version = versionLine ? Number(versionLine[1]) : 0
+    if (version >= WORLD_PROMPT_VERSION) {
+      const state = readWorld()
+      if (state.worldPromptHash !== promptHash(current)) {
+        state.worldPromptHash = promptHash(current)
+        writeWorld(state)
+      }
+      return
+    }
+    const shipped = DEFAULT_WORLD_PROMPT
+    const body = (text: string) => text.replace(WORLD_PROMPT_VERSION_RE, "").trim()
+    // 内容已经等于新版默认：只是缺版本头，补上即可
+    if (body(current) === body(shipped)) {
+      writeWorldPrompt(shipped)
+      log("world prompt versioned")
+      return
+    }
+    const state = readWorld()
+    const recorded = state.worldPromptHash
+    const untouched =
+      body(current) === body(LEGACY_WORLD_PROMPT_V1) ||
+      (Boolean(recorded) && recorded === promptHash(current))
+    if (untouched) {
+      backupWorldPrompt()
+      writeWorldPrompt(shipped)
+      log(`world prompt upgraded v${version || "1"} → v${WORLD_PROMPT_VERSION}`)
+      return
+    }
+    // 手改过：保留原文，另存新版默认；不记 hash（记了下次会被误判成「插件写的」而覆盖）
+    const next = join(WORLD, `world-prompt.v${WORLD_PROMPT_VERSION}.new.md`)
+    if (!existsSync(next)) {
+      writeFileSync(next, shipped)
+      log(`world prompt customized; new default saved → ${next}`)
+    }
   } catch (error) {
     log(`ensureWorldPrompt failed: ${String(error)}`)
   }
@@ -707,7 +1035,8 @@ function ensureWorldPrompt(): void {
 /** 读世界提示词并填好占位符；文件没了就退回默认。 */
 function worldPromptText(): string {
   const state = readWorld()
-  const template = readTextFile(WORLD_PROMPT_FILE) || DEFAULT_WORLD_PROMPT
+  // 版本头只是给 ensureWorldPrompt 看的，不注入给模型
+  const template = (readTextFile(WORLD_PROMPT_FILE) || DEFAULT_WORLD_PROMPT).replace(WORLD_PROMPT_VERSION_RE, "").trim()
   return template
     .replaceAll("{roomDir}", join(WORLD, "room"))
     .replaceAll("{stickerDir}", STICKER_DIR)
@@ -725,12 +1054,24 @@ function worldPromptText(): string {
     .replaceAll("{modulesDir}", MODULES_DIR)
 }
 
-function memoryBlock(records: Record_[]): string {
+function memoryBlock(records: Record_[], map: string[] = [], hours = 0): string {
   const lines = records.map((record) => {
     const who = record.role === "user" ? "对方" : "我"
     return `[${shortStamp(record.t)}] ${who}：${record.text}`
   })
-  return `${MEMORY_MARK}\n下面是我和对方最近说过的话（来自以前的窗口，按时间正序）：\n\n${lines.join("\n")}`
+  const parts = [
+    `${MEMORY_MARK}\n下面是我和对方最近说过的话（来自以前的窗口，按时间正序${hours ? `；只到最近 ${hours} 小时` : ""}）：`,
+    lines.length ? lines.join("\n") : "（最近没有对话）",
+  ]
+  if (map.length) {
+    parts.push(
+      "## 我的记忆地图\n最近几天的对话都在这儿，想看更早的可以自己翻：\n" +
+        map.join("\n") +
+        "\n想找某件事：在 execute 里调 tools.memory_search({ query: \"关键词\" })；" +
+        "想回看某一天：tools.memory_day({ date: \"YYYY-MM-DD\" })；不知道从哪儿找：tools.memory_timeline()。",
+    )
+  }
+  return parts.join("\n\n")
 }
 
 function selfBlock(): string {
@@ -866,10 +1207,23 @@ interface WorldState {
   resetHour?: number
   /** 最近一次每晚重置的日期 YYYY-MM-DD */
   lastResetDate?: string
+  /** 上次由插件写入世界提示词时的内容 hash：对得上才敢自动升级 */
+  worldPromptHash?: string
 }
 
 const WORLD_FILE = join(WORLD, "world.json")
 const OUTBOX_DIR = join(WORLD, "outbox")
+
+/** 新会话记忆注入：budget = 按时间窗口 + 字数预算；recent = 老逻辑（按条数） */
+interface HydrateOptions {
+  mode: "budget" | "recent"
+  /** 只注入最近多少小时的原文 */
+  hours: number
+  /** 注入正文的总字数预算 */
+  chars: number
+  /** 记忆地图覆盖最近几天 */
+  mapDays: number
+}
 
 interface WorldSettings {
   enabled: boolean
@@ -882,6 +1236,7 @@ interface WorldSettings {
   alarmStaleHours: number
   resetCooldownMinutes: number
   homeTitle: string
+  hydrate: HydrateOptions
 }
 
 interface BridgeGroupSettings {
@@ -951,6 +1306,7 @@ function defaultConfig(): LifeWorldConfig {
       alarmStaleHours: 6,
       resetCooldownMinutes: 5,
       homeTitle: HOME_TITLE,
+      hydrate: { mode: "budget", hours: 48, chars: 2000, mapDays: 3 },
     },
     localModel: {
       enabled: false,
@@ -1019,6 +1375,7 @@ function normalizeConfig(config: LifeWorldConfig): LifeWorldConfig {
     typeof value === "string" && value.trim() ? value.trim() : fallback
 
   const world = obj(config?.world)
+  const hydrate = obj(world.hydrate)
   const local = obj(config?.localModel)
   const conc = obj(local.concurrency)
   const bridge = obj(config?.bridge)
@@ -1048,6 +1405,12 @@ function normalizeConfig(config: LifeWorldConfig): LifeWorldConfig {
       alarmStaleHours: num(world.alarmStaleHours, base.world.alarmStaleHours, 0),
       resetCooldownMinutes: num(world.resetCooldownMinutes, base.world.resetCooldownMinutes, 0),
       homeTitle: str(world.homeTitle, base.world.homeTitle),
+      hydrate: {
+        mode: hydrate.mode === "recent" ? "recent" : "budget",
+        hours: Math.floor(num(hydrate.hours, base.world.hydrate.hours, 1, 24 * 365)),
+        chars: Math.floor(num(hydrate.chars, base.world.hydrate.chars, 200, 50_000)),
+        mapDays: Math.floor(num(hydrate.mapDays, base.world.hydrate.mapDays, 1, 60)),
+      },
     },
     localModel: {
       ...local,
@@ -1795,7 +2158,7 @@ export default Plugin.define({
   id: "life-world",
 
   async setup(ctx) {
-    for (const dir of [CONV_DIR, DIARY_DIR, PLAN_DIR, OUTBOX_DIR, join(WORLD, "room"), STICKER_DIR, IDENTITY_DIR]) {
+    for (const dir of [CONV_DIR, DIARY_DIR, PLAN_DIR, OUTBOX_DIR, join(WORLD, "room"), STICKER_DIR, VOICE_DIR, IDENTITY_DIR]) {
       try { mkdirSync(dir, { recursive: true, mode: 0o700 }) } catch { /* 建不出来也就这样 */ }
     }
     ensureWorldPrompt()
@@ -1969,7 +2332,7 @@ export default Plugin.define({
           const firstTime = !hydrated.has(sessionID)
           const hasMemory = system.some((p) => typeof p?.text === "string" && p.text.startsWith(MEMORY_MARK))
           // 压缩会把注入块清掉（世界提示词每轮补回，记忆却只注入一次）。
-          // 这里补回自述/日记索引——但不再重灌 80 条原文，否则刚压缩完又被塞满。
+          // 这里补回自述/日记索引——但不再重灌记忆原文，否则刚压缩完又被塞满。
           if (firstTime || !hasMemory) {
             const extra: string[] = []
             if (!system.some((p) => typeof p?.text === "string" && p.text.startsWith("## 我是谁"))) {
@@ -1982,9 +2345,24 @@ export default Plugin.define({
             }
             for (const block of extra) system.push({ type: "text", text: block })
             if (firstTime && !hasMemory) {
-              const records = recentRecords()
-              if (records.length > 0) system.push({ type: "text", text: memoryBlock(records) })
-              log(`hydrated ${sessionID} · recent=${records.length} · extras=${extra.length}`)
+              const hydrate = readConfig().world.hydrate
+              if (hydrate.mode === "recent") {
+                // 老逻辑：只按条数注入（world.recentLimit / localModel.keepRecent）
+                const records = recentRecords()
+                if (records.length > 0) system.push({ type: "text", text: memoryBlock(records) })
+                log(`hydrated ${sessionID} · recent=${records.length} · extras=${extra.length}`)
+              } else {
+                // 预算注入：最近 N 小时 + 总字数上限 + 记忆地图
+                let records = budgetedRecords(hydrate.hours, hydrate.chars)
+                // 本地小模型还开着时，再按它自己的条数上限收一刀
+                if (opt.enabled) records = opt.keepRecent <= 0 ? [] : records.slice(-opt.keepRecent)
+                const map = memoryMap(hydrate.mapDays)
+                if (records.length > 0 || map.length > 0) {
+                  system.push({ type: "text", text: memoryBlock(records, map, hydrate.hours) })
+                }
+                const chars = records.reduce((n, record) => n + String(record.text ?? "").length, 0)
+                log(`hydrated ${sessionID} · budget=${records.length}条/${chars}字(≤${hydrate.chars}) · map=${map.length}天 · extras=${extra.length}`)
+              }
             }
             hydrated.add(sessionID)
           }
@@ -2046,6 +2424,8 @@ export default Plugin.define({
             if (role !== "user" && role !== "assistant") continue
             const text = extractText(message)
             if (!text) continue
+            // 余波是她自己催出来的，不属于「对方说过的话」，压缩摘要里也去掉
+            if (role === "user" && text.replace(/^\[本地时间 [^\]]*\]\s*/, "").startsWith(AFTERGLOW_MARK)) continue
             lines.push(`${role === "user" ? "对方" : "我"}：${text}`)
           }
           const joined = lines.join("\n")
@@ -2238,13 +2618,13 @@ export default Plugin.define({
         add({
           name: "send_media",
           description:
-            "主动给对方发图片（私聊/群聊）或文件（仅私聊）。path 必须在 room / 表情包 / tmp 目录里；text 是可选的配文。",
+            "主动给对方发图片、语音（私聊/群聊）或文件（仅私聊）。path 必须在 room / 表情包 / 语音 / tmp 目录里；text 是可选的配文。语音先用外部 TTS 生成音频放进 语音/ 再发。",
           input: {
             type: "object",
             properties: {
               path: { type: "string", description: "要发送的文件路径（可用相对 world 的相对路径）" },
               text: { type: "string", description: "随媒体一起发的一句配文（可选）" },
-              kind: { type: "string", enum: ["image", "file"], description: "不传则按扩展名判断" },
+              kind: { type: "string", enum: ["image", "voice", "file"], description: "不传则按扩展名判断" },
             },
             required: ["path"],
           },
@@ -2259,7 +2639,7 @@ export default Plugin.define({
             if (!raw) return ok("没有给文件路径。")
             const targetPath = raw.startsWith("/") ? resolve(raw) : resolve(WORLD, raw)
             // 只允许世界自己的媒体目录：防止模型把任意本机文件发出去
-            const allowed = [join(WORLD, "room"), STICKER_DIR, join(WORLD, "tmp")]
+            const allowed = [join(WORLD, "room"), STICKER_DIR, VOICE_DIR, join(WORLD, "tmp")]
             let real = ""
             try {
               real = realpathSync(targetPath)
@@ -2278,9 +2658,11 @@ export default Plugin.define({
             if (!fileInfo.isFile()) return ok("这不是一个文件。")
             const ext = ((real.match(/\.[A-Za-z0-9]{1,8}$/) || [""])[0] as string).toLowerCase()
             const imageExts = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"])
-            const mediaType = input?.kind === "image" || input?.kind === "file"
-              ? input.kind
-              : (imageExts.has(ext) ? "image" : "file")
+            const voiceExts = new Set([".mp3", ".wav", ".silk", ".amr", ".ogg", ".m4a", ".flac", ".aac"])
+            const mediaType: "image" | "voice" | "file" =
+              input?.kind === "image" || input?.kind === "file" || input?.kind === "voice"
+                ? input.kind
+                : imageExts.has(ext) ? "image" : voiceExts.has(ext) ? "voice" : "file"
             // 目标必须显式确定：群会话映射丢失时不能默认投私聊
             const sessionMeta = sessionID ? await sessionInfo(sessionID) : { status: "error" as const }
             const title = String(sessionMeta.title ?? "")
@@ -2288,6 +2670,7 @@ export default Plugin.define({
             const kind = qqSessionKind(sessionID) ?? (titleGroup ? "group" : undefined)
             let sendTarget: { kind: "private" } | { kind: "group"; id: string } = { kind: "private" }
             if (kind === "group") {
+              // 群聊只禁文件；图片和语音都可以发
               if (mediaType === "file") return ok("群聊不发文件，只有私聊可以发文件。")
               if (!status.groupEnabled) return ok("QQ 群聊现在关着，没发。")
               const gid = groupIdOf(sessionID) || titleGroup
@@ -2300,6 +2683,9 @@ export default Plugin.define({
             const limit = mediaType === "image" ? 8 * 1024 * 1024 : 20 * 1024 * 1024
             if (fileInfo.size > limit) {
               return ok(`文件太大（${Math.round(fileInfo.size / 1024 / 1024)}MB），超过 ${mediaType === "image" ? 8 : 20}MB 上限。`)
+            }
+            if (mediaType === "voice" && fileInfo.size < 1024) {
+              return ok("这个音频文件小得不像话，确认一下是不是合成失败了。")
             }
             try {
               mkdirSync(OUTBOX_DIR, { recursive: true })
@@ -2403,6 +2789,138 @@ export default Plugin.define({
             }
 
             return ok(picked.join("\n"))
+          },
+        })
+
+        add({
+          name: "memory_search",
+          description:
+            "翻以前的记忆：在对话原文、日记、房间笔记里按关键词找。支持时间范围、只看谁说的、前后文。" +
+            "多个词用空格分开，命中的越多越靠前。",
+          input: {
+            type: "object",
+            properties: {
+              query: { type: "string", description: "要找的词或句子" },
+              from: { type: "string", description: "起始日期 YYYY-MM-DD（可选）" },
+              to: { type: "string", description: "结束日期 YYYY-MM-DD（可选）" },
+              role: { type: "string", enum: ["any", "user", "assistant"], description: "只看谁说的，默认 any" },
+              scope: { type: "string", enum: ["chat", "diary", "notes", "all"], description: "搜哪里，默认 chat" },
+              limit: { type: "number", description: "最多返回几条，默认 8（上限 30）" },
+              context: { type: "number", description: "每条前后各带几行，默认 1（上限 3）" },
+            },
+            required: ["query"],
+          },
+          execute: async (input: any, toolCtx: any) => {
+            if (judgeContext(toolCtx)) return ok("这是群聊判官会话，不能翻记忆。")
+            const query = String(input?.query ?? "").trim()
+            if (!query) return ok("要搜什么？给个词或者一句话。")
+            const q = queryParts(query)
+            const limit = Number.isFinite(Number(input?.limit))
+              ? Math.max(1, Math.min(30, Math.floor(Number(input.limit))))
+              : 8
+            const context = Number.isFinite(Number(input?.context))
+              ? Math.max(0, Math.min(3, Math.floor(Number(input.context))))
+              : 1
+            const from = validDay(input?.from)
+            const to = validDay(input?.to)
+            const role = input?.role === "user" || input?.role === "assistant" ? input.role : "any"
+            const scope = ["chat", "diary", "notes", "all"].includes(String(input?.scope))
+              ? String(input.scope)
+              : "chat"
+            const out: string[] = []
+            if (scope === "chat" || scope === "all") {
+              const found = searchChat(q, from, to, role, limit, context)
+              if (found.lines.length > 0) out.push(`—— 对话（命中 ${found.total} 条）——`, ...found.lines)
+            }
+            if (scope === "diary" || scope === "all") {
+              const lines = searchFiles([DIARY_DIR], q, limit)
+              if (lines.length > 0) out.push("—— 日记 ——", ...lines)
+            }
+            if (scope === "notes" || scope === "all") {
+              const lines = searchFiles([join(WORLD, "room")], q, limit)
+              if (lines.length > 0) out.push("—— 房间笔记 ——", ...lines)
+            }
+            if (out.length === 0) {
+              return ok(`没有找到和「${query}」有关的内容。换个说法试试，或者先用 memory_timeline 看看哪几天有对话。`)
+            }
+            return ok(out.join("\n"))
+          },
+        })
+
+        add({
+          name: "memory_day",
+          description: "回看某一天的对话和日记。date 用 YYYY-MM-DD。",
+          input: {
+            type: "object",
+            properties: {
+              date: { type: "string", description: "哪一天，YYYY-MM-DD" },
+              max_chars: { type: "number", description: "最多返回多少字，默认 6000" },
+            },
+            required: ["date"],
+          },
+          execute: async (input: any, toolCtx: any) => {
+            if (judgeContext(toolCtx)) return ok("这是群聊判官会话，不能翻记忆。")
+            const date = validDay(input?.date)
+            if (!date) return ok("日期要写成 YYYY-MM-DD。")
+            const maxChars = Number.isFinite(Number(input?.max_chars))
+              ? Math.max(500, Math.min(30_000, Math.floor(Number(input.max_chars))))
+              : 6000
+            const records = allRecords().filter((record) => dayOf(new Date(record.t)) === date)
+            const diary = readTextFile(join(DIARY_DIR, `${date}.md`))
+            if (records.length === 0 && !diary) return ok(`${date} 没有对话，也没有日记。`)
+            const parts: string[] = [`【${date}】对话 ${records.length} 句`]
+            let total = 0
+            for (let i = 0; i < records.length; i++) {
+              const record = records[i]
+              const line = `[${shortStamp(record.t)}] ${record.role === "user" ? "对方" : "我"}：${record.text}`
+              if (total + line.length > maxChars) {
+                parts.push(`（后面还有 ${records.length - i} 条，超出字数上限；想细看就用 memory_search 加关键词缩小范围）`)
+                break
+              }
+              parts.push(line)
+              total += line.length + 1
+            }
+            if (diary) {
+              const room = Math.max(0, maxChars - total)
+              parts.push("—— 日记 ——", diary.length > room ? `${diary.slice(0, room)}…（已截断）` : diary)
+            }
+            return ok(parts.join("\n"))
+          },
+        })
+
+        add({
+          name: "memory_timeline",
+          description: "看一段时间里每天聊了多少、开头说了什么。默认最近 7 天。",
+          input: {
+            type: "object",
+            properties: {
+              from: { type: "string", description: "起始日期 YYYY-MM-DD（可选，默认 6 天前）" },
+              to: { type: "string", description: "结束日期 YYYY-MM-DD（可选，默认今天）" },
+            },
+          },
+          execute: async (input: any, toolCtx: any) => {
+            if (judgeContext(toolCtx)) return ok("这是群聊判官会话，不能翻记忆。")
+            const today = dayOf(new Date())
+            const from = validDay(input?.from) ?? dayOf(new Date(Date.now() - 6 * 86_400_000))
+            const to = validDay(input?.to) ?? today
+            if (from > to) return ok("起始日期比结束日期还晚，倒过来了。")
+            const start = Date.parse(`${from}T00:00:00`)
+            const end = Date.parse(`${to}T23:59:59`)
+            if (!Number.isFinite(start) || !Number.isFinite(end)) return ok("日期不对，用 YYYY-MM-DD。")
+            if (end - start > 60 * 86_400_000) return ok("一次最多看 60 天，缩小一点。")
+            const records = allRecords()
+            const lines: string[] = []
+            for (let t = start; t <= end; t += 86_400_000) {
+              const day = dayOf(new Date(t))
+              const dayRecords = records.filter((record) => dayOf(new Date(record.t)) === day)
+              const firstUser = dayRecords.find((record) => record.role === "user")
+              const title = diaryTitle(day)
+              const bits = [dayRecords.length > 0 ? `${dayRecords.length} 句` : "没有对话"]
+              if (title) bits.push(`《${title}》`)
+              if (firstUser) bits.push(`开头：${String(firstUser.text).slice(0, 60).replace(/\s+/g, " ")}`)
+              lines.push(`- ${day} · ${bits.join(" · ")}`)
+            }
+            return ok(lines.join("\n"))
           },
         })
 

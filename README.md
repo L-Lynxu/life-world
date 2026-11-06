@@ -14,11 +14,12 @@
 | 时间上下文 | 每轮把「当前时间 + 时区」写进 system |
 | 消息时间戳 | 用户消息正文前加 `[本地时间 YYYY-MM-DD HH:mm TZ]` |
 | 原文归档 | 读 `~/.local/share/opencode/opencode.db` 的 `session_message`，按天写 `conversations/*.jsonl`，含 assistant |
-| 跨窗口记忆 | 新会话第一次请求时，注入最近 80 条原文（`RECENT_LIMIT`，优化开关打开时可调低）+ 自述 + 日记索引 |
-| 生活线工具 | `plan_next` / `check_alarm` / `cancel_alarm` / `reach_out` / `send_media`（主动发图片/文件；多闹钟，`alarms` 数组）；**只能通过 `execute` 调**（`await tools.plan_next(...)`），不能点名直呼 |
+| 跨窗口记忆 | 新会话第一次请求时，注入**最近 48 小时、总字数不超过 2000 的原文** + 最近 3 天记忆地图 + 自述 + 日记索引（`world.hydrate` 可调；`mode: "recent"` 退回旧的按条数注入） |
+| **记忆检索** | `memory_search`（关键词/时间范围，搜对话/日记/房间笔记）、`memory_day`（回看某天）、`memory_timeline`（一段时间每天聊了什么） |
+| 生活线工具 | `plan_next` / `check_alarm` / `cancel_alarm` / `reach_out` / `send_media`（图片/语音/文件；多闹钟，`alarms` 数组）；**只能通过 `execute` 调**（`await tools.plan_next(...)`），不能点名直呼 |
 | 闹钟 | 每 30 秒检查 `world.json`，到点经共享服务 HTTP 接口唤醒家会话；发送成功才移除 |
 | 每日回顾 | 默认 23 点后一天一次，回看、写日记、改写自述、更新用户画像；发送成功才记账 |
-| 世界提示词 | `world-prompt.md`，首次运行生成，可自行改写 |
+| 世界提示词 | `world-prompt.md`，首次运行生成，可自行改写；**带版本号**，升级只自动替换没改过的，手改过的另存 `.new.md` |
 | 早上兜底 | **今天**没排着闹钟时，在 `fallbackWakeTime` 后 4 小时内叫醒一次，自己拟全天计划（跨天的闹钟不算） |
 | 今日计划 | `plan/YYYY-MM-DD.md` |
 | 颜文字 | `kaomoji` 工具按场景随机取；`remember: true` 收进 `room/颜文字.md`；库可用 `bin/kaomoji-update.mjs` 从 npm 更新 |
@@ -29,6 +30,8 @@
 | 真实浏览器 | `scripts/browser-*` 开带调试口的 Chrome、读浏览历史、关掉 |
 | QQ 桥接（可选） | `scripts/qq-bridge.mjs`：接任意 **OneBot v11 正向 WebSocket**（NapCat、SnowLuma 等）↔ `qq-chat` 会话；每行一条消息、真人节奏；开关状态会注入给角色 |
 | **主动消息 outbox** | `reach_out` 写 `outbox/YYYY-MM-DD.jsonl`；桥接每 2 秒投递，**断线/跨天后自动补发最近 3 天未送出的**；`bin/life-world.sh inbox [天数]` 可回看她主动说过什么 |
+| **语音** | 不内置 TTS：外部 TTS 把音频放进 `语音/`，`send_media({ kind: "voice" })` 以 OneBot `record` 段发送；私聊/群聊都支持，失败时私聊退成文件 |
+| **QQ 私聊余波** | 她发完话 30 秒没人回 → 补一轮；再 30 秒还没人回 → 再补一轮（默认最多 2 轮，`bridge.afterglow` 可调）；主动推送不触发余波 |
 | 压缩 | 只保留对话正文，去掉工具调用过程 |
 | 初次引导 | 首次启用时读 `modules/first-meeting.md`：介绍能力、问要不要接 QQ、引导配置 |
 | **本地小模型优化（可选）** | `life-world.json` 的 `localModel`：折叠工具结果/旧推理、压缩注入条数、提示用在线子模型当子代理。**默认关闭** |
@@ -67,7 +70,10 @@ opencode service restart
 
 `install.sh` 只更新插件与脚本，**不碰世界数据**。
 
-注意：`worlds/default/world-prompt.md` 是每个世界一份，插件不会自动覆盖它。想让角色拿到新版默认提示词，先备份再删掉这个文件（或手动把新段落合并进去）；文件会在下次插件加载时用新默认重建，**重启 opencode 服务并开新会话（或等下一次压缩）后生效**。自定义过的提示词请手动合并，别直接删。
+注意：`worlds/default/world-prompt.md` 是每个世界一份，**带版本号**（首行 `<!-- life-world:world version=N -->`）。升级时：
+- 没改过的（等于旧版默认，或插件上次写入的 hash 对得上）→ 备份后**自动换新版**；
+- 手改过的 → **一个字不动**，另存 `world-prompt.vN.new.md`，用 `life-world.sh prompt diff` 看差异、`prompt apply` 手动合并；
+- `life-world.sh prompt status | diff | apply | reset` 都能用，`reset` 会先备份再删，重启后重建默认稿。
 
 QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动重启 qq-bridge**（若在跑）：先 `pkill -f "qq-bridge[.]mjs"` 停掉旧进程，再按下面的启动命令起一次；不要直接再起一个，会双实例双回复。只重启服务/TUI 时，判官隔离由插件侧兼容旧路径兜底，但桥接自身的其余修复仍要等它重启。
 
@@ -97,7 +103,7 @@ QQ 桥接是独立进程，`install.sh` 不会重启它。**升级后请手动�
 ~/.local/share/life-world/bin/life-world.sh on       # 恢复
 ```
 
-关掉时：不注入时间/世界提示词/心情/记忆、不打时间戳、7 个工具一个都不挂、定时器空转——模型看到的上下文和原生 opencode 一样。**归档仍在后台继续**（只写文件、不进上下文），历史不会断；世界数据（日记、计划、记忆、心情、闹钟）原地保留，开回来直接接上。
+关掉时：不注入时间/世界提示词/心情/记忆、不打时间戳、10 个工具一个都不挂、定时器空转——模型看到的上下文和原生 opencode 一样。**归档仍在后台继续**（只写文件、不进上下文），历史不会断；世界数据（日记、计划、记忆、心情、闹钟）原地保留，开回来直接接上。
 
 开关记在 `~/.local/share/life-world/life-world.json` 的 `world.enabled`（不写=开启；旧文件兜底）。脚本改完会重启服务和 TUI：工具与定时器都是进程启动时建的，不重启等于没生效。开关**只认人手**，没有做成给角色调用的工具。
 
@@ -129,13 +135,16 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 | `bridge.wsUrl` / `token` | 正向 WS 地址与 token（NapCat、SnowLuma 等通用）。旧的 `~/.config/opencode/qq-bridge.json` 只在 `life-world.json` 完全没有 `bridge` 段时兜底；正常情况改这里。 |
 | `bridge.group.enabled` | 群聊开关，默认 `false`；角色也能用 `group_chat` 工具实时开关 |
 | `bridge.attachmentCleanup` / `attachmentRetentionDays` | 是否自动清理 `worlds/default/tmp` 里的附件，默认 `true` / 7 天；设 `false` 则永久保留，手动清理 |
+| `bridge.afterglow` | 私聊余波：`enabled`（默认 `true`）、`delayMs`（默认 30000）、`maxRounds`（默认 2）。见下文「私聊余波」 |
 
 - `/new`：删除 `qq-chat`，下一条消息或她的 `reach_out` 再新建。
 - **outbox 补发**：投递游标按天记录；桥接启动/重连时会扫最近 3 天，把没送出去的补发（跨天离线也不丢）。
 - 回复按行拆成多条：每个短句一条 QQ 消息，两条之间按下一句长度停顿约 1.5~5 秒（加随机抖动），模拟真人打字。
 - **私聊接收图片和文件**：下载后作为附件放进这一轮请求（图片 8MB、文件 20MB 上限），模型可以直接看/读。附件存放在 `worlds/default/tmp/`（和 `room` 平级，权限 700），持久保留、方便手动清理；默认超过 7 天自动清掉，可用 `bridge.attachmentCleanup` / `attachmentRetentionDays` 关闭或改天数。
 - **正在输入**：私聊在模型思考和生成期间显示「对方正在输入…」（调用 OneBot 扩展 `set_input_status`；SnowLuma 支持，不支持的实现会自动禁用，不报错）。群聊没有这个标准接口，不显示。
-- **主动发图片/文件**：角色用 `send_media` 把 `room` / `表情包` / `tmp` 里的文件发给你——私聊图片和文件都行，群聊只发图片。文件走 base64 段直接发送，不经过 opencode 会话；图片上限 8MB、文件 20MB，发送超时图片 60 秒/文件 120 秒。**超时视为投递未知，不自动重发**（避免重复图片/文件），失败只记日志。
+- **主动发图片/语音/文件**：角色用 `send_media` 把 `room` / `表情包` / `语音` / `tmp` 里的文件发给你——图片和语音私聊、群聊都行，文件只有私聊能发。文件走 base64 段直接发送，不经过 opencode 会话；图片上限 8MB、语音/文件 20MB，发送超时图片/语音 60 秒、文件 120 秒。**超时视为投递未知，不自动重发**（避免重复图片/文件），失败只记日志。
+- **语音**：life-world 不内置 TTS。任何外部 TTS 把音频（mp3/wav/silk/amr/ogg/m4a）放进 `worlds/default/语音/`，角色就能用 `send_media({ path: "语音/x.mp3", kind: "voice" })` 发出来，桥接转成 OneBot `record` 段。`record` 被实现拒绝时，私聊会退成普通文件段，群聊直接报失败（不静默丢）。
+- **余波**：私聊里她发完话，如果 30 秒没人回，桥接会让她补一轮（「还有没说完的/想问一句怎么不说话」）；再 30 秒还没回，再补一轮。默认最多 2 轮，`bridge.afterglow` 可调；**主动推送（reach_out）不触发余波**。任何一条你的消息都会让还没响的计时作废；已经生成中的那条余波照发，但不再续。余波注入的 `【余波】` 标记不会进归档/压缩摘要，不会被当成你说过的话。
 - 若这一轮正文为空、但她调用了 `reach_out`，桥接会把这一轮缓冲的那些行当回复发出去，避免漏回。
 - 开关关闭或桥接离线（心跳超过 90 秒）时，角色会看到「reach_out 不会送达」，不会以为已经通知到你。
 - `life-world.json` 含凭据（token），权限 600，别外传；旧 `qq-bridge.json` 仅作兜底。
@@ -161,6 +170,22 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 | `judgeTimeoutMs` | 判官超时，默认 `60000` 毫秒 |
 | `bannedWords` | 群聊出站黑名单，命中整行丢弃 |
 
+### 私聊余波（`bridge.afterglow`）
+
+她发完最后一句话、并且没有别的回合排在后面时，桥接开始计时：
+
+1. 30 秒没有你的消息 → 发一条带 `【余波】` 标记的回合，让她补一句没说完的、解释一下、或者问一句怎么不说话；
+2. 再过 30 秒还没有 → 再补一轮；
+3. 最多 `maxRounds` 轮（默认 2）就停，直到你再次说话。
+
+规则：
+
+- **任何一条你的消息**都会让还没响的计时作废；如果余波已经在生成，那条**仍然会发出来**，只是不再续下一轮。
+- **主动推送（`reach_out`）不触发余波**——主动找人本来就要简短，不追着说。
+- `【余波】` 是系统标记，不是你说的话：插件归档和压缩摘要都会跳过它，不会污染记忆。
+- 超时/生成失败不会重试；模型一轮超过 3 分钟没出正文，看门狗会把状态清掉。
+- 只作用于 QQ 私聊；群聊和终端不触发。
+
 ## 数据位置
 
 运行时数据全部在 `~/.local/share/life-world/`，**不随仓库分发**；用户配置在 `~/.local/share/life-world/life-world.json`（含 token，600）：
@@ -179,6 +204,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
     ├── plan/
     ├── room/
     ├── 表情包/            她收集的表情包和图片（主动发图从这里取）
+    ├── 语音/              外部 TTS 产出的音频（主动发语音从这里取）
     ├── tmp/               收到的 QQ 图片/文件（7 天兜底清理）
     └── outbox/
 ```
@@ -205,7 +231,8 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
     "enabled": true, "running": true, "reviewHour": 23, "fallbackWakeTime": "09:00",
     "resetHour": null, "recentLimit": 80, "summaryLimit": 12000,
     "alarmStaleHours": 6, "resetCooldownMinutes": 5,
-    "homeTitle": "life-world home session"
+    "homeTitle": "life-world home session",
+    "hydrate": { "mode": "budget", "hours": 48, "chars": 2000, "mapDays": 3 }
   },
   "localModel": {
     "enabled": false, "keepRecent": 20, "foldRecentContext": 6, "resultChars": 300,
@@ -215,6 +242,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
   "bridge": {
     "enabled": false, "ownerQQ": 0, "ownerName": "", "wsUrl": "ws://127.0.0.1:3001",
     "token": "", "privateSessionTitle": "qq-chat", "location": "",
+    "afterglow": { "enabled": true, "delayMs": 30000, "maxRounds": 2 },
     "attachmentCleanup": true, "attachmentRetentionDays": 7,
     "group": { "enabled": false, "keywords": [], "interjectChance": 0.05, "afterReplyChance": 0.8, "probabilityDurationMs": 120000, "judgeModel": "default", "judgeTimeoutMs": 60000, "debounceMs": 10000, "triggerDebounceMs": 1200, "maxBatchWaitMs": 60000, "cooldownMs": 8000, "maxPer10Min": 0, "bannedWords": [] }
   }
@@ -227,7 +255,32 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs \
 | `localModel` | 本地小模型优化，见下文 |
 | `bridge` | QQ/OneBot 桥接，见下文 QQ 一节 |
 
-`world.json` 现在只存运行时状态（家会话、闹钟、lastReview/lastWake 等），不要手改；配置只改 `life-world.json`。
+`world.json` 现在只存运行时状态（家会话、闹钟、lastReview/lastWake、世界提示词 hash 等），不要手改；配置只改 `life-world.json`。
+
+### 新会话记忆（`world.hydrate`）
+
+新会话第一次请求时，默认**不再**塞最近 80 条原文，而是：
+
+```json
+"hydrate": { "mode": "budget", "hours": 48, "chars": 2000, "mapDays": 3 }
+```
+
+| 字段 | 默认 | 作用 |
+|---|---|---|
+| `mode` | `budget` | `budget` = 时间窗口 + 字数预算；`recent` = 旧逻辑，按 `recentLimit` 条数注入 |
+| `hours` | 48 | 只注入最近多少小时的原文 |
+| `chars` | 2000 | 注入正文的总字数上限（从新往旧累加，超出截断） |
+| `mapDays` | 3 | 记忆地图覆盖最近几天（每天一行：句数 + 日记标题） |
+
+更早的内容不再硬塞，改由三个工具按需翻：
+
+```js
+await tools.memory_search({ query: "法考 出分", from: "2026-09-01", to: "2026-11-06" })
+await tools.memory_day({ date: "2026-10-31" })
+await tools.memory_timeline({ from: "2026-10-01", to: "2026-10-31" })
+```
+
+检索是零依赖的：精确子串 + 中文 2 字 bigram 覆盖率打分，只返回命中处附近的片段；对话、日记、房间笔记都能搜，按文件 mtime 缓存，反复查也不重读整个归档。
 
 ## 家会话
 

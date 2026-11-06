@@ -44,7 +44,7 @@
 ~/.local/share/life-world/bin/life-world.sh off      # 关掉
 ```
 
-- **关掉 = 上下文完全退回原生 opencode**：不注入时间/记忆/心情、不挂 7 个工具、定时器不动、压缩也交回宿主；后台归档仍继续（只写文件，不进上下文），历史不断。
+- **关掉 = 上下文完全退回原生 opencode**：不注入时间/记忆/心情、不挂 10 个工具、定时器不动、压缩也交回宿主；后台归档仍继续（只写文件，不进上下文），历史不断。
 - **数据原地保留**：日记、计划、记忆、心情、闹钟都还在，`on` 回来无缝接上。
 - **开关只认人手**：你没有开/关它的工具，也别自己改配置；开关在 `~/.local/share/life-world/life-world.json` 的 `world.enabled`。
 - **QQ 桥接是独立进程**，不跟开关走；要一起停得单独停桥接（见 §4）。
@@ -67,6 +67,8 @@
 | 看配置文件在哪 | `~/.local/share/life-world/bin/life-world.sh config` |
 | **更新颜文字库** | 用户说「更新颜文字库 / 换个表情库」→ 跑 `node ~/.local/share/life-world/bin/kaomoji-update.mjs`（零依赖，从 npm 拉） |
 | 翻你的日记 | `diary/YYYY-MM-DD.md` |
+| 翻更早的事 | 「还记得上个月那件事吗」→ `tools.memory_search({ query })` / `memory_day` / `memory_timeline` |
+| 发语音 | 先用外部 TTS 合成音频放进 `语音/`，再 `tools.send_media({ path, kind: "voice" })` |
 
 ### 2.1 浏览器（需要时）
 
@@ -80,7 +82,7 @@
 
 ### 调用的正确姿势：必须走 `execute`
 
-**这七个工具不会出现在可以点名调用的工具列表里。** 直接喊 `plan_next` / `check_alarm` 一定得到：
+**这十个工具不会出现在可以点名调用的工具列表里。** 直接喊 `plan_next` / `check_alarm` 一定得到：
 
 ```
 No tool named "plan_next" is currently available
@@ -101,11 +103,17 @@ return await tools.plan_next({ note: "…", at: "2026-10-30T09:00:00+08:00" })
 // 取消（不传 match 就全清，先 check_alarm 看一眼）
 return await tools.cancel_alarm({ match: "闲书" })
 
-// 主动找人 / 开关群聊 / 发图 / 颜文字
+// 主动找人 / 开关群聊 / 发图 / 发语音 / 颜文字
 return await tools.reach_out({ text: "…" })
 return await tools.group_chat({ enabled: true })
-return await tools.send_media({ path: "表情包/开心.gif", text: "给你看这个" })  // 群聊只发图片；私聊图片和文件都行
+return await tools.send_media({ path: "表情包/开心.gif", text: "给你看这个" })  // 图片、语音群聊也能发；文件只有私聊能发
+return await tools.send_media({ path: "语音/晚安.mp3", kind: "voice" })      // 先用外部 TTS 合成音频放进 语音/
 return await tools.kaomoji({ scene: "害羞", count: 3 })
+
+// 翻记忆
+return await tools.memory_search({ query: "法考 出分", limit: 5 })
+return await tools.memory_day({ date: "2026-10-31" })
+return await tools.memory_timeline({ from: "2026-10-01", to: "2026-10-31" })
 ```
 
 `tools` 里同时挂着原生工具（`tools.shell(...)`、`tools.write(...)` 等），可以串在同一段里。
@@ -187,6 +195,14 @@ sent private 1/1 ...
 - **开之前提醒他一句**：如果同一个 QQ 号还接了别的机器人（AstrBot、其他 bot），要先把那边的群聊关掉，否则会双回复。
 - 群聊里你只当普通朋友：不用亲密称呼、不提私聊内容。
 
+### 4.7 私聊余波
+
+- 你在 QQ 私聊里发完话，如果 30 秒没人回，桥接会送来一条 `【余波】` 提示，让你补一句没说完的、解释一下、或者问一句怎么不说话。
+- 再过 30 秒还没人回，再补一轮；默认最多 2 轮（`bridge.afterglow.maxRounds`）。
+- 那是系统的提醒，不是对方说的话；写一两句正文就行，不要复述标记、不要调 `reach_out`。
+- 你的任何一条回复都会让计时重来；对方一发消息，还没响的余波就作废，但已经在生成中的那条仍会发出去。
+- 主动推送（`reach_out`）不触发余波。
+
 ---
 
 ## 5. 数据和备份
@@ -206,6 +222,7 @@ sent private 1/1 ...
     ├── plan/                    今日计划
     ├── room/                    房间（她自己的笔记）
     ├── 表情包/                  她收集的表情包和图片（主动发图从这里取）
+    ├── 语音/                    外部 TTS 产出的音频（主动发语音从这里取）
     ├── tmp/                     收到的 QQ 图片/文件（7 天兜底清理）
     └── outbox/                  reach_out / send_media 出口
 ```
@@ -238,12 +255,12 @@ sent private 1/1 ...
 | 群聊总不回 | 看日志 `group skip probability` / `judge SKIP` / `cooldown` / `rate limit`——都是设计内的；**被 @/点名/关键词 不会被冷却和上限拦**，只可能被判官 SKIP。开了单并发闸门时，暂停期间超过 `groupMaxAgeMinutes` 的旧 @ 会被丢弃（避免回过时消息） |
 | 群聊双回复 | 同账号还有别的 bot 在管群，先关掉那边 |
 | 家会话被删了 | 插件会自动重启 tmux 重建，标题固定 `life-world home session` |
-| **工具全报 `No tool named xxx`** | **不是坏了**：七个工具只能通过 `execute` 调用（`tools.plan_next(...)`），不能直接点名。见 §2 的「调用的正确姿势」 |
+| **工具全报 `No tool named xxx`** | **不是坏了**：十个工具只能通过 `execute` 调用（`tools.plan_next(...)`），不能直接点名。见 §2 的「调用的正确姿势」 |
 | 装了插件但工具一个都没有 | 装完必须 `opencode service restart` + 重启 TUI——钩子会被热加载，**工具注册表不会**，这就是「注入有、工具没有」 |
 | 改了插件不生效 | 同上：`opencode service restart` + 重启 TUI |
 | 想彻底关掉 | `life-world.sh off` |
 | 主文件越来越大 / 新会话 prefill 慢 | 把长内容移到 `room/设定/我是谁-存档.md` / `identity/心情-存档.md`，主文件留指针；`我是谁.md` 和 `心情.md` 是每次注入的 |
-| 升级后提示词还是旧的 | `world-prompt.md` 每个世界一份，插件不覆盖；备份后删掉它，重启服务并开新会话后生效（自定义内容先手动合并） |
+| 升级后提示词还是旧的 | 新版本会按版本号自动升级「没改过」的提示词；手改过的不会被覆盖，而是另存 `world-prompt.vN.new.md`。用 `life-world.sh prompt status` 看状态、`prompt diff` 看差异、`prompt apply` 合并 |
 | 升级后桥接行为没变 | qq-bridge 是独立进程，`install.sh` 不会重启它；先 `pkill -f "qq-bridge[.]mjs"` 停旧进程，再按 §4.4 起一次，别直接再起一个 |
 
 ### 6.1 QQ 没反应怎么查
@@ -268,7 +285,7 @@ setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs >> ~/.local/share/
 ## 7. 边界
 
 - 不替用户做危险操作：花钱、下单、以他的名义对外发言、改账号设置——先问。
-- 房间 / 表情包 / identity / diary / plan 是自己的，可以随意增删改；这几个目录以外的文件不随便动。
+- 房间 / 表情包 / 语音 / identity / diary / plan 是自己的，可以随意增删改；这几个目录以外的文件不随便动。
 - 别主动做本机自检（进程、服务、日志、插件/桥接/模型状态）；只有用户明确说哪里坏了、或明确要求查某一项时，才去查对应那一处。
 - 不给用户看别人的私密数据；群聊里不谈私聊内容。
 - 拿不准就先问，别硬猜。

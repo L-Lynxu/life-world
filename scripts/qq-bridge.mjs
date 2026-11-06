@@ -354,6 +354,8 @@ async function deletePrivate() {
   runWindow = null
   pendingPrivateTurns = 0
   stopTyping(ownerQQ)
+  userReturned()
+  afterglow.inFlight = false
   releaseGate(id)
   saveState()
   log("deleted private session", id)
@@ -599,6 +601,105 @@ function stopTyping(userId) {
   }
 }
 
+// ———————————————————————— 私聊余波 ————————————————————————
+// 她发完话一段时间没人回 → 补一轮；再没人回 → 再补一轮（默认最多两轮）。
+// 任何一条真实用户消息都会让当前计时作废；已经生成中的余波照发，只是不再续下一轮。
+const afterglow = { timer: null, round: 0, inFlight: false, seq: 0, userSeq: 0 }
+
+function afterglowCfg() {
+  const live = readBridgeConfig()
+  const a = live?.afterglow && typeof live.afterglow === "object" ? live.afterglow : {}
+  const num = (v, d, min, max) =>
+    typeof v === "number" && Number.isFinite(v) ? Math.min(max, Math.max(min, Math.floor(v))) : d
+  return {
+    enabled: a.enabled !== false,
+    delayMs: num(a.delayMs, 30000, 1000, 300_000),
+    maxRounds: num(a.maxRounds, 2, 0, 5),
+  }
+}
+
+function clearAfterglowTimer() {
+  if (afterglow.timer) {
+    clearTimeout(afterglow.timer)
+    afterglow.timer = null
+  }
+}
+
+/** 用户回来了：当前计时作废（生成中的那一条不拦，照发） */
+function userReturned() {
+  afterglow.userSeq += 1
+  afterglow.round = 0
+  clearAfterglowTimer()
+}
+
+function armAfterglow(round) {
+  const cfg = afterglowCfg()
+  if (!cfg.enabled || cfg.maxRounds <= 0 || round < 1 || round > cfg.maxRounds) return
+  clearAfterglowTimer()
+  afterglow.round = round
+  afterglow.seq = afterglow.userSeq
+  afterglow.timer = setTimeout(() => {
+    afterglow.timer = null
+    fireAfterglow(round).catch((error) => log("afterglow failed", String(error)))
+  }, cfg.delayMs)
+  afterglow.timer.unref?.()
+}
+
+async function fireAfterglow(round) {
+  // 计时期间用户回过话：这一拍作废
+  if (afterglow.seq !== afterglow.userSeq || afterglow.inFlight) return
+  const id = state.privateSessionId
+  if (!id) return
+  const info = await sessionInfo(id)
+  if (info.status !== "ok") {
+    clearAfterglowTimer()
+    afterglow.round = 0
+    return
+  }
+  const text = [
+    "【余波】对方还没回你，已经过了一会儿。",
+    "不要假装他说话了，也不要重新打招呼。",
+    "如果上一轮还有没说完的、想补一句解释、或者想问一句怎么不说话——现在补一句；一两句就够。",
+    "直接写正文，不要调用 reach_out。",
+  ].join("\n")
+  afterglow.inFlight = true
+  runWindow = { start: Date.now(), end: 0, reaches: [] }
+  pendingPrivateTurns += 1
+  lastPrivatePromptAt = Date.now()
+  startTyping(ownerQQ)
+  // 看门狗：模型一轮跑太久/只出工具不出正文时，别让 inFlight 一直挂着
+  if (afterglow.watchdog) clearTimeout(afterglow.watchdog)
+  afterglow.watchdog = setTimeout(() => {
+    if (!afterglow.inFlight) return
+    afterglow.inFlight = false
+    afterglow.round = 0
+    log("afterglow watchdog, give up")
+  }, 180_000)
+  afterglow.watchdog.unref?.()
+  let res
+  try {
+    res = await api(`/api/session/${id}/prompt`, { method: "POST", body: JSON.stringify({ text }) })
+  } catch (error) {
+    log("afterglow prompt failed", String(error))
+    if (afterglow.watchdog) { clearTimeout(afterglow.watchdog); afterglow.watchdog = null }
+    afterglow.inFlight = false
+    afterglow.round = 0
+    pendingPrivateTurns = Math.max(0, pendingPrivateTurns - 1)
+    stopTyping(ownerQQ)
+    return
+  }
+  if (!res.ok) {
+    log("afterglow prompt failed", res.status, (await res.text()).slice(0, 200))
+    if (afterglow.watchdog) { clearTimeout(afterglow.watchdog); afterglow.watchdog = null }
+    afterglow.inFlight = false
+    afterglow.round = 0
+    pendingPrivateTurns = Math.max(0, pendingPrivateTurns - 1)
+    stopTyping(ownerQQ)
+    return
+  }
+  log("afterglow prompt queued", round, id)
+}
+
 /** 私聊附件：图片、表情和文件都收；群聊只收图片（见 groupMedia） */
 function privateMedia(msg) {
   const out = []
@@ -635,6 +736,8 @@ let runWindow = null
 
 async function handlePrivate(msg) {
   if (Number(msg.user_id) !== ownerQQ) { log("ignore private from", String(msg.user_id)); return }
+  // 用户说话了：还没响的余波计时作废
+  userReturned()
   const text = textOf(msg)
   const media = privateMedia(msg)
   if (!text && media.length === 0) { log("ignore empty private"); return }
@@ -1628,6 +1731,8 @@ async function pollPrivate() {
       releaseGate(id)
       pendingPrivateTurns = 0
       stopTyping(ownerQQ)
+      userReturned()
+      afterglow.inFlight = false
       delete state.privateSessionId
       delete state.lastSessionId
       delete state.lastIdle
@@ -1714,6 +1819,27 @@ async function pollPrivate() {
     const completed = sentTurns + (sentBuffered ? 1 : 0)
     if (completed > 0) pendingPrivateTurns = Math.max(0, pendingPrivateTurns - completed)
     if (pendingPrivateTurns === 0) stopTyping(ownerQQ)
+    // 有余波回合的正文落地了：先摘掉看门狗（不管后面还有没有排队回合）
+    if (completed > 0 && afterglow.watchdog) {
+      clearTimeout(afterglow.watchdog)
+      afterglow.watchdog = null
+    }
+    // 余波：这一轮真的发出东西、也没有排队回合时，才排下一拍
+    if (completed > 0 && pendingPrivateTurns === 0) {
+      if (afterglow.inFlight) {
+        afterglow.inFlight = false
+        if (afterglow.seq === afterglow.userSeq) {
+          const next = afterglow.round + 1
+          if (next <= afterglowCfg().maxRounds) armAfterglow(next)
+          else afterglow.round = 0
+        } else {
+          // 用户中途回来了：这一条余波照发，但不再续
+          afterglow.round = 0
+        }
+      } else if (!afterglow.timer) {
+        armAfterglow(1)
+      }
+    }
     saveState()
   } catch (error) {
     log("poll failed", String(error))
@@ -1771,7 +1897,7 @@ async function sendOutboxMedia(item) {
   // 防御 outbox 被手改：只允许发 world 下 room / 表情包 / tmp 里的文件
   try { path = realpathSync(path) } catch { return { ok: false } }
   const worldRoot = dirname(OUTBOX_DIR)
-  const allowed = [join(worldRoot, "room"), join(worldRoot, "表情包"), join(worldRoot, "tmp")]
+  const allowed = [join(worldRoot, "room"), join(worldRoot, "表情包"), join(worldRoot, "语音"), join(worldRoot, "tmp")]
   if (!allowed.some((dir) => path === dir || path.startsWith(dir + sep))) {
     log("outbound media outside allowed dirs", path)
     return { ok: false }
@@ -1779,6 +1905,8 @@ async function sendOutboxMedia(item) {
   let size
   try { size = statSync(path).size } catch { return { ok: false } }
   const isImage = item.mediaType === "image" || (!item.mediaType && /\.(png|jpe?g|gif|webp|bmp)$/i.test(path))
+  const isVoice = item.mediaType === "voice" ||
+    (!item.mediaType && /\.(mp3|wav|silk|amr|ogg|m4a|flac|aac)$/i.test(path))
   const limit = isImage ? MAX_MEDIA_BYTES : MAX_FILE_BYTES
   if (size > limit) {
     log("outbound media too large", path, size)
@@ -1803,7 +1931,8 @@ async function sendOutboxMedia(item) {
     }
   }
   const groupEntry = groupId ? [groupId, ""] : undefined
-  if (groupEntry && !isImage) {
+  // 群聊只禁文件；图片和语音都能发
+  if (groupEntry && !isImage && !isVoice) {
     log("group file not supported, skipped", item.name || basename(path))
     return { ok: false }
   }
@@ -1819,7 +1948,7 @@ async function sendOutboxMedia(item) {
     const imageSegment = { type: "image", data: { file: `base64://${b64}`, summary: "[图片]" } }
     const fileSegment = { type: "file", data: { file: `base64://${b64}`, name: item.name || basename(path) } }
     const text = String(item.text || "").slice(0, 500)
-    const timeout = isImage ? 60_000 : 120_000
+    const timeout = isImage || isVoice ? 60_000 : 120_000
     const send = (message, ms) => groupEntry
       ? call("send_group_msg", { group_id: Number(groupEntry[0]), message }, ms)
       : call("send_private_msg", { user_id: ownerQQ, message }, ms)
@@ -1830,6 +1959,21 @@ async function sendOutboxMedia(item) {
         if (text) message.push({ type: "text", data: { text } })
         message.push(imageSegment)
         await send(message, timeout)
+      } else if (isVoice) {
+        const message = []
+        if (text) message.push({ type: "text", data: { text } })
+        message.push({ type: "record", data: { file: `base64://${b64}` } })
+        try {
+          await send(message, timeout)
+        } catch (error) {
+          const message = String(error)
+          // 断线/超时代表投递未知：直接失败，不退成文件重发（会重复）
+          if (/ws not ready|timeout|fetch failed|ECONN|socket/i.test(message)) throw error
+          // 群聊不能退回文件；私聊可以退成文件，至少把内容送到
+          if (groupEntry) throw error
+          log("voice segment rejected, fallback to file", message)
+          await send([fileSegment], timeout)
+        }
       } else {
         // 文件单独一个气泡：先发说明，停一下再发文件
         if (text) {
@@ -2125,5 +2269,5 @@ if (process.argv[2] === "--test-send") {
   setInterval(pollPrivate, 1500)
   setInterval(pollGroups, 1500)
   setInterval(pollOutbox, 2000)
-  log("bridge started", { ownerQQ, sessionTitle: privateTitle(), wsUrl, group: config.group?.enabled === true })
+  log("bridge started", { ownerQQ, sessionTitle: privateTitle(), wsUrl, group: config.group?.enabled === true, afterglow: afterglowCfg() })
 }

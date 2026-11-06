@@ -9,7 +9,13 @@
     "summaryLimit": 12000,
     "alarmStaleHours": 6,
     "resetCooldownMinutes": 5,
-    "homeTitle": "life-world home session"
+    "homeTitle": "life-world home session",
+    "hydrate": {
+      "mode": "budget",
+      "hours": 48,
+      "chars": 2000,
+      "mapDays": 3
+    }
   },
   "localModel": {
     "enabled": false,
@@ -38,6 +44,11 @@
     "token": "",
     "privateSessionTitle": "qq-chat",
     "location": "",
+    "afterglow": {
+      "enabled": true,
+      "delayMs": 30000,
+      "maxRounds": 2
+    },
     "attachmentCleanup": true,
     "attachmentRetentionDays": 7,
     "group": {

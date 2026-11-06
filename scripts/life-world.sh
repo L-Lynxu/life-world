@@ -126,6 +126,55 @@ inbox() { # $1 = 看最近几天（默认 1）
   ' "$HOME/.local/share/life-world/worlds/default/outbox" "$days"
 }
 
+prompt_cmd() { # $1 = status | diff | apply | reset
+  local dir="$HOME/.local/share/life-world/worlds/default"
+  local file="$dir/world-prompt.md"
+  local next
+  next="$(ls -1 "$dir"/world-prompt.v*.new.md 2>/dev/null | tail -1)"
+  case "${1:-status}" in
+    status)
+      if [ ! -f "$file" ]; then
+        echo "世界提示词：不存在（插件下次加载时写新版默认）"
+        exit 0
+      fi
+      local ver
+      ver="$(head -1 "$file" | sed -n 's/.*version=\([0-9][0-9]*\).*/\1/p')"
+      echo "世界提示词：$file"
+      echo "  版本：${ver:-（无版本头，旧版或手改过）}"
+      [ -n "$next" ] && echo "  有新版待合并：$next"
+      local bak
+      bak="$(ls -1 "$dir"/world-prompt.bak-*.md 2>/dev/null | tail -1)"
+      [ -n "$bak" ] && echo "  最近备份：$bak"
+      echo "  说明：插件只自动升级「没改过」的提示词；改过的会另存 .new.md，绝不覆盖。"
+      ;;
+    diff)
+      if [ ! -f "$file" ]; then echo "还没有世界提示词。"; exit 0; fi
+      if [ -z "$next" ]; then echo "没有待合并的新版（$dir/world-prompt.v*.new.md 不存在）。"; exit 0; fi
+      diff -u "$file" "$next" || true
+      ;;
+    apply)
+      if [ -z "$next" ]; then echo "没有待合并的新版。"; exit 1; fi
+      local stamp
+      stamp="$(date +%Y%m%d-%H%M%S)"
+      cp "$file" "$dir/world-prompt.bak-$stamp.md"
+      cp "$next" "$file"
+      echo "已应用新版（旧文件备份到 world-prompt.bak-$stamp.md）。下一轮请求就会用新提示词。"
+      ;;
+    reset)
+      if [ ! -f "$file" ]; then echo "本来就没有世界提示词。"; exit 0; fi
+      local stamp
+      stamp="$(date +%Y%m%d-%H%M%S)"
+      cp "$file" "$dir/world-prompt.bak-$stamp.md"
+      rm -f "$file"
+      echo "已删除世界提示词（备份 world-prompt.bak-$stamp.md）。插件下次加载时写新版默认。"
+      ;;
+    *)
+      echo "用法：life-world.sh prompt status | diff | apply | reset"
+      exit 1
+      ;;
+  esac
+}
+
 status() {
   ensure_config
   local s
@@ -157,7 +206,7 @@ case "${1:-status}" in
     echo "life-world：打开"
     restart_service
     tui_active
-    echo "  插件会在 TUI 发出第一句话后加载（注入、7 个工具、定时器）"
+    echo "  插件会在 TUI 发出第一句话后加载（注入、10 个工具、定时器）"
     ;;
   off)
     write_enabled false
@@ -169,6 +218,9 @@ case "${1:-status}" in
   inbox)
     inbox "${2:-1}"
     ;;
+  prompt)
+    prompt_cmd "${2:-status}"
+    ;;
   config)
     ensure_config
     echo "$CONFIG"
@@ -178,7 +230,7 @@ case "${1:-status}" in
     status
     ;;
   *)
-    echo "用法：life-world.sh status | on | off | config | inbox [天数]"
+    echo "用法：life-world.sh status | on | off | config | inbox [天数] | prompt [status|diff|apply|reset]"
     exit 1
     ;;
 esac
