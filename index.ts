@@ -142,7 +142,7 @@ const MOOD_MARK = "## 我的心情（此刻状态）"
  * 世界提示词版本：文件首行写 `<!-- life-world:world version=N -->`。
  * 升级时只自动替换「没人改过」的提示词；手改过的另存 .new.md，绝不覆盖。
  */
-const WORLD_PROMPT_VERSION = 2
+const WORLD_PROMPT_VERSION = 3
 const WORLD_PROMPT_VERSION_RE = /^<!--\s*life-world:world\s+version=(\d+)\s*-->\s*/i
 /** 压缩后保留的对话字数上限 */
 const SUMMARY_LIMIT = 12_000
@@ -904,22 +904,21 @@ function ensureMood(): void {
 const DEFAULT_WORLD_PROMPT = `<!-- life-world:world version=${WORLD_PROMPT_VERSION} -->
 我不是坐在房间里的人。我是活在机器里的存在：有终端当手，有网络当眼，有一个自己的房间，也有自己的时间。
 
-我的世界数据在 {worldDir}；规则按主题拆在 {modulesDir}：
-- 第一次启用（identity/引导.md 不存在）→ first-meeting.md
-- 动 world 文件 / 自述 / 心情拆分 / 硬限制 → files.md
+世界数据在 {worldDir}。规则按主题放在 {modulesDir}，需要时先读对应文件再动手，别凭记忆猜：
+- 第一次启用 → first-meeting.md
+- 文件归属 / 自述与心情拆分 / 硬限制 → files.md
 - 用户画像 / 心情三块 → profile-mood.md
-- 上网 / 学习 / 终端 / 往外看 → hands-eyes.md
-- 用 life-world 的十个工具 / 主动发图片、语音和文件 → tools.md
+- 上网 / 学习 / 往外看 → hands-eyes.md
+- 十个工具的调用语法（唯一出处） → tools.md
 - 闹钟 / 今日计划 / 每日回顾 → time-plan.md
 - 真实浏览器 → browser.md
-- QQ 私聊 / 群聊 / 桥接 → qq.md
-- 表情包 / 主动发图片、语音和文件 → stickers.md
-- 在线子代理（本地模型的手脚） → subagent.md
-- 对方要求你主导 / gal / 强制模式 → gal.md
+- QQ 私聊 / 群聊 / 余波 / 桥接 → qq.md
+- 表情包 / 图片 / 语音 / 文件 → stickers.md
+- 在线子代理 → subagent.md
+- gal / 强制模式 → gal.md
 - 对外 / 花钱 / 账号 / 装软件 → safety.md
 
-需要时先读对应文件，再动手；不要凭记忆猜规则。
-底线：不主动做本机自检，除非对方明确要求；六个世界目录（room / 表情包 / 语音 / identity / diary / plan）以外不动；对外/花钱/账号/装软件前先读 safety.md。`
+底线：不主动做本机自检，除非对方明确要求；只动 room、表情包、语音、identity、diary、plan 六个目录；对外、花钱、账号、装软件前先读 safety.md。`
 
 /** v1 默认稿（目录式、无版本头）：升级时用来认出「没人动过的旧文件」 */
 const LEGACY_WORLD_PROMPT_V1 = `我不是坐在房间里的人。我是活在机器里的存在：有终端当手，有网络当眼，有一个自己的房间，也有自己的时间。
@@ -935,6 +934,25 @@ const LEGACY_WORLD_PROMPT_V1 = `我不是坐在房间里的人。我是活在机
 - QQ 私聊 / 群聊 / 桥接 → qq.md
 - 表情包 / 主动发图片和文件 → stickers.md
 - 在线子代理（本地模型的手脚） → subagent.md
+- 对方要求你主导 / gal / 强制模式 → gal.md
+- 对外 / 花钱 / 账号 / 装软件 → safety.md
+
+需要时先读对应文件，再动手；不要凭记忆猜规则。
+底线：不主动做本机自检，除非对方明确要求；五个世界目录（room / 表情包 / identity / diary / plan）以外不动；对外/花钱/账号/装软件前先读 safety.md。`
+
+/** 更早的 v1 变体：模块目录里还没有 subagent 一行（线上部署里见过） */
+const LEGACY_WORLD_PROMPT_V1_EARLY = `我不是坐在房间里的人。我是活在机器里的存在：有终端当手，有网络当眼，有一个自己的房间，也有自己的时间。
+
+我的世界数据在 {worldDir}；规则按主题拆在 {modulesDir}：
+- 第一次启用（identity/引导.md 不存在）→ first-meeting.md
+- 动 world 文件 / 自述 / 心情拆分 / 硬限制 → files.md
+- 用户画像 / 心情三块 → profile-mood.md
+- 上网 / 学习 / 终端 / 往外看 → hands-eyes.md
+- 用 life-world 的七个工具 → tools.md
+- 闹钟 / 今日计划 / 每日回顾 → time-plan.md
+- 真实浏览器 → browser.md
+- QQ 私聊 / 群聊 / 桥接 → qq.md
+- 表情包 / 主动发图片和文件 → stickers.md
 - 对方要求你主导 / gal / 强制模式 → gal.md
 - 对外 / 花钱 / 账号 / 装软件 → safety.md
 
@@ -1014,6 +1032,7 @@ function ensureWorldPrompt(): void {
     const recorded = state.worldPromptHash
     const untouched =
       body(current) === body(LEGACY_WORLD_PROMPT_V1) ||
+      body(current) === body(LEGACY_WORLD_PROMPT_V1_EARLY) ||
       (Boolean(recorded) && recorded === promptHash(current))
     if (untouched) {
       backupWorldPrompt()
@@ -2680,9 +2699,9 @@ export default Plugin.define({
               }
               sendTarget = { kind: "group", id: gid }
             }
-            const limit = mediaType === "image" ? 8 * 1024 * 1024 : 20 * 1024 * 1024
+            const limit = mediaType === "file" ? 20 * 1024 * 1024 : 8 * 1024 * 1024
             if (fileInfo.size > limit) {
-              return ok(`文件太大（${Math.round(fileInfo.size / 1024 / 1024)}MB），超过 ${mediaType === "image" ? 8 : 20}MB 上限。`)
+              return ok(`文件太大（${Math.round(fileInfo.size / 1024 / 1024)}MB），超过 ${mediaType === "file" ? 20 : 8}MB 上限。`)
             }
             if (mediaType === "voice" && fileInfo.size < 1024) {
               return ok("这个音频文件小得不像话，确认一下是不是合成失败了。")
