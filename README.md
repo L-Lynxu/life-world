@@ -88,6 +88,13 @@ QQ ←→ OneBot v11 正向 WS（SnowLuma / NapCat …）
 
 完整示例见 `pi/config.example.json`。不要用它覆盖已有配置，只合并需要的段。
 
+## 界面整洁
+
+- **思考块**：在 `~/.pi/agent/settings.json` 加 `"hideThinkingBlock": true`，思考过程不再显示（仍会生成，只是不占屏幕）；
+- **工具调用**：输出默认折叠，按 `Ctrl+O` 展开/收起；
+- **注入的状态**：时间、心情、桥接状态改成 `before_agent_start` 的隐藏消息（`display: false`），不再拼在用户消息正文里；
+- 每个工具都有紧凑的 `renderCall` / `renderResult`，默认一行摘要，展开才看全文。
+
 ## 跑 QQ 桥接
 
 ```bash

@@ -1,4 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
+import { Text } from "@earendil-works/pi-tui"
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs"
 import { basename, dirname, join, resolve, sep } from "node:path"
 import { homedir } from "node:os"
@@ -129,8 +130,8 @@ function moodLine(): string {
   return "无"
 }
 
-function inputPrefix(): string {
-  return `[本地时间 ${stamp()} ${zone()}]\n（心情：${moodLine()}；OneBot 桥接：${bridgeStatus()}）\n`
+function stateText(): string {
+  return `[本地时间 ${stamp()} ${zone()}]\n（心情：${moodLine()}；OneBot 桥接：${bridgeStatus()}）`
 }
 
 // ———————— 归档 / 记忆 ————————
@@ -165,6 +166,7 @@ function isAfterglow(text: string): boolean {
 
 function archive(message: any): void {
   try {
+    if (typeof message?.customType === "string" && message.customType.startsWith("life-world-")) return
     const role = message?.role
     if (role !== "user" && role !== "assistant") return
     let text = messageText(message).trim()
@@ -470,6 +472,37 @@ function tick(): void {
 let piRef: unknown
 
 // ———————— 扩展 ————————
+function argSummary(name: string, args: any): string {
+  if (!args) return ""
+  const value = args.note || args.query || args.date || args.text || args.path || args.task || args.scene || args.question
+  return value ? String(value).replace(/\s+/g, " ").slice(0, 50) : ""
+}
+
+function compactRenderers(name: string) {
+  return {
+    renderCall(args: any, theme: any) {
+      const summary = argSummary(name, args)
+      const title = theme.fg("toolTitle", theme.bold(name))
+      return new Text(summary ? `${title} ${theme.fg("muted", summary)}` : title, 0, 0)
+    },
+    renderResult(result: any, opts: any, theme: any) {
+      const content = (result?.content || [])
+        .filter((part: any) => part?.type === "text")
+        .map((part: any) => part.text)
+        .join("\n")
+        .trim()
+      const first = content.split("\n")[0]?.slice(0, 90) || ""
+      let text = theme.fg("success", "✓ ") + theme.fg("muted", first)
+      if (opts?.expanded && content) text += `\n${theme.fg("dim", content)}`
+      return new Text(text, 0, 0)
+    },
+  }
+}
+
+function addTool(api: ExtensionAPI, def: any) {
+  api.registerTool({ ...def, ...compactRenderers(def.name) })
+}
+
 let promptCache: string | undefined
 function worldPromptText(): string {
   if (promptCache !== undefined) return promptCache
@@ -519,22 +552,29 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async () => { hydrated = false })
 
   pi.on("before_agent_start", async (event: any) => {
-    if (hydrated) return
-    hydrated = true
-    const world = worldPromptText()
-    const memory = memoryBlock()
     const patch: any = {}
     const current = String(event?.systemPrompt || "")
-    if (world && !current.includes(WORLD_MARK)) patch.systemPrompt = `${current}\n\n${world}`
-    if (memory) patch.message = { customType: "life-world-memory", content: memory, display: false }
+    const first = !hydrated
+    if (first) {
+      hydrated = true
+      const world = worldPromptText()
+      if (world && !current.includes(WORLD_MARK)) patch.systemPrompt = `${current}\n\n${world}`
+    }
+    const memory = first ? memoryBlock() : ""
+    const content = [stateText(), memory].filter(Boolean).join("\n\n")
+    if (content) {
+      patch.message = {
+        customType: first && memory ? "life-world-bootstrap" : "life-world-state",
+        content,
+        display: false,
+      }
+    }
     if (patch.systemPrompt || patch.message) return patch
   })
 
-  pi.on("input", async (event: any) => {
-    if (event?.source === "extension") return { action: "continue" } as const
-    const text = String(event?.text || "")
-    if (!text.trim() || text.startsWith("[本地时间 ")) return { action: "continue" } as const
-    return { action: "transform", text: `${inputPrefix()}${text}` } as const
+  pi.on("input", async () => {
+    // 动态状态改走 before_agent_start 的隐藏消息，不再污染用户消息正文
+    return { action: "continue" } as const
   })
 
   pi.on("message_end", async (event: any) => {
@@ -543,7 +583,7 @@ export default function (pi: ExtensionAPI) {
   })
 
   // —— 工具 ——
-  pi.registerTool({
+  addTool(pi, {
     name: "plan_next",
     label: "Plan next",
     description: "说好接下来做什么、做到什么时候。到点会提醒。note 要写清做什么、怎么算做成；at 与 after_minutes 二选一。",
@@ -570,7 +610,7 @@ export default function (pi: ExtensionAPI) {
     },
   })
 
-  pi.registerTool({
+  addTool(pi, {
     name: "check_alarm",
     label: "Check alarms",
     description: "看看现在排着的闹钟。",
@@ -582,7 +622,7 @@ export default function (pi: ExtensionAPI) {
     },
   })
 
-  pi.registerTool({
+  addTool(pi, {
     name: "cancel_alarm",
     label: "Cancel alarm",
     description: "取消闹钟。传 match 只取消 note 含这个词的；不传全取消。",
@@ -598,7 +638,7 @@ export default function (pi: ExtensionAPI) {
     },
   })
 
-  pi.registerTool({
+  addTool(pi, {
     name: "reach_out",
     label: "Reach out",
     description: "想找对方时用：把一两句话写进 outbox，桥接会送到对方 QQ。桥接关闭/离线时不会送达。",
@@ -617,7 +657,7 @@ export default function (pi: ExtensionAPI) {
     },
   })
 
-  pi.registerTool({
+  addTool(pi, {
     name: "send_media",
     label: "Send media",
     description: "主动发图片/语音/文件。path 必须在 room / 表情包 / 语音 / tmp 里；群聊只发图片/语音。",
@@ -652,7 +692,7 @@ export default function (pi: ExtensionAPI) {
     },
   })
 
-  pi.registerTool({
+  addTool(pi, {
     name: "group_chat",
     label: "Toggle group chat",
     description: "开关 QQ 群聊（写 life-world.json 的 bridge.group.enabled，桥接实时读取）。",
@@ -670,7 +710,7 @@ export default function (pi: ExtensionAPI) {
     },
   })
 
-  pi.registerTool({
+  addTool(pi, {
     name: "kaomoji",
     label: "Kaomoji",
     description: "按场景取几条颜文字。不传 scene 就列出可用场景。",
@@ -696,7 +736,7 @@ export default function (pi: ExtensionAPI) {
     },
   })
 
-  pi.registerTool({
+  addTool(pi, {
     name: "memory_search",
     label: "Memory search",
     description: "翻以前的记忆：对话原文、日记、房间笔记。支持时间范围、角色、前后文。",
@@ -737,7 +777,7 @@ export default function (pi: ExtensionAPI) {
     },
   })
 
-  pi.registerTool({
+  addTool(pi, {
     name: "memory_day",
     label: "Memory day",
     description: "回看某一天的对话和日记（YYYY-MM-DD）。",
@@ -762,7 +802,7 @@ export default function (pi: ExtensionAPI) {
     },
   })
 
-  pi.registerTool({
+  addTool(pi, {
     name: "memory_timeline",
     label: "Memory timeline",
     description: "看一段时间每天聊了多少、开头说了什么。默认最近 7 天。",
@@ -791,7 +831,7 @@ export default function (pi: ExtensionAPI) {
     },
   })
 
-  pi.registerTool({
+  addTool(pi, {
     name: "delegate",
     label: "Delegate subagent",
     description: "把一个耗时/并发的任务交给独立 pi 子进程（隔离上下文）。零第三方扩展，最多一层。",
@@ -804,7 +844,7 @@ export default function (pi: ExtensionAPI) {
   })
 
 
-  pi.registerTool({
+  addTool(pi, {
     name: "gal_choice",
     label: "Gal choice panel",
     description: "终端 gal 模式用：抛一个单选面板让用户选。QQ/群聊没有面板，别用；那边把选项写成正文。",

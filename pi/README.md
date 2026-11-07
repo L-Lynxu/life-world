@@ -85,6 +85,12 @@ pi          # TUI，已经带 life-world
 
 完整示例见 `pi/config.example.json`。
 
+## 界面整洁
+
+- `~/.pi/agent/settings.json` 加 `"hideThinkingBlock": true`：隐藏思考块；
+- 工具输出默认折叠，`Ctrl+O` 展开/收起；每个工具自带紧凑 renderer；
+- 时间/心情/桥接状态走 `before_agent_start` 的隐藏消息，不再出现在用户消息正文里。
+
 ## 启动
 
 ```bash
