@@ -33,7 +33,7 @@
     "debugStats": false
   },
   "models": {
-    "local": "",
+    "local": "basalt/abliterated-iq3_xxs",
     "cloud": "deepseek/deepseek-flash",
     "autoFailover": true,
     "localHealthUrl": "",
