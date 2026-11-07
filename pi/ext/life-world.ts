@@ -44,6 +44,36 @@ const JUDGE = process.env.LIFE_WORLD_JUDGE === "1"
 const GROUP_ID = process.env.LIFE_WORLD_GROUP_ID || ""
 const DEPTH = Number(process.env.LIFE_WORLD_DEPTH || 0)
 
+/** QQ 私聊 / 群聊的说话方式（从 opencode 版移植） */
+const QQ_PRIVATE_MARK = "## QQ 私聊回复方式"
+const QQ_PRIVATE_BODY = [
+  "你在 QQ 上和对方聊天，不是在写报告：",
+  "- 每个短句单独一行；每行会作为一条独立的 QQ 消息发出去。",
+  "- 一次发 1~3 条短消息，最多不超过 4 条；不要写长段落。",
+  "- 像真人线上聊天：短、口语、有来有回。",
+  "- 不要调用 reach_out；你的回复直接写在正文里，每行一句。",
+  "- 不要用标题、列表、编号、加粗、表格；不要写「首先/其次/总结」。",
+  "- 不要复述工具调用、命令、过程或内部推理。",
+  "- 对方问什么就答什么，别扩写。",
+].join("\n")
+
+const QQ_GROUP_MARK = "## QQ 群聊模式"
+const QQ_GROUP_BODY = [
+  "这是 QQ 群聊，不是私聊。你在群里是普通朋友，不是任何人的伴侣。",
+  "- 不要用情侣/伴侣称呼，不要提亲密关系、私聊内容、日记、画像、心情。",
+  "- 学习群友的聊天风格：友好又诙谐，口语化能接梗；像日常聊天，别文言、别书面语；一次 1~3 条短句；可以发表情/颜文字。",
+  "- 你知道你们的关系，但在这里只以朋友身份说话；不该接就只回 [SILENT]。",
+].join("\n")
+
+/** 在线模型子代理提示（本地模型优化打开且 preferSubagent 时注入） */
+const SUBAGENT_MARK = "## 在线模型子代理（可选）"
+const SUBAGENT_BODY = [
+  "先问对方一句：有没有可以调用的在线模型（云端的，或者他在别处跑的强模型）？",
+  "- 没有就算了，不追问，也不硬凑。",
+  "- 有的话，这类活优先交给在线模型当子代理：整篇网页抓取、网络调研、多来源并行查证，以及任何「要快、要并发、内容又多」的处理。你只负责出判断、留结论。",
+  "- 如果在线子代理因为内容审查被掐断（表现是它的回复直接断掉或返回空），不要反复重试：这一次降级为你自己来做。",
+].join("\n")
+
 function log(text: string): void {
   try {
     mkdirSync(ROOT, { recursive: true })
@@ -83,10 +113,32 @@ function ensureDirs(): void {
   }
 }
 
+/**
+ * 本地小模型优化（默认关闭）。
+ * 面向「上下文短、并发差、prefill 慢」的本地模型；接在线模型时保持关闭。
+ * 打开后在 life-world.json 里配 localModel: { enabled: true, ... }。
+ */
+interface LocalModelOptions {
+  enabled: boolean
+  /** 新会话注入的历史条数（0 = 不注入，-1 = 不限制） */
+  keepRecent: number
+  /** 保留最近几轮的工具结果（0 = 全折，-1 = 不折） */
+  foldToolResults: number
+  /** 折叠后每条结果保留的字符数 */
+  resultChars: number
+  /** 保留最近几轮的推理；0 = 全折，-1 = 不折 */
+  foldingThinkingTurns: number
+  /** 是否注入「在线模型子代理」提示 */
+  preferSubagent: boolean
+  /** 是否每轮输出上下文构成统计（调试用） */
+  debugStats: boolean
+}
+
 interface Config {
   world: { enabled: boolean; running: boolean; reviewHour: number; fallbackWakeTime: string; recentLimit: number; hydrate: { hours: number; chars: number; mapDays: number } }
   bridge: { enabled: boolean; ownerQQ: number; wsUrl: string; group: { enabled: boolean; id?: string } }
   subagent: { model: string }
+  localModel: LocalModelOptions
 }
 
 function config(): Config {
@@ -94,6 +146,7 @@ function config(): Config {
     world: { enabled: true, running: true, reviewHour: 23, fallbackWakeTime: "09:00", recentLimit: 80, hydrate: { hours: 48, chars: 2000, mapDays: 3 } },
     bridge: { enabled: false, ownerQQ: 0, wsUrl: "ws://127.0.0.1:3001", group: { enabled: false } },
     subagent: { model: "deepseek-flash" },
+    localModel: { enabled: false, keepRecent: 20, foldToolResults: 6, resultChars: 300, foldingThinkingTurns: 0, preferSubagent: true, debugStats: false },
   }
   const raw = readJson<Partial<Config>>(CONFIG_FILE, {})
   return {
@@ -102,8 +155,11 @@ function config(): Config {
     world: { ...base.world, ...(raw.world || {}), hydrate: { ...base.world.hydrate, ...((raw.world || {}).hydrate || {}) } },
     bridge: { ...base.bridge, ...(raw.bridge || {}), group: { ...base.bridge.group, ...((raw.bridge || {}).group || {}) } },
     subagent: { ...base.subagent, ...(raw.subagent || {}) },
+    localModel: { ...base.localModel, ...(raw.localModel || {}) },
   }
 }
+
+function localModelOptions(): LocalModelOptions { return config().localModel }
 
 interface Alarm { id: string; at: string; note: string; setAt: string }
 interface WorldState { running?: boolean; alarms?: Alarm[]; lastReview?: string; lastWake?: string }
@@ -241,6 +297,9 @@ function memoryBlock(): string {
     if (total + cost > h.chars) break
     picked.unshift(recent[i]); total += cost
   }
+  // 本地小模型优化：限制注入的历史条数（0 = 不注入，-1 = 不限制）
+  const keep = c.localModel.enabled ? c.localModel.keepRecent : -1
+  if (keep >= 0 && picked.length > keep) picked.splice(0, picked.length - keep)
   const lines = picked.map((r) => `[${shortStamp(r.t)}] ${r.role === "user" ? "对方" : "我"}：${r.text}`)
   const map: string[] = []
   for (let i = h.mapDays - 1; i >= 0; i--) {
@@ -541,6 +600,85 @@ function worldPromptText(): string {
   return text
 }
 
+// ———————— 本地小模型：上下文折叠 ————————
+/** 保留最近 keepTurns 轮，返回需要处理的截止下标（0 = 不需要动） */
+function turnCutoff(messages: any[], keepTurns: number): number {
+  const userIdx: number[] = []
+  messages.forEach((m, i) => { if (m?.role === "user") userIdx.push(i) })
+  if (keepTurns === 0) return messages.length
+  if (userIdx.length <= keepTurns) return 0
+  return userIdx[userIdx.length - keepTurns - 1]
+}
+
+/** 折叠较早轮次的工具结果，只留开头一小段 */
+function foldToolResults(messages: any[], keepTurns: number, keepChars: number): boolean {
+  if (keepTurns < 0) return false
+  const cutoff = turnCutoff(messages, keepTurns)
+  if (!cutoff) return false
+  let changed = false
+  const shrink = (holder: any): void => {
+    if (!holder || typeof holder !== "object") return
+    if (typeof holder.text === "string" && holder.text.length > keepChars && !holder.text.startsWith("[已折叠")) {
+      holder.text = `[已折叠 工具结果 ${Math.round(holder.text.length / 1024)}KB] ` + holder.text.slice(0, keepChars).replace(/\s+/g, " ") + " …"
+      changed = true
+    }
+  }
+  for (let i = 0; i < cutoff; i++) {
+    const msg = messages[i]
+    if (msg?.role !== "toolResult") continue
+    if (Array.isArray(msg.content)) msg.content.forEach(shrink)
+    else shrink(msg)
+  }
+  return changed
+}
+
+/** 折叠较早轮次的推理（思考过程每轮重发太贵） */
+function foldThinking(messages: any[], keepTurns: number): boolean {
+  if (keepTurns < 0) return false
+  const cutoff = turnCutoff(messages, keepTurns)
+  if (!cutoff) return false
+  let changed = false
+  for (let i = 0; i < cutoff; i++) {
+    const parts = messages[i]?.content
+    if (!Array.isArray(parts)) continue
+    for (const part of parts) {
+      if (part?.type !== "thinking" || !String(part.text ?? "")) continue
+      part.text = ""
+      if (typeof part.signature === "string") part.signature = ""
+      if (part.native && typeof part.native === "object") part.native = {}
+      changed = true
+    }
+  }
+  return changed
+}
+
+/** 统计一次请求的构成（对话 / 工具 / 推理），调试用 */
+function statsRequest(messages: any[]): void {
+  let dialogue = 0, tools = 0, reasoning = 0, other = 0
+  for (const m of messages) {
+    const parts = Array.isArray(m?.content) ? m.content : []
+    if (m?.role === "user") {
+      dialogue += parts.filter((p: any) => p?.type === "text").map((p: any) => String(p.text || "")).length
+      continue
+    }
+    if (m?.role === "toolResult") {
+      for (const p of parts) tools += String(p?.text ?? JSON.stringify(p ?? {})).length
+      continue
+    }
+    for (const p of parts) {
+      if (p?.type === "text") dialogue += String(p.text || "").length
+      else if (p?.type === "thinking") reasoning += String(p.text || "").length
+      else if (p?.type === "toolCall" || p?.type === "image") tools += JSON.stringify(p).length
+      else other += JSON.stringify(p).length
+    }
+  }
+  const total = dialogue + tools + reasoning + other
+  if (!total) return
+  const kb = (n: number) => Math.round(n / 1024) + "KB"
+  const pct = (n: number) => ((n / total) * 100).toFixed(1) + "%"
+  log(`ctx stats · 总 ${kb(total)} | 对话 ${kb(dialogue)} ${pct(dialogue)} | 工具 ${kb(tools)} ${pct(tools)} | 推理 ${kb(reasoning)} ${pct(reasoning)} | 其他 ${kb(other)}`)
+}
+
 export default function (pi: ExtensionAPI) {
   piRef = pi
   if (JUDGE) return // 判官：不注入、不注册工具
@@ -553,13 +691,28 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("before_agent_start", async (event: any) => {
     const patch: any = {}
-    const current = String(event?.systemPrompt || "")
+    const original = String(event?.systemPrompt || "")
+    let prompt = original
     const first = !hydrated
     if (first) {
       hydrated = true
       const world = worldPromptText()
-      if (world && !current.includes(WORLD_MARK)) patch.systemPrompt = `${current}\n\n${world}`
+      if (world && !prompt.includes(WORLD_MARK)) prompt = `${prompt}\n\n${world}`
     }
+    // QQ 渠道：补上私聊 / 群聊的说话方式（压缩后可能丢，每轮确保在场）
+    const style = CHANNEL === "qq"
+      ? [QQ_PRIVATE_MARK, QQ_PRIVATE_BODY]
+      : CHANNEL === "group"
+        ? [QQ_GROUP_MARK, QQ_GROUP_BODY]
+        : null
+    if (style && !prompt.includes(style[0])) {
+      prompt = `${prompt}\n\n${style[0]}\n${style[1]}`
+      log(`style injected · ${CHANNEL}`)
+    }
+    // 本地小模型：提醒可以把重活交给在线子代理
+    const opt = localModelOptions()
+    if (opt.enabled && opt.preferSubagent && !prompt.includes(SUBAGENT_MARK)) prompt = `${prompt}\n\n${SUBAGENT_MARK}\n${SUBAGENT_BODY}`
+    if (prompt !== original) patch.systemPrompt = prompt
     const memory = first ? memoryBlock() : ""
     const content = [stateText(), memory].filter(Boolean).join("\n\n")
     if (content) {
@@ -575,6 +728,18 @@ export default function (pi: ExtensionAPI) {
   pi.on("input", async () => {
     // 动态状态改走 before_agent_start 的隐藏消息，不再污染用户消息正文
     return { action: "continue" } as const
+  })
+
+  // 本地小模型：发请求前折叠旧工具结果 / 推理，省上下文、省 prefill
+  pi.on("context", async (event: any) => {
+    const opt = localModelOptions()
+    if (!opt.enabled) return
+    const messages = event?.messages
+    if (!Array.isArray(messages)) return
+    const a = foldToolResults(messages, opt.foldToolResults, opt.resultChars)
+    const b = foldThinking(messages, opt.foldingThinkingTurns)
+    if (opt.debugStats) statsRequest(messages)
+    if (a || b) return { messages }
   })
 
   pi.on("message_end", async (event: any) => {
