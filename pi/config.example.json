@@ -23,5 +23,22 @@
       "bannedWords": []
     }
   },
-  "subagent": { "model": "deepseek-flash" }
+  "subagent": { "model": "deepseek-flash" },
+  "localModel": {
+    "enabled": false,
+    "keepRecent": 20,
+    "foldToolResults": 6,
+    "resultChars": 300,
+    "foldingThinkingTurns": 0,
+    "debugStats": false
+  },
+  "models": {
+    "local": "",
+    "cloud": "deepseek/deepseek-flash",
+    "autoFailover": true,
+    "localHealthUrl": "",
+    "cloudHealthUrl": "https://api.deepseek.com/models",
+    "probeTimeoutMs": 4000,
+    "cooldownMs": 60000
+  }
 }

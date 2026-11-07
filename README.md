@@ -3,7 +3,7 @@
 > **这是 `pi-agent` 分支的 README。**
 > `main` 分支仍是 opencode 插件版；本分支把 life-world 迁到 **pi 1.5.0** 的扩展体系，代码在 `pi/`。
 
-给 [pi coding agent](https://github.com/earendil-works/pi) 里的陪伴角色一个会记得、会生活的世界：跨会话记忆与检索、自己的时间、每日回顾、心情、颜文字、QQ 桥接、语音、私聊余波和零第三方子代理。
+给 [pi coding agent](https://github.com/earendil-works/pi) 里的陪伴角色一个会记得、会生活的世界：跨会话记忆与检索、自己的时间、每日回顾、心情、颜文字、QQ 桥接、语音、私聊余波、零第三方子代理，以及**本地 / 在线模型热切换**和**免费联网搜索**。
 
 ## 快速开始
 
@@ -52,11 +52,29 @@ QQ ←→ OneBot v11 正向 WS（SnowLuma / NapCat …）
 关键设计：
 
 - **静态世界规则**：`pi/prompt/world.md`（由 `pi/build-prompt.mjs` 从仓库 `modules/*.md` 生成），扩展在 `before_agent_start` 首轮注入一次；
-- **动态状态**：`input` 事件把「本地时间 + 心情 + 桥接状态」拼进当前用户消息，不改 system，保护缓存；
+- **动态状态**：`before_agent_start` 用隐藏消息（`display: false`）注入「本地时间 + 心情 + 桥接状态」，不改 system，保护缓存；
 - **工具**：`pi.registerTool`，模型直接可见，不需要 opencode 的 `execute` 绕路；
 - **归档**：`message_end` 写 `conversations/YYYY-MM-DD.jsonl`；
 - **定时器**：只在 `LIFE_WORLD_ROLE=home` 的进程跑，用 `pi.sendMessage(triggerTurn)` 唤醒；
-- **子代理**：`delegate` 起独立 `pi -p` 子进程，深度限制 1 层，零第三方。
+- **子代理**：`delegate` 起独立 `pi -p` 子进程，深度限制 1 层，零第三方；
+- **模型热切换**：`switch_model` 工具让角色自己决定用本地还是在线模型；`before_agent_start` 里另有脚本探活兜底，当前模型不可用会自动切到另一个（不依赖模型自己判断）；
+- **联网搜索**：`web_search` 工具走 TinyFish 的 keyless 模式，不填 API Key 也能搜（opencode 版同源能力）。
+
+## 和 main（opencode 版）的区别
+
+`main` 是 opencode 插件版，`pi-agent` 是 pi 原生扩展版，两边并存、互不影响。
+
+| 能力 | main（opencode） | pi-agent（本分支） |
+|---|---|---|
+| 宿主 | opencode 插件（`execute` 里调工具） | pi 1.5 原生扩展（`registerTool`） |
+| 每轮状态 | 注入 system 块 | `before_agent_start` 隐藏消息（不劈缓存） |
+| 原文归档 | 读 opencode SQLite | `message_end` 直接写 JSONL |
+| 定时器 | HTTP 唤醒共享会话 | `pi.sendMessage(triggerTurn)` |
+| QQ 桥接 | opencode HTTP API | pi RPC（JSONL 子进程） |
+| 会话 | opencode 会话列表 | 磁盘 JSONL 树，`pi -r` 挑回 |
+| 本地/在线切换 | 无 | `switch_model` + 脚本级故障切换 |
+| 联网搜索 | 内置 websearch（5 家供应商，需 Key） | `web_search`，TinyFish keyless 免 Key |
+| 聊天气质 | 世界提示词 + 心情 | 同上，另加 `identity/模型使用规范.md`（≤500 字）注入 |
 
 ## 配置
 
@@ -72,7 +90,15 @@ QQ ←→ OneBot v11 正向 WS（SnowLuma / NapCat …）
     "afterglow": { "enabled": true, "delayMs": 60000, "maxRounds": 2 },
     "group": { "enabled": false, "keywords": ["铃"] }
   },
-  "subagent": { "model": "deepseek-flash" }
+  "subagent": { "model": "deepseek-flash" },
+  "localModel": { "enabled": true, "keepRecent": 20, "foldToolResults": 6, "resultChars": 300 },
+  "models": {
+    "local": "basalt/abliterated-iq3_xxs",
+    "cloud": "deepseek/deepseek-flash",
+    "autoFailover": true,
+    "localHealthUrl": "http://127.0.0.1:8081/health",
+    "cloudHealthUrl": "https://api.deepseek.com/models"
+  }
 }
 ```
 

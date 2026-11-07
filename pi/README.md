@@ -10,7 +10,9 @@
 
 把 life-world 从 opencode 插件搬到 pi 的原生扩展点：
 
-- **工具**：`plan_next` / `check_alarm` / `cancel_alarm` / `reach_out` / `send_media` / `group_chat` / `kaomoji` / `memory_search` / `memory_day` / `memory_timeline` / `delegate` / `gal_choice`
+- **工具**：`plan_next` / `check_alarm` / `cancel_alarm` / `reach_out` / `send_media` / `group_chat` / `kaomoji` / `memory_search` / `memory_day` / `memory_timeline` / `delegate` / `gal_choice` / `switch_model` / `web_search`
+- **模型热切换**：`switch_model` 让角色自己决定本地 / 在线；`before_agent_start` 另有脚本探活兜底，当前模型不可用自动切另一个
+- **联网搜索**：`web_search` 走 TinyFish keyless，免 API Key
 - **每轮状态**：`input` 事件把时间、心情、桥接状态拼进当前用户消息（不改 system，保护缓存）
 - **归档**：`message_end` 写 `conversations/YYYY-MM-DD.jsonl`
 - **记忆**：新会话首轮注入最近 48h / 2000 字 + 3 天记忆地图 + 自述
@@ -79,11 +81,27 @@ pi          # TUI，已经带 life-world
     "afterglow": { "enabled": true, "delayMs": 60000, "maxRounds": 2 },
     "group": { "enabled": false, "keywords": ["铃"] }
   },
-  "subagent": { "model": "deepseek-flash" }
+  "subagent": { "model": "deepseek-flash" },
+  "localModel": { "enabled": true, "keepRecent": 20, "foldToolResults": 6, "resultChars": 300 },
+  "models": {
+    "local": "basalt/abliterated-iq3_xxs",
+    "cloud": "deepseek/deepseek-flash",
+    "autoFailover": true,
+    "localHealthUrl": "http://127.0.0.1:8081/health",
+    "cloudHealthUrl": "https://api.deepseek.com/models",
+    "probeTimeoutMs": 4000,
+    "cooldownMs": 60000
+  }
 }
 ```
 
 完整示例见 `pi/config.example.json`。
+
+### 模型使用规范
+
+`worlds/default/identity/模型使用规范.md`（≤500 字）会被注入 system，和 `心情.md` 同级。写清楚什么时候用本地、什么时候切在线，以及切换礼仪；角色会照着执行，用户也可以随时改这份文档。
+
+`models.local` 留空则不启用热切换；`autoFailover` 打开时，扩展在每轮开始前探活当前模型，挂了就自动切到另一个（冷却 `cooldownMs`，防止来回抖）。
 
 ## 界面整洁
 
@@ -129,11 +147,14 @@ TZ=Asia/Shanghai TEST_MS=45000 node pi/bin/qq-bridge.mjs --test-user "在吗"
 | opencode | pi |
 |---|---|
 | `tool.transform` + `execute` 绕路 | `registerTool`，模型直接调用 |
-| 每轮 system 注入 | `input` 拼进用户消息 |
+| 每轮 system 注入 | `before_agent_start` 隐藏消息 |
 | `opencode.db` 归档 | `message_end` 写 JSONL |
 | HTTP `sendHome` | `pi.sendMessage(triggerTurn)` |
 | 桥接 HTTP API | pi RPC JSONL |
-| 在线子代理提示 | `delegate` 独立 `pi -p` 进程 |
+| 在线子代理提示 | `switch_model` 热切换 + 脚本级故障切换 |
+| 内置 websearch（5 家供应商，需 Key） | `web_search`，TinyFish keyless 免 Key |
+| 会话列表 | 磁盘 JSONL 树，`pi -r` 挑回 |
+| QQ 私聊 / 群聊风格块 | 同样注入（按 `LIFE_WORLD_CHANNEL`） |
 
 ## 文件
 

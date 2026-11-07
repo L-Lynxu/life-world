@@ -65,14 +65,10 @@ const QQ_GROUP_BODY = [
   "- 你知道你们的关系，但在这里只以朋友身份说话；不该接就只回 [SILENT]。",
 ].join("\n")
 
-/** 在线模型子代理提示（本地模型优化打开且 preferSubagent 时注入） */
-const SUBAGENT_MARK = "## 在线模型子代理（可选）"
-const SUBAGENT_BODY = [
-  "先问对方一句：有没有可以调用的在线模型（云端的，或者他在别处跑的强模型）？",
-  "- 没有就算了，不追问，也不硬凑。",
-  "- 有的话，这类活优先交给在线模型当子代理：整篇网页抓取、网络调研、多来源并行查证，以及任何「要快、要并发、内容又多」的处理。你只负责出判断、留结论。",
-  "- 如果在线子代理因为内容审查被掐断（表现是它的回复直接断掉或返回空），不要反复重试：这一次降级为你自己来做。",
-].join("\n")
+/** 模型使用规范：放在 identity 下，和心情一样注入（不超过 500 字） */
+const MODEL_RULES_FILE = join(IDENTITY_DIR, "模型使用规范.md")
+const MODEL_RULES_MARK = "## 模型使用规范"
+const AUTH_FILE = join(homedir(), ".pi/agent/auth.json")
 
 function log(text: string): void {
   try {
@@ -128,10 +124,26 @@ interface LocalModelOptions {
   resultChars: number
   /** 保留最近几轮的推理；0 = 全折，-1 = 不折 */
   foldingThinkingTurns: number
-  /** 是否注入「在线模型子代理」提示 */
-  preferSubagent: boolean
   /** 是否每轮输出上下文构成统计（调试用） */
   debugStats: boolean
+}
+
+/** 本地 / 在线模型热切换（设了 local 才会启用） */
+interface ModelSwitchOptions {
+  /** 本地模型，如 basalt/abliterated-iq3_xxs；留空 = 不启用热切换 */
+  local: string
+  /** 在线模型，如 deepseek/deepseek-flash */
+  cloud: string
+  /** 当前模型不可用时，脚本自动切到另一个 */
+  autoFailover: boolean
+  /** 本地健康检查地址 */
+  localHealthUrl: string
+  /** 在线健康检查地址 */
+  cloudHealthUrl: string
+  /** 健康检查超时（毫秒） */
+  probeTimeoutMs: number
+  /** 两次自动切换之间的冷却（毫秒），防止来回抖 */
+  cooldownMs: number
 }
 
 interface Config {
@@ -139,6 +151,7 @@ interface Config {
   bridge: { enabled: boolean; ownerQQ: number; wsUrl: string; group: { enabled: boolean; id?: string } }
   subagent: { model: string }
   localModel: LocalModelOptions
+  models: ModelSwitchOptions
 }
 
 function config(): Config {
@@ -146,7 +159,8 @@ function config(): Config {
     world: { enabled: true, running: true, reviewHour: 23, fallbackWakeTime: "09:00", recentLimit: 80, hydrate: { hours: 48, chars: 2000, mapDays: 3 } },
     bridge: { enabled: false, ownerQQ: 0, wsUrl: "ws://127.0.0.1:3001", group: { enabled: false } },
     subagent: { model: "deepseek-flash" },
-    localModel: { enabled: false, keepRecent: 20, foldToolResults: 6, resultChars: 300, foldingThinkingTurns: 0, preferSubagent: true, debugStats: false },
+    localModel: { enabled: false, keepRecent: 20, foldToolResults: 6, resultChars: 300, foldingThinkingTurns: 0, debugStats: false },
+    models: { local: "", cloud: "deepseek/deepseek-flash", autoFailover: true, localHealthUrl: "", cloudHealthUrl: "", probeTimeoutMs: 4000, cooldownMs: 60000 },
   }
   const raw = readJson<Partial<Config>>(CONFIG_FILE, {})
   return {
@@ -156,6 +170,7 @@ function config(): Config {
     bridge: { ...base.bridge, ...(raw.bridge || {}), group: { ...base.bridge.group, ...((raw.bridge || {}).group || {}) } },
     subagent: { ...base.subagent, ...(raw.subagent || {}) },
     localModel: { ...base.localModel, ...(raw.localModel || {}) },
+    models: { ...base.models, ...(raw.models || {}) },
   }
 }
 
@@ -722,6 +737,99 @@ function statsRequest(messages: any[]): void {
   log(`ctx stats · 总 ${kb(total)} | 对话 ${kb(dialogue)} ${pct(dialogue)} | 工具 ${kb(tools)} ${pct(tools)} | 推理 ${kb(reasoning)} ${pct(reasoning)} | 其他 ${kb(other)}`)
 }
 
+// ———————— 本地 / 在线模型热切换 ————————
+let lastSwitch = { at: 0, from: "", to: "" }
+let failingOver = false
+const modelHealthCache = new Map<string, { at: number; up: boolean }>()
+
+function parseModelRef(ref: string): { provider: string; id: string } | null {
+  const i = String(ref || "").indexOf("/")
+  if (i <= 0 || i >= String(ref).length - 1) return null
+  return { provider: String(ref).slice(0, i), id: String(ref).slice(i + 1) }
+}
+
+function modelIdOf(ctx: any): string {
+  const m = ctx?.model
+  if (!m) return ""
+  return `${m.provider}/${m.id}`
+}
+
+function providerKey(provider: string): string {
+  try {
+    const auth = readJson<Record<string, { key?: string }>>(AUTH_FILE, {})
+    return String(auth?.[provider]?.key || "")
+  } catch { return "" }
+}
+
+async function probeUrl(url: string, headers: Record<string, string>, timeoutMs: number): Promise<boolean> {
+  if (!url) return true
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs)
+  try {
+    const res = await fetch(url, { headers, signal: ctrl.signal })
+    return res.ok
+  } catch { return false } finally { clearTimeout(timer) }
+}
+
+/** 模型是否可用（15 秒内复用结果，避免每轮都探） */
+async function modelUp(id: string): Promise<boolean> {
+  const o = config().models
+  const cached = modelHealthCache.get(id)
+  if (cached && Date.now() - cached.at < 15_000) return cached.up
+  const ref = parseModelRef(id)
+  let up = true
+  if (ref && id === o.local) {
+    up = await probeUrl(o.localHealthUrl, {}, o.probeTimeoutMs)
+  } else if (ref && id === o.cloud) {
+    const key = providerKey(ref.provider)
+    up = await probeUrl(o.cloudHealthUrl, key ? { Authorization: `Bearer ${key}` } : {}, o.probeTimeoutMs)
+  }
+  modelHealthCache.set(id, { at: Date.now(), up })
+  return up
+}
+
+async function switchTo(ctx: any, target: string, reason: string): Promise<string> {
+  const ref = parseModelRef(target)
+  if (!ref) return `模型写法不对：${target}（要 provider/model）`
+  const model = ctx?.modelRegistry?.find?.(ref.provider, ref.id)
+  if (!model) return `pi 里找不到这个模型：${target}`
+  const from = modelIdOf(ctx)
+  const success = await (piRef as any)?.setModel?.(model)
+  if (!success) return `切不过去：${target} 没有可用凭据`
+  lastSwitch = { at: Date.now(), from, to: target }
+  modelHealthCache.delete(target)
+  log(`model switch ${from} → ${target}${reason ? ` · ${reason}` : ""}`)
+  return `已切到 ${target}${reason ? `（${reason}）` : ""}`
+}
+
+/**
+ * 脚本级兜底：当前模型探活失败就切到另一个。
+ * 不依赖模型自己判断，避免模型挂掉之后没人接手。
+ */
+async function ensureModelAlive(ctx: any): Promise<void> {
+  const o = config().models
+  if (!o.autoFailover || !o.local || !o.cloud) return
+  const cur = modelIdOf(ctx)
+  if (!cur || (cur !== o.local && cur !== o.cloud)) return
+  if (failingOver) return
+  if (Date.now() - lastSwitch.at < o.cooldownMs) return
+  failingOver = true
+  try {
+    if (await modelUp(cur)) return
+    const alt = cur === o.local ? o.cloud : o.local
+    if (!(await modelUp(alt))) {
+      log(`failover skipped · both down (${cur}, ${alt})`)
+      return
+    }
+    const result = await switchTo(ctx, alt, `${cur} 不可用，自动切换`)
+    log(`failover · ${result}`)
+  } catch (e) {
+    log(`failover failed · ${String(e)}`)
+  } finally {
+    failingOver = false
+  }
+}
+
 export default function (pi: ExtensionAPI) {
   piRef = pi
   if (JUDGE) return // 判官：不注入、不注册工具
@@ -732,7 +840,9 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async () => { hydrated = false })
 
-  pi.on("before_agent_start", async (event: any) => {
+  pi.on("before_agent_start", async (event: any, ctx: any) => {
+    // 脚本级兜底：当前模型探活失败就自动切另一个（不依赖模型自己判断）
+    await ensureModelAlive(ctx)
     const patch: any = {}
     const original = String(event?.systemPrompt || "")
     let prompt = original
@@ -752,9 +862,9 @@ export default function (pi: ExtensionAPI) {
       prompt = `${prompt}\n\n${style[0]}\n${style[1]}`
       log(`style injected · ${CHANNEL}`)
     }
-    // 本地小模型：提醒可以把重活交给在线子代理
-    const opt = localModelOptions()
-    if (opt.enabled && opt.preferSubagent && !prompt.includes(SUBAGENT_MARK)) prompt = `${prompt}\n\n${SUBAGENT_MARK}\n${SUBAGENT_BODY}`
+    // 模型使用规范：和心情一样注入（identity/模型使用规范.md，控制在 500 字内）
+    const rules = readText(MODEL_RULES_FILE)
+    if (rules && !prompt.includes(MODEL_RULES_MARK)) prompt = `${prompt}\n\n${MODEL_RULES_MARK}\n${rules}`
     if (prompt !== original) patch.systemPrompt = prompt
     const memory = first ? memoryBlock() : ""
     const content = [stateText(), memory].filter(Boolean).join("\n\n")
@@ -941,6 +1051,32 @@ export default function (pi: ExtensionAPI) {
         } catch { /* ignore */ }
       }
       return ok(picked.join("\n"))
+    },
+  })
+
+  addTool(pi, {
+    name: "switch_model",
+    label: "Switch model",
+    description: "本地 / 在线模型热切换。target: local=本地小模型，cloud=在线大模型，也可写 provider/model；不传 target 就报当前模型。",
+    parameters: {
+      type: "object",
+      properties: {
+        target: { type: "string", description: "local / cloud / provider/model；省略则查状态" },
+        reason: { type: "string", description: "为什么切，写一句，便于回看" },
+      },
+    },
+    async execute(_id: string, params: any, _signal: any, _onUpdate: any, ctx: any) {
+      const o = config().models
+      const cur = modelIdOf(ctx) || "未知"
+      const raw = String(params?.target || "").trim()
+      if (!raw || raw === "status") {
+        return ok(`当前模型：${cur}\n本地：${o.local || "未配"}\n在线：${o.cloud || "未配"}\n自动兜底：${o.autoFailover ? "开" : "关"}`)
+      }
+      if (!o.local && !o.cloud) return ok("还没配 models.local / models.cloud，先在 life-world.json 里配好。")
+      const target = raw === "local" ? o.local : raw === "cloud" ? o.cloud : raw
+      if (!target) return ok(`这个别名没配：${raw}`)
+      if (target === cur) return ok(`已经是 ${target} 了。`)
+      return ok(await switchTo(ctx, target, String(params?.reason || "")))
     },
   })
 
