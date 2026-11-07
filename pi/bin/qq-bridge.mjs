@@ -64,6 +64,8 @@ const wsUrl = bridge.wsUrl || "ws://127.0.0.1:3001"
 const wsToken = bridge.token || ""
 const afterglowCfg = Object.assign({ enabled: true, delayMs: 60000, maxRounds: 2 }, bridge.afterglow || {})
 const groupCfg = Object.assign({ enabled: false }, bridge.group || {})
+/** 群聊优先用在线模型（配了 models.cloud 才生效），私聊仍用 LIFE_WORLD_MODEL/本地 */
+const CLOUD_MODEL = String((config.models && config.models.cloud) || "")
 const TEST_USER = process.argv[2] === "--test-user" ? (process.argv[3] || "在吗") : ""
 const TEST_MS = Number(process.env.TEST_MS || 60000)
 
@@ -369,6 +371,8 @@ class PiSession {
     this.groupId = groupId
     this.name = name
     this.sessionFile = sessionFile
+    // 群聊优先在线模型；私聊仍用启动时指定的（本地）
+    this.model = channel === "group" && CLOUD_MODEL ? CLOUD_MODEL : MODEL
     this.child = null
     this.buffer = ""
     this.running = false
@@ -383,10 +387,10 @@ class PiSession {
   }
   start() {
     if (this.child) return
-    const args = ["--mode", "rpc", "--model", MODEL, "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-extensions", "-e", EXT, "--session-dir", SESSION_DIR]
+    const args = ["--mode", "rpc", "--model", this.model, "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-extensions", "-e", EXT, "--session-dir", SESSION_DIR]
     if (this.sessionFile) args.push("--session", this.sessionFile)
     else args.push("--name", this.name)
-    log("pi start", this.name, this.sessionFile || "(new)")
+    log("pi start", this.name, this.model, this.sessionFile || "(new)")
     const child = spawn(PI_BIN, args, { env: this.env(), stdio: ["pipe", "pipe", "pipe"] })
     this.child = child
     this.closed = false
@@ -632,7 +636,9 @@ async function handleGroup(msg) {
   if (!text && !media.length) return
   const key = String(groupId)
   const buf = groupBuffers.get(key) || []
-  buf.push({ sender: nameOf(msg), text: text || "[图片]", media, trigger: groupTrigger(msg, text), at: Date.now() })
+  const trigger = groupTrigger(msg, text)
+  buf.push({ sender: nameOf(msg), text: text || "[图片]", media, trigger, at: Date.now() })
+  log("group in", key, nameOf(msg), trigger ? "T" : "-", (text || "[图片]").slice(0, 40))
   groupBuffers.set(key, buf)
   if (buf.timer) clearTimeout(buf.timer)
   buf.timer = setTimeout(async () => {
@@ -678,13 +684,16 @@ async function handleGroup(msg) {
 function judgeGroup(groupId, batch) {
   return new Promise((resolve) => {
     const prompt = ["你是群聊读空气判断器。只输出 REPLY 或 SKIP。", `群号：${groupId}`, "最近消息：", ...batch.map((m) => `${m.sender}：${m.trigger ? "【@/点名】" : ""}${m.text}`), "规则：@/点名/关键词倾向 REPLY；闲聊/广告/敏感 SKIP。"].join("\n")
-    const child = spawn(PI_BIN, ["-p", "--model", MODEL, "--no-session", "--no-skills", "--no-prompt-templates", "--no-extensions", "--no-context-files", "--no-tools", "--system-prompt", "你是群聊读空气判断器，只输出 REPLY 或 SKIP。"], { env: { ...process.env, TZ }, stdio: ["pipe", "pipe", "ignore"] })
+    // 判官用在线模型（更快）：配了 models.cloud 就用它
+    const judgeModel = CLOUD_MODEL || MODEL
+    const child = spawn(PI_BIN, ["-p", "--model", judgeModel, "--no-session", "--no-skills", "--no-prompt-templates", "--no-extensions", "--no-context-files", "--no-tools", "--system-prompt", "你是群聊读空气判断器，只输出 REPLY 或 SKIP。"], { env: { ...process.env, TZ }, stdio: ["pipe", "pipe", "ignore"] })
     let out = ""
     const timer = setTimeout(() => { try { child.kill("SIGKILL") } catch { /* ignore */ } resolve("SKIP") }, 45000)
     child.stdout.on("data", (d) => { out += String(d) })
     child.on("close", () => { clearTimeout(timer); resolve(/REPLY/i.test(out) && !/SKIP/i.test(out) ? "REPLY" : "SKIP") })
     child.on("error", () => { clearTimeout(timer); resolve("SKIP") })
-    child.stdin.write(prompt + "\n")
+    // 必须 end()：pi -p 要等 stdin EOF 才会开始跑
+    child.stdin.end(prompt + "\n")
   })
 }
 

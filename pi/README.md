@@ -20,6 +20,8 @@
 - **记忆**：新会话首轮注入最近 48h / 2000 字 + 3 天记忆地图 + 自述
 - **定时器**：`LIFE_WORLD_ROLE=home` 的进程每 30 秒检查闹钟 / 每日回顾 / 早上兜底，用 `pi.sendMessage(triggerTurn)` 唤醒
 - **QQ 桥接**：OneBot v11 正向 WS ↔ `pi --mode rpc`；私聊、余波、outbox、图片/语音/文件、基础群聊
+  - 配了 `models.cloud` 时，**群聊会话优先在线模型**（判官也用在线模型），私聊仍用 `LIFE_WORLD_MODEL`（通常本地）
+  - 群聊触发：@ / 关键词 / 5% 随机插话；配置在桥接启动时读取，改完需重启
 - **子代理**：`delegate` 起独立 `pi -p` 子进程，零第三方扩展，深度限制 1 层
 - **gal**：`gal_choice` 工具用 `ctx.ui.select` 抛单选面板（仅终端 TUI；QQ 无面板）
 
