@@ -1,0 +1,27 @@
+{
+  "world": {
+    "enabled": true,
+    "running": true,
+    "reviewHour": 23,
+    "fallbackWakeTime": "09:00",
+    "hydrate": { "hours": 48, "chars": 2000, "mapDays": 3 }
+  },
+  "bridge": {
+    "enabled": true,
+    "ownerQQ": 0,
+    "ownerName": "",
+    "wsUrl": "ws://127.0.0.1:3001",
+    "token": "",
+    "privateSessionTitle": "qq-chat",
+    "afterglow": { "enabled": true, "delayMs": 60000, "maxRounds": 2 },
+    "group": {
+      "enabled": false,
+      "keywords": ["铃", "小铃"],
+      "interjectChance": 0.05,
+      "cooldownMs": 8000,
+      "maxPer10Min": 0,
+      "bannedWords": []
+    }
+  },
+  "subagent": { "model": "deepseek-flash" }
+}
