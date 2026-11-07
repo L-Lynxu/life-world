@@ -69,6 +69,9 @@ const QQ_GROUP_BODY = [
 const MODEL_RULES_FILE = join(IDENTITY_DIR, "模型使用规范.md")
 const MODEL_RULES_MARK = "## 模型使用规范"
 const AUTH_FILE = join(homedir(), ".pi/agent/auth.json")
+/** 机密抽屉：切到云端前把这段对话（含机密文件内容）收起来，切回本地再打开 */
+const DRAWER_DIR = join(WORLD, "机密抽屉")
+const DRAWER_FILE = join(DRAWER_DIR, "state.json")
 
 function log(text: string): void {
   try {
@@ -176,7 +179,7 @@ function config(): Config {
 
 function localModelOptions(): LocalModelOptions { return config().localModel }
 
-interface Alarm { id: string; at: string; note: string; setAt: string }
+interface Alarm { id: string; at: string; note: string; setAt: string; model?: "local" | "cloud" }
 interface WorldState { running?: boolean; alarms?: Alarm[]; lastReview?: string; lastWake?: string }
 function readWorld(): WorldState { return readJson<WorldState>(WORLD_FILE, { running: true, alarms: [] }) }
 function writeWorld(state: WorldState): boolean {
@@ -201,8 +204,9 @@ function moodLine(): string {
   return "无"
 }
 
-function stateText(): string {
-  return `[本地时间 ${stamp()} ${zone()}]\n（心情：${moodLine()}；OneBot 桥接：${bridgeStatus()}）`
+function stateText(withMood = true): string {
+  const tail = withMood ? `（心情：${moodLine()}；OneBot 桥接：${bridgeStatus()}）` : `（OneBot 桥接：${bridgeStatus()}）`
+  return `[本地时间 ${stamp()} ${zone()}]\n${tail}`
 }
 
 // ———————— 归档 / 记忆 ————————
@@ -505,6 +509,17 @@ function sendTime(text: string): void {
   } catch (e) { log(`sendTime failed ${String(e)}`) }
 }
 
+/** 闹钟到点前，先切到任务指定的模型（local / cloud） */
+async function switchForAlarm(alarm: Alarm): Promise<void> {
+  if (!alarm.model) return
+  const c = config().models
+  const target = alarm.model === "local" ? c.local : alarm.model === "cloud" ? c.cloud : ""
+  if (!target || !lastCtx) return
+  if (modelIdOf(lastCtx) === target) return
+  const result = await switchTo(lastCtx, target, `闹钟任务：${alarm.note.slice(0, 20)}`)
+  log(`alarm model · ${result}`)
+}
+
 function tick(): void {
   try {
     const c = config()
@@ -522,7 +537,9 @@ function tick(): void {
     // 到点闹钟
     const due = (state.alarms || []).filter((a) => Number.isFinite(Date.parse(a.at)) && Date.parse(a.at) <= Date.now())
     for (const a of due) {
-      sendTime(`【我的时间】${shortStamp(a.at)} 到了，说好做到这里是：${a.note}。\n先看看做完了没有；做完了就想想下一件，用 tools.plan_next 重新定。今天的计划在 ${join(PLAN_DIR, `${today}.md`)}。`)
+      const text = `【我的时间】${shortStamp(a.at)} 到了，说好做到这里是：${a.note}。\n先看看做完了没有；做完了就想想下一件，用 tools.plan_next 重新定。今天的计划在 ${join(PLAN_DIR, `${today}.md`)}。`
+      if (a.model) void switchForAlarm(a).then(() => sendTime(text)).catch((e) => { log(`alarm switch failed ${String(e)}`); sendTime(text) })
+      else sendTime(text)
       const fresh = readWorld()
       fresh.alarms = (fresh.alarms || []).filter((x) => x.id !== a.id)
       fresh.lastWake = today
@@ -544,6 +561,7 @@ function tick(): void {
 }
 
 let piRef: unknown
+let lastCtx: any = null
 
 // ———————— 扩展 ————————
 function argSummary(name: string, args: any): string {
@@ -740,7 +758,64 @@ function statsRequest(messages: any[]): void {
 // ———————— 本地 / 在线模型热切换 ————————
 let lastSwitch = { at: 0, from: "", to: "" }
 let failingOver = false
+let toolFailures = 0
 const modelHealthCache = new Map<string, { at: number; up: boolean }>()
+
+interface DrawerState { active: boolean; cutoff: number; hidden: number; stashed?: boolean }
+function readDrawer(): DrawerState {
+  return readJson<DrawerState>(DRAWER_FILE, { active: false, cutoff: 0, hidden: 0 })
+}
+/** 抽屉的实体：被挡下的原文按天存在机密抽屉目录里（云端看不到） */
+function drawerLogPath(): string { return join(DRAWER_DIR, `${dayOf()}.jsonl`) }
+/** 私密画像：只给本地模型看，切云端不注入 */
+const PRIVATE_PROFILE_FILE = join(DRAWER_DIR, "用户画像-私密.md")
+const PRIVATE_PROFILE_MARK = "## 私密画像（仅本地）"
+function writeDrawer(state: DrawerState): void {
+  try {
+    mkdirSync(DRAWER_DIR, { recursive: true, mode: 0o700 })
+    atomicWrite(DRAWER_FILE, JSON.stringify(state, null, 2))
+  } catch (e) { log(`writeDrawer failed ${String(e)}`) }
+}
+/** 切到云端：把此刻之前的私密对话收进抽屉（只对云端屏蔽，不改原会话） */
+function openDrawer(): void {
+  // 没配本地模型就谈不上“私密”，抽屉不启用
+  if (!config().models.local) return
+  const d = readDrawer()
+  writeDrawer({ active: true, cutoff: Date.now(), hidden: d.hidden, stashed: false })
+  log("privacy drawer opened")
+}
+/** 切回本地：抽屉合上，原对话重新可见 */
+function closeDrawer(): void {
+  const d = readDrawer()
+  if (!d.active) return
+  writeDrawer({ ...d, active: false })
+  log("privacy drawer closed")
+}
+
+/** 过滤后清掉配不上对的工具调用 / 结果，避免云端报 “tool 必须跟在 tool_calls 后面” */
+function sanitizeToolPairs(messages: any[]): any[] {
+  const callIds = new Set<string>()
+  for (const m of messages) {
+    if (m?.role !== "assistant" || !Array.isArray(m.content)) continue
+    for (const p of m.content) if (p?.type === "toolCall" && p.id) callIds.add(String(p.id))
+  }
+  const kept: any[] = []
+  const resultIds = new Set<string>()
+  for (const m of messages) {
+    if (m?.role === "toolResult") {
+      const id = String(m.toolCallId || "")
+      if (!callIds.has(id)) continue
+      resultIds.add(id)
+    }
+    kept.push(m)
+  }
+  for (const m of kept) {
+    if (m?.role !== "assistant" || !Array.isArray(m.content)) continue
+    const parts = m.content.filter((p: any) => p?.type !== "toolCall" || resultIds.has(String(p.id)))
+    if (parts.length !== m.content.length) m.content = parts
+  }
+  return kept.filter((m: any) => m?.role !== "assistant" || (Array.isArray(m.content) && m.content.length > 0))
+}
 
 function parseModelRef(ref: string): { provider: string; id: string } | null {
   const i = String(ref || "").indexOf("/")
@@ -798,6 +873,11 @@ async function switchTo(ctx: any, target: string, reason: string): Promise<strin
   if (!success) return `切不过去：${target} 没有可用凭据`
   lastSwitch = { at: Date.now(), from, to: target }
   modelHealthCache.delete(target)
+  toolFailures = 0
+  // 隐私：去云端先把这段私密对话收进本地抽屉；回本地再打开
+  const o = config().models
+  if (o.cloud && target === o.cloud) openDrawer()
+  else if (o.local && target === o.local) closeDrawer()
   log(`model switch ${from} → ${target}${reason ? ` · ${reason}` : ""}`)
   return `已切到 ${target}${reason ? `（${reason}）` : ""}`
 }
@@ -830,6 +910,19 @@ async function ensureModelAlive(ctx: any): Promise<void> {
   }
 }
 
+/** 出错兜底：同一模型连续两次报错就切另一个（不等健康检查） */
+async function failoverToOther(ctx: any, reason: string, opts: { onlyToCloud?: boolean } = {}): Promise<boolean> {
+  const o = config().models
+  if (!o.local || !o.cloud) return false
+  const cur = modelIdOf(ctx)
+  if (opts.onlyToCloud && cur !== o.local) return false
+  const alt = cur === o.local ? o.cloud : cur === o.cloud ? o.local : ""
+  if (!alt) return false
+  const result = await switchTo(ctx, alt, reason)
+  log(`failover · ${result}`)
+  return result.startsWith("已切到")
+}
+
 export default function (pi: ExtensionAPI) {
   piRef = pi
   if (JUDGE) return // 判官：不注入、不注册工具
@@ -838,9 +931,10 @@ export default function (pi: ExtensionAPI) {
 
   let hydrated = false
 
-  pi.on("session_start", async () => { hydrated = false })
+  pi.on("session_start", async (_event: any, ctx: any) => { hydrated = false; lastCtx = ctx })
 
   pi.on("before_agent_start", async (event: any, ctx: any) => {
+    lastCtx = ctx
     // 脚本级兜底：当前模型探活失败就自动切另一个（不依赖模型自己判断）
     await ensureModelAlive(ctx)
     const patch: any = {}
@@ -862,12 +956,26 @@ export default function (pi: ExtensionAPI) {
       prompt = `${prompt}\n\n${style[0]}\n${style[1]}`
       log(`style injected · ${CHANNEL}`)
     }
+    // 隐私抽屉开着时（云端在岗），不注入心情、私密记忆和私密画像
+    const drawer = readDrawer()
+    const o = config().models
+    // 只要当前在云端，就不注入任何私密内容（不管抽屉开没开）
+    const cloudActive = !!o.cloud && modelIdOf(ctx) === o.cloud
     // 模型使用规范：和心情一样注入（identity/模型使用规范.md，控制在 500 字内）
     const rules = readText(MODEL_RULES_FILE)
     if (rules && !prompt.includes(MODEL_RULES_MARK)) prompt = `${prompt}\n\n${MODEL_RULES_MARK}\n${rules}`
+    // 私密画像：只在本地模型在岗时注入；没配本地模型就完全不启用
+    if (o.local && !cloudActive) {
+      const priv = readText(PRIVATE_PROFILE_FILE)
+      if (priv && !prompt.includes(PRIVATE_PROFILE_MARK)) prompt = `${prompt}\n\n${PRIVATE_PROFILE_MARK}\n${priv}`
+    } else if (cloudActive) {
+      // 云端在岗：把之前注入过的私密画像从 system 里剥掉（块在末尾，直接截断）
+      const at = prompt.indexOf(`\n\n${PRIVATE_PROFILE_MARK}`)
+      if (at >= 0) prompt = prompt.slice(0, at)
+    }
     if (prompt !== original) patch.systemPrompt = prompt
-    const memory = first ? memoryBlock() : ""
-    const content = [stateText(), memory].filter(Boolean).join("\n\n")
+    const memory = first && !cloudActive ? memoryBlock() : ""
+    const content = [stateText(!cloudActive), memory].filter(Boolean).join("\n\n")
     if (content) {
       patch.message = {
         customType: first && memory ? "life-world-bootstrap" : "life-world-state",
@@ -883,34 +991,99 @@ export default function (pi: ExtensionAPI) {
     return { action: "continue" } as const
   })
 
-  // 本地小模型：发请求前折叠旧工具结果 / 推理，省上下文、省 prefill
-  pi.on("context", async (event: any) => {
-    const opt = localModelOptions()
-    if (!opt.enabled) return
+  pi.on("context", async (event: any, ctx: any) => {
     const messages = event?.messages
     if (!Array.isArray(messages)) return
-    const a = foldToolResults(messages, opt.foldToolResults, opt.resultChars)
-    const b = foldThinking(messages, opt.foldingThinkingTurns)
-    if (opt.debugStats) statsRequest(messages)
-    if (a || b) return { messages }
+    const o = config().models
+    const drawer = readDrawer()
+    let filtered = false
+
+    // 隐私抽屉：切到云端后，切换前的对话对云端不可见（原会话不动，切回本地自动恢复）
+    if (drawer.active && o.local && o.cloud && modelIdOf(ctx) === o.cloud) {
+      let lastUser = -1
+      for (let i = 0; i < messages.length; i++) if (messages[i]?.role === "user") lastUser = i
+      const kept = sanitizeToolPairs(messages.filter((m: any, i: number) => Number(m?.timestamp || 0) >= drawer.cutoff || i === lastUser))
+      if (kept.length !== messages.length) {
+        const hidden = messages.length - kept.length
+        if (!drawer.stashed) {
+          // 第一次收起时，把原文也在本地抽屉留一份（仅本地，云端看不到）
+          try {
+            const lines = messages
+              .filter((m: any) => Number(m?.timestamp || 0) < drawer.cutoff && m?.role !== "system")
+              .map((m: any) => {
+                const parts = Array.isArray(m?.content) ? m.content : [{ type: "text", text: String(m?.content ?? "") }]
+                const text = parts.map((p: any) => p?.type === "text" ? String(p.text || "") : p?.type === "image" ? "[图片]" : `[${p?.type || "?"}]`).join("\n").slice(0, 4000)
+                return JSON.stringify({ t: new Date(Number(m?.timestamp || 0)).toISOString(), role: m?.role, text })
+              })
+            if (lines.length) {
+              mkdirSync(DRAWER_DIR, { recursive: true, mode: 0o700 })
+              appendFileSync(drawerLogPath(), lines.join("\n") + "\n", { mode: 0o600 })
+            }
+          } catch (e) { log(`drawer stash failed ${String(e)}`) }
+          writeDrawer({ ...drawer, hidden, stashed: true })
+        } else if (hidden !== drawer.hidden) {
+          writeDrawer({ ...drawer, hidden })
+        }
+        log(`privacy drawer · hid ${hidden} messages from cloud`)
+        const stub = {
+          role: "system",
+          content: `[机密抽屉] 切换到云端之前有 ${hidden} 条对话已收进本地机密抽屉（${DRAWER_DIR}），本次请求不包含它们；回到本地模型时会重新打开。`,
+        }
+        event.messages = [stub, ...kept]
+        filtered = true
+      }
+    }
+
+    // 本地小模型：发请求前折叠旧工具结果 / 推理，省上下文、省 prefill
+    const opt = localModelOptions()
+    const a = opt.enabled ? foldToolResults(event.messages, opt.foldToolResults, opt.resultChars) : false
+    const b = opt.enabled ? foldThinking(event.messages, opt.foldingThinkingTurns) : false
+    if (opt.enabled && opt.debugStats) statsRequest(event.messages)
+    if (a || b || filtered) return { messages: event.messages }
   })
 
-  pi.on("message_end", async (event: any) => {
+  pi.on("message_end", async (event: any, ctx: any) => {
     const message = event?.message ?? event
     archive(message)
+    if (message?.role !== "assistant") return
+    const stop = String(message?.stopReason || "")
+    if (stop === "error") {
+      // 回复不了就直接切，不计数
+      log(`model error · ${modelIdOf(ctx)} · ${String(message?.errorMessage || "").slice(0, 200)}`)
+      await failoverToOther(ctx, "模型无响应")
+    } else if (stop === "stop" || stop === "length") {
+      // 正常收尾才清零；toolUse 只是中间轮，别把失败计数抹掉
+      toolFailures = 0
+    }
+  })
+
+  // 工具连续失败两次（参数错 / 调用不了）→ 切到另一个模型看看情况
+  pi.on("tool_execution_end", async (event: any, ctx: any) => {
+    if (event?.isError) {
+      toolFailures++
+      log(`tool failure ${toolFailures}/2 · ${String(event?.toolName || "?")}`)
+      if (toolFailures >= 2) {
+        toolFailures = 0
+        // 只在本地模型上切云端看看情况；已经在云端就别来回踢
+        await failoverToOther(ctx, "连续两次工具调用失败", { onlyToCloud: true })
+      }
+    } else {
+      toolFailures = 0
+    }
   })
 
   // —— 工具 ——
   addTool(pi, {
     name: "plan_next",
     label: "Plan next",
-    description: "说好接下来做什么、做到什么时候。到点会提醒。note 要写清做什么、怎么算做成；at 与 after_minutes 二选一。",
+    description: "说好接下来做什么、做到什么时候、到点用哪个模型跑。note 要写清做什么、怎么算做成；at 与 after_minutes 二选一；model 定好 local / cloud，到点会先切过去。",
     parameters: {
       type: "object",
       properties: {
         note: { type: "string", description: "做什么，以及怎么算做成了" },
         at: { type: "string", description: "带时区的完整时间，如 2026-11-07T18:00:00+08:00" },
         after_minutes: { type: "number", description: "从现在起多少分钟（至少 1）" },
+        model: { type: "string", enum: ["local", "cloud"], description: "到点用哪个模型跑；不传就沿用当前模型" },
       },
       required: ["note"],
     },
@@ -921,10 +1094,16 @@ export default function (pi: ExtensionAPI) {
       const target = typeof params.after_minutes === "number" ? now + params.after_minutes * 60_000 : Date.parse(String(params.at || ""))
       if (!Number.isFinite(target) || target < now + 60_000) return ok("时间不对：至少定在 1 分钟之后，at 要带时区。")
       const state = readWorld()
-      const alarm: Alarm = { id: `a-${now}-${Math.random().toString(36).slice(2, 6)}`, at: new Date(target).toISOString(), note: String(params.note || ""), setAt: new Date(now).toISOString() }
+      const c = config().models
+      const current = lastCtx ? modelIdOf(lastCtx) : ""
+      const model: Alarm["model"] = params.model === "local" || params.model === "cloud"
+        ? params.model
+        : current && current === c.local ? "local" : current && current === c.cloud ? "cloud" : undefined
+      const alarm: Alarm = { id: `a-${now}-${Math.random().toString(36).slice(2, 6)}`, at: new Date(target).toISOString(), note: String(params.note || ""), setAt: new Date(now).toISOString(), model }
       state.alarms = [...(state.alarms || []), alarm].sort((a, b) => Date.parse(a.at) - Date.parse(b.at))
       if (!writeWorld(state)) return ok("闹钟没能写进 world.json。")
-      return ok(`定好了：${isoLocal(new Date(target))} —— ${alarm.note}`)
+      const modelText = model === "cloud" ? "在线模型" : model === "local" ? "本地模型" : "当前模型"
+      return ok(`定好了：${isoLocal(new Date(target))} —— ${alarm.note}（到点用${modelText}跑）`)
     },
   })
 
@@ -936,7 +1115,7 @@ export default function (pi: ExtensionAPI) {
     async execute() {
       const alarms = readWorld().alarms || []
       if (!alarms.length) return ok("现在没有定闹钟。")
-      return ok(alarms.map((a) => `- ${shortStamp(a.at)}（还有 ${Math.max(0, Math.round((Date.parse(a.at) - Date.now()) / 60_000))} 分钟）${a.note}`).join("\n"))
+      return ok(alarms.map((a) => `- ${shortStamp(a.at)}（还有 ${Math.max(0, Math.round((Date.parse(a.at) - Date.now()) / 60_000))} 分钟）${a.note}${a.model ? `（${a.model === "cloud" ? "在线" : "本地"}模型）` : ""}`).join("\n"))
     },
   })
 

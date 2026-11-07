@@ -57,7 +57,7 @@ QQ ←→ OneBot v11 正向 WS（SnowLuma / NapCat …）
 - **归档**：`message_end` 写 `conversations/YYYY-MM-DD.jsonl`；
 - **定时器**：只在 `LIFE_WORLD_ROLE=home` 的进程跑，用 `pi.sendMessage(triggerTurn)` 唤醒；
 - **子代理**：`delegate` 起独立 `pi -p` 子进程，深度限制 1 层，零第三方；
-- **模型热切换**：`switch_model` 工具让角色自己决定用本地还是在线模型；`before_agent_start` 里另有脚本探活兜底，当前模型不可用会自动切到另一个（不依赖模型自己判断）；
+- **模型热切换**：`switch_model` 让角色自己决定用本地还是在线模型；模型无响应立即切，工具连续失败两次切云端；脚本探活兜底，不依赖模型自己判断。切云端前，之前的对话与机密文件收进本地 `机密抽屉/`，`用户画像-私密.md` 只给本地模型看；没配本地模型则抽屉不启用。`plan_next` 可为任务指定到点用哪个模型；
 - **联网搜索**：`web_search` 工具走 TinyFish 的 keyless 模式，不填 API Key 也能搜（opencode 版同源能力）。
 
 ## 和 main（opencode 版）的区别

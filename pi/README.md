@@ -11,7 +11,9 @@
 把 life-world 从 opencode 插件搬到 pi 的原生扩展点：
 
 - **工具**：`plan_next` / `check_alarm` / `cancel_alarm` / `reach_out` / `send_media` / `group_chat` / `kaomoji` / `memory_search` / `memory_day` / `memory_timeline` / `delegate` / `gal_choice` / `switch_model` / `web_search`
-- **模型热切换**：`switch_model` 让角色自己决定本地 / 在线；`before_agent_start` 另有脚本探活兜底，当前模型不可用自动切另一个
+- **模型热切换**：`switch_model` 让角色自己决定本地 / 在线；模型无响应立即切、工具连续失败两次切云端，另有脚本探活兜底
+- **机密抽屉**：切云端前把之前的对话与机密文件收进 `worlds/default/机密抽屉/`，`用户画像-私密.md` 只给本地模型看；没配本地模型则整个抽屉不启用
+- **闹钟带模型**：`plan_next` 可指定到点用 `local` / `cloud`，定时器触发前先切过去
 - **联网搜索**：`web_search` 走 TinyFish keyless，免 API Key
 - **每轮状态**：`input` 事件把时间、心情、桥接状态拼进当前用户消息（不改 system，保护缓存）
 - **归档**：`message_end` 写 `conversations/YYYY-MM-DD.jsonl`
@@ -106,7 +108,17 @@ pi          # TUI，已经带 life-world
 - 在线模型（如 `deepseek/deepseek-flash`）用 pi 内置目录 + `~/.pi/agent/auth.json` 的凭据；
 - 自建/本地模型（如 `basalt/abliterated-iq3_xxs`）先在 `~/.pi/agent/models.json` 里注册 provider（baseUrl / api / apiKey），再用 `provider/model` 引用。
 
-`models.local` 留空则不启用热切换；`autoFailover` 打开时，扩展在每轮开始前探活当前模型，挂了就自动切到另一个（冷却 `cooldownMs`，防止来回抖）。
+`models.local` 留空则不启用热切换（机密抽屉也随之停用）；`autoFailover` 打开时，扩展在每轮开始前探活当前模型，挂了就自动切到另一个（冷却 `cooldownMs`，防止来回抖）。
+
+### 机密抽屉
+
+切到云端前，扩展会把切换前的对话与工具读到的内容收进 `worlds/default/机密抽屉/`（按天 `${dayOf()}.jsonl`），云端请求只保留当前这条任务；切回本地自动恢复。`机密抽屉/用户画像-私密.md` 只在本地模型在岗时注入 system，云端看不到。
+
+触发自动切换的规则：模型无响应（`stopReason=error`）立即切；工具连续失败两次，从本地切到云端看看情况。
+
+### 闹钟带模型
+
+`plan_next({ note, at|after_minutes, model: "local"|"cloud" })`：到点时定时器先切到指定模型再唤醒。《模型使用规范》建议定任务时就写清楚用哪个。
 
 ## 界面整洁
 
