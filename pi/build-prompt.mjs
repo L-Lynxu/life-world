@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * 把仓库根目录的 modules/*.md 拼成 pi 的静态系统提示词 prompt/world.md。
- * pi 通过 --append-system-prompt 加载它；静态内容站在可缓存前缀里。
+ * 扩展在 before_agent_start 每轮确保它在 system 里；静态内容站在可缓存前缀里。
  *
  *   LIFE_WORLD_ROOT=~/.local/share/life-world node build-prompt.mjs
  */

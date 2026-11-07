@@ -968,11 +968,10 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event: any, ctx: any) => {
     hydrated = false
     lastCtx = ctx
-    // 恢复会话时按当前模型对齐抽屉：云端补开，本地补合
+    // 恢复会话时只补开、不主动合：同一 session 可能还有另一个进程在云端
     const o = config().models
     if (!o.local) return
-    if (modelIdOf(ctx) === o.local) closeDrawer(ctx)
-    else openDrawer(ctx)
+    if (modelIdOf(ctx) !== o.local) openDrawer(ctx)
   })
 
   // 手动 /model、Ctrl+P 切到云端也要开抽屉；切回本地合上
@@ -1011,10 +1010,22 @@ export default function (pi: ExtensionAPI) {
     try { blob = JSON.stringify(input) } catch { blob = "" }
     if (hitsDrawer(blob)) return { block: true, reason: `云端模式不能打开机密抽屉。${HINT}` }
 
-    // 递归/打包整个世界目录：抽屉藏在里面，点到为止拦一下
-    if (name === "grep" || name === "find" || name === "bash") {
+    // grep / find 本身就是递归的（没有 -r 参数），path 指向 world 或其祖先就拦
+    const cwd = String(ctx?.sessionManager?.getCwd?.() || process.cwd())
+    const inWorld = (p: string): boolean => {
+      if (!p) return false
+      const abs = p.startsWith("/") ? p : resolve(cwd, p)
+      const norm = abs.replace(/\/+$/, "")
+      return DRAWER_DIR === norm || DRAWER_DIR.startsWith(norm + sep)
+    }
+    if ((name === "grep" || name === "find") && inWorld(String(input.path || ""))) {
+      return { block: true, reason: `机密抽屉在 ${input.path} 底下，云端模式别递归翻；点名具体文件，或切回本地。${HINT}` }
+    }
+
+    // bash：递归 / 打包 / 裸 find 整个世界目录也拦
+    if (name === "bash") {
       const touchesWorld = blob.includes(WORLD) || blob.includes("worlds/default")
-      const recursive = /-r|--recursive|-R|-exec|\btar\s|\bgrep\s+-[A-Za-z]*r/.test(blob)
+      const recursive = /-r|--recursive|-R|-exec|\btar\s|\bfind\s|\bgrep\s+-[A-Za-z]*r/.test(blob)
       if (touchesWorld && recursive) {
         return { block: true, reason: `整个世界目录里有机密抽屉，云端模式别递归翻；点名具体文件，或切回本地。${HINT}` }
       }
@@ -1053,7 +1064,7 @@ export default function (pi: ExtensionAPI) {
     // 私密资料：不预加载内容，只告诉它在哪；云端模式明确别碰
     if (o.local && !prompt.includes(PRIVATE_HINT_MARK)) {
       const hint = cloudActive
-        ? `私密资料在 ${DRAWER_DIR}。当前是云端模式：这个文件夹不许 read / ls / grep / edit，需要就切回本地。`
+        ? `私密资料在 ${DRAWER_DIR}。当前是云端模式：这个文件夹不许 read / write / edit / grep / find / ls / bash 打开，也别递归翻 world 目录；需要就切回本地。`
         : `私密资料在 ${DRAWER_DIR}，需要时自己 read。`
       prompt = `${prompt}\n\n${PRIVATE_HINT_MARK}\n${hint}`
     }

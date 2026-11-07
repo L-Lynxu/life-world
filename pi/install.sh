@@ -26,6 +26,9 @@ ensure_world() {
   cp "$SRC"/../scripts/browser-* "$ROOT/bin/" 2>/dev/null || true
   cp "$SRC"/bin/qq-bridge.mjs "$ROOT/bin/pi-qq-bridge.mjs" 2>/dev/null || true
   cp "$SRC"/bin/home-rpc.mjs "$ROOT/bin/pi-home-rpc.mjs" 2>/dev/null || true
+  # 桥接/家会话默认从 ../ext 找扩展；装到 bin/ 后要有一份对应位置
+  mkdir -p "$ROOT/ext"
+  ln -sfn "$SRC/ext/life-world.ts" "$ROOT/ext/life-world.ts"
   chmod +x "$ROOT/bin"/*.sh "$ROOT/bin"/*.mjs 2>/dev/null || true
   echo "  ✓ 配套脚本 → $ROOT/bin/（pi-qq-bridge.mjs / pi-home-rpc.mjs）"
 }

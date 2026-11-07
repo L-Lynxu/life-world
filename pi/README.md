@@ -51,8 +51,9 @@ cd life-world
 4. 把扩展软链到 pi 的自动发现目录：
    - 全局：`~/.pi/agent/extensions/life-world/index.ts`
    - 项目级：`<仓库>/.pi/extensions/life-world/index.ts`
+5. 把 `browser-*`、`pi-qq-bridge.mjs`、`pi-home-rpc.mjs` 复制到 `~/.local/share/life-world/bin/`，并放一份扩展在 `~/.local/share/life-world/ext/`（桥接脚本默认从那里找）。
 
-**扩展会自己在每轮开始前确保 `prompt/world.md` 在场**，所以不需要 `--append-system-prompt`，也不需要改 `APPEND_SYSTEM.md`。
+**扩展会自己在每轮开始前确保世界规则在 system 里**（`prompt/world.md` 缺失时用 `modules/` 现拼），所以不需要 `--append-system-prompt`，也不需要改 `APPEND_SYSTEM.md`。
 
 装完直接：
 
@@ -98,6 +99,8 @@ pi          # TUI，已经带 life-world
 ```
 
 完整示例见 `pi/config.example.json`。
+
+> 总开关：`world.enabled=false` 会让扩展整体停用（工具、注入、定时器都不挂），**需重启 pi 生效**；世界数据原地保留。
 
 ### 模型使用规范
 
