@@ -147,6 +147,8 @@ pi -p --model deepseek-flash --no-skills --no-prompt-templates \
 
 `PI_BIN` / `LIFE_WORLD_EXT` / `LIFE_WORLD_PROMPT` / `LIFE_WORLD_MODEL` 都可用环境变量覆盖；默认从 `bin/` 相对定位扩展与提示词。
 
+附件：图片超过 8MB 会自动缩到 1568px（需要 `imagemagick` 或 `ffmpeg`）；工作文件不设大小上限，流式落盘到 `worlds/default/tmp/` 后把路径交给模型。
+
 ### SnowLuma / NapCat 只监听 127.0.0.1 时
 
 从其他机器/容器连不上时，用 SSH 隧道（以宿主机 `192.168.0.195` 为例）：

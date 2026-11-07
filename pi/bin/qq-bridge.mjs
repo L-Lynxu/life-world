@@ -12,11 +12,13 @@
  *   node qq-bridge.mjs
  *   node qq-bridge.mjs --test-user "在吗"     # 模拟 owner 发一条私聊，测试用
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { appendFileSync, createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { Readable } from "node:stream"
+import { pipeline } from "node:stream/promises"
 import { basename, dirname, join, sep } from "node:path"
 import { fileURLToPath } from "node:url"
 import { homedir } from "node:os"
-import { spawn } from "node:child_process"
+import { spawn, spawnSync } from "node:child_process"
 
 const HOME = homedir()
 const ROOT = process.env.LIFE_WORLD_ROOT || join(HOME, ".local/share/life-world")
@@ -208,8 +210,13 @@ function sendGroup(groupId, text) {
 
 // ———————————————— 附件 ————————————————
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024
-const MAX_FILE_BYTES = 20 * 1024 * 1024
-const MAX_TOTAL_BYTES = 40 * 1024 * 1024
+/** 工作文件不设上限（下载走流式落盘，不进内存） */
+const MAX_FILE_BYTES = Infinity
+const MAX_TOTAL_BYTES = Infinity
+/** 图片在缩放前的原始大小上限（再大就不折腾了） */
+const HARD_CAP_BYTES = 40 * 1024 * 1024
+/** 最近一次附件失败原因，用来给出准确提示 */
+let lastAttachmentIssue = ""
 function safeName(name, fallback) {
   const s = String(name || "").replace(/[\\/:*?"<>|\r\n\t]/g, "_").replace(/\.\./g, "_").trim().slice(0, 80)
   return s || fallback
@@ -262,24 +269,89 @@ async function resolveMedia(m) {
   } catch (e) { log("get_private_file_url failed", String(e)) }
   return undefined
 }
+/** 找一个可用的图片缩放工具（装了哪个用哪个） */
+function findConverter() {
+  for (const cmd of ["magick", "convert", "ffmpeg"]) {
+    try {
+      const r = spawnSync("sh", ["-c", `command -v ${cmd}`], { stdio: "ignore" })
+      if (r.status === 0) return cmd
+    } catch { /* ignore */ }
+  }
+  return ""
+}
+
+/** 图片超上限时缩到 1568px 长边、JPEG，返回新路径 */
+function resizeImage(path, maxBytes) {
+  const cmd = findConverter()
+  if (!cmd) return undefined
+  const out = `${path}.small.jpg`
+  const args = cmd === "ffmpeg"
+    ? ["-y", "-loglevel", "error", "-i", path, "-vf", "scale=min(1568\\,iw):-2", "-q:v", "3", out]
+    : [path, "-resize", "1568x1568>", "-quality", "85", out]
+  try {
+    const r = spawnSync(cmd, args, { timeout: 30_000 })
+    if (r.status !== 0 || !existsSync(out)) return undefined
+    if (statSync(out).size > maxBytes) { try { unlinkSync(out) } catch { /* ignore */ } return undefined }
+    return out
+  } catch { return undefined }
+}
+
 async function downloadMedia(m, maxBytes) {
+  // 文件：流式落盘，不设大小上限（工作文件可能很大）
+  if (m.type === "file" && !m.base64 && !m.localPath && /^https?:\/\//i.test(m.url || "")) {
+    try {
+      const res = await fetch(m.url, { signal: AbortSignal.timeout(10 * 60_000) })
+      if (!res.ok || !res.body) { lastAttachmentIssue = "download"; return undefined }
+      mkdirSync(TMP_DIR, { recursive: true, mode: 0o700 })
+      const ext = (String(m.name || "").match(/\.[A-Za-z0-9]{1,8}$/) || [".bin"])[0]
+      const path = join(TMP_DIR, `qq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`)
+      await pipeline(Readable.fromWeb(res.body), createWriteStream(path, { mode: 0o600 }))
+      return { path, name: m.name || basename(path) }
+    } catch (e) {
+      lastAttachmentIssue = "download"
+      log("file download failed", String(e).slice(0, 200))
+      return undefined
+    }
+  }
   let buf
   if (m.base64) buf = Buffer.from(String(m.base64), "base64")
   else if (m.localPath && existsSync(m.localPath)) buf = readFileSync(m.localPath)
   else if (/^https?:\/\//i.test(m.url || "")) {
     const res = await fetch(m.url, { signal: AbortSignal.timeout(15000) })
-    if (!res.ok) return undefined
+    if (!res.ok) { lastAttachmentIssue = "download"; return undefined }
     const len = Number(res.headers.get("content-length") || 0)
-    if (len > maxBytes) return undefined
+    if (len > HARD_CAP_BYTES) {
+      lastAttachmentIssue = "too_large"
+      log("attachment too large (hard cap)", len)
+      return undefined
+    }
     buf = Buffer.from(await res.arrayBuffer())
-  } else return undefined
-  if (buf.length > maxBytes) return undefined
+  } else { lastAttachmentIssue = "download"; return undefined }
+  if (buf.length > HARD_CAP_BYTES) { lastAttachmentIssue = "too_large"; return undefined }
   mkdirSync(TMP_DIR, { recursive: true, mode: 0o700 })
   const ext = m.type === "image"
     ? ((String(m.name || m.url || "").match(/\.(png|jpe?g|gif|webp)/i) || [".jpg"])[0])
     : ((String(m.name || "").match(/\.[A-Za-z0-9]{1,8}$/) || [".bin"])[0])
-  const path = join(TMP_DIR, `qq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`)
+  let path = join(TMP_DIR, `qq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`)
   writeFileSync(path, buf, { mode: 0o600 })
+  if (buf.length > maxBytes) {
+    if (m.type !== "image") {
+      lastAttachmentIssue = "too_large"
+      try { unlinkSync(path) } catch { /* ignore */ }
+      log("file too large", buf.length)
+      return undefined
+    }
+    const small = resizeImage(path, maxBytes)
+    if (!small) {
+      lastAttachmentIssue = "too_large"
+      try { unlinkSync(path) } catch { /* ignore */ }
+      log("image too large and cannot resize", buf.length)
+      return undefined
+    }
+    log("image resized", buf.length, "→", statSync(small).size)
+    try { unlinkSync(path) } catch { /* ignore */ }
+    path = small
+  }
   return { path, name: m.name || basename(path) }
 }
 async function fetchAttachment(m, maxBytes) {
@@ -472,6 +544,7 @@ async function handlePrivateNow(msg) {
     return
   }
   const attachments = []
+  lastAttachmentIssue = ""
   let budget = MAX_TOTAL_BYTES
   for (const item of media) {
     const max = Math.min(item.type === "image" ? MAX_IMAGE_BYTES : MAX_FILE_BYTES, budget)
@@ -485,7 +558,10 @@ async function handlePrivateNow(msg) {
     attachments.push({ ...got, type: item.type })
   }
   if (!text && !attachments.length) {
-    await call("send_private_msg", { user_id: ownerQQ, message: "（附件没下载下来，再发一次试试？）" }).catch(() => {})
+    const tip = lastAttachmentIssue === "too_large"
+      ? "（图片太大了：单张上限 8MB，缩一下或截小一点再发；装了 imagemagick 或 ffmpeg 的话我会自动缩。）"
+      : "（附件没下载下来，再发一次试试？）"
+    await call("send_private_msg", { user_id: ownerQQ, message: tip }).catch(() => {})
     return
   }
   const images = attachments.filter((a) => a.type === "image").map((a) => imagePayload(a.path))

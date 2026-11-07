@@ -31,6 +31,9 @@ ensure_world() {
   ln -sfn "$SRC/ext/life-world.ts" "$ROOT/ext/life-world.ts"
   chmod +x "$ROOT/bin"/*.sh "$ROOT/bin"/*.mjs 2>/dev/null || true
   echo "  ✓ 配套脚本 → $ROOT/bin/（pi-qq-bridge.mjs / pi-home-rpc.mjs）"
+  if ! command -v magick >/dev/null 2>&1 && ! command -v convert >/dev/null 2>&1 && ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "  · 提示：没装 imagemagick / ffmpeg，超过 8MB 的图片不会自动缩"
+  fi
 }
 
 build_prompt() {
