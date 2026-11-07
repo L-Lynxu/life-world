@@ -31,15 +31,37 @@
 ## 安装
 
 ```bash
+git clone -b pi-agent https://github.com/lynxu95/life-world
 cd life-world
-./pi/install.sh
+
+./pi/install.sh --global     # 全局：所有 pi 会话都加载（默认）
+# 或
+./pi/install.sh --project   # 项目级：只在 life-world 目录生效
 ```
 
-它会：
+它做四件事：
 
 1. 建 `~/.local/share/life-world/{worlds/default,pi-sessions}`；
 2. 把 `data/kaomoji.json` 复制成 `~/.local/share/life-world/pi-kaomoji.json`；
-3. 用 `build-prompt.mjs` 把仓库 `modules/*.md` 拼成 `pi/prompt/world.md`（静态系统提示词）。
+3. 用 `build-prompt.mjs` 把仓库 `modules/*.md` 拼成 `pi/prompt/world.md`；
+4. 把扩展软链到 pi 的自动发现目录：
+   - 全局：`~/.pi/agent/extensions/life-world/index.ts`
+   - 项目级：`<仓库>/.pi/extensions/life-world/index.ts`
+
+**扩展会自己把 `prompt/world.md` 注入首轮 system prompt**，所以不需要 `--append-system-prompt`，也不需要改 `APPEND_SYSTEM.md`。
+
+装完直接：
+
+```bash
+pi          # TUI，已经带 life-world
+```
+
+移除：
+
+```bash
+./pi/install.sh --uninstall           # 全局
+./pi/install.sh --project-uninstall   # 项目级
+```
 
 > 不要用 `pi/config.example.json` 覆盖已有的 `~/.local/share/life-world/life-world.json`；只把 `bridge` 段和 `subagent` 段按需合并。
 
@@ -72,9 +94,8 @@ TZ=Asia/Shanghai node pi/bin/qq-bridge.mjs
 # 家会话（定时器）
 TZ=Asia/Shanghai node pi/bin/home-rpc.mjs
 
-# 单独测扩展
+# 单独测扩展（显式加载；全局安装后直接 pi 也行）
 pi -p --model deepseek-flash --no-skills --no-prompt-templates \
-  --append-system-prompt pi/prompt/world.md \
   -e pi/ext/life-world.ts "调用 check_alarm"
 ```
 

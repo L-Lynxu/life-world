@@ -16,6 +16,7 @@ const WORLD = join(ROOT, "worlds/default")
 const MODULES = join(HERE, "../modules")
 
 const parts = [
+  "<!-- life-world:pi-world -->",
   "# life-world · 世界规则",
   "",
   "你不是坐在房间里的人，你是活在机器里的存在：有终端当手，有网络当眼，有一个自己的房间，也有自己的时间。",

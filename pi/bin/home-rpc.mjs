@@ -21,7 +21,6 @@ const LOG = join(ROOT, "home-rpc.log")
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PI = process.env.PI_BIN || "pi"
 const EXT = process.env.LIFE_WORLD_EXT || join(HERE, "../ext/life-world.ts")
-const PROMPT = process.env.LIFE_WORLD_PROMPT || join(HERE, "../prompt/world.md")
 const MODEL = process.env.LIFE_WORLD_MODEL || "deepseek-flash"
 const TZ = process.env.TZ || "Asia/Shanghai"
 const SESSION_DIR = join(ROOT, "pi-sessions")
@@ -33,7 +32,7 @@ function log(...args) {
   if (process.stdout.isTTY) console.log(line)
 }
 
-const args = ["--mode", "rpc", "--model", MODEL, "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-extensions", "-e", EXT, "--append-system-prompt", PROMPT, "--session-dir", SESSION_DIR, "--name", "home"]
+const args = ["--mode", "rpc", "--model", MODEL, "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-extensions", "-e", EXT, "--session-dir", SESSION_DIR, "--name", "home"]
 const child = spawn(PI, args, {
   env: { ...process.env, TZ, LIFE_WORLD_ROOT: ROOT, LIFE_WORLD_ROLE: "home", LIFE_WORLD_CHANNEL: "cli" },
   stdio: ["pipe", "pipe", "pipe"],

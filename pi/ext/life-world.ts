@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs"
 import { basename, dirname, join, resolve, sep } from "node:path"
 import { homedir } from "node:os"
+import { fileURLToPath } from "node:url"
 import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 
@@ -12,6 +13,11 @@ import { createHash } from "node:crypto"
  */
 
 const ROOT = process.env.LIFE_WORLD_ROOT || join(homedir(), ".local/share/life-world")
+const SELF_PATH = (() => { try { return realpathSync(fileURLToPath(import.meta.url)) } catch { return fileURLToPath(import.meta.url) } })()
+const EXT_DIR = dirname(SELF_PATH)
+const PROMPT_FILE = process.env.LIFE_WORLD_PROMPT || join(EXT_DIR, "../prompt/world.md")
+const MODULES_DIR = join(EXT_DIR, "../../modules")
+const WORLD_MARK = "<!-- life-world:pi-world -->"
 const WORLD = join(ROOT, "worlds/default")
 const CONV_DIR = join(WORLD, "conversations")
 const DIARY_DIR = join(WORLD, "diary")
@@ -464,6 +470,44 @@ function tick(): void {
 let piRef: unknown
 
 // ———————— 扩展 ————————
+let promptCache: string | undefined
+function worldPromptText(): string {
+  if (promptCache !== undefined) return promptCache
+  let text = ""
+  try { if (existsSync(PROMPT_FILE)) text = readFileSync(PROMPT_FILE, "utf8") } catch { /* ignore */ }
+  if (!text) {
+    // 没跑 install.sh（例如直接 clone / 包安装）时，从仓库 modules 现拼
+    try {
+      const parts = ["# life-world · 世界规则", "", `世界数据在 ${WORLD}。规则按主题如下：`, ""]
+      for (const file of readdirSync(MODULES_DIR).filter((f) => f.endsWith(".md")).sort()) {
+        const name = file.replace(/\.md$/, "")
+        let body = readFileSync(join(MODULES_DIR, file), "utf8").trim()
+        if (name === "gal") body = body.replace(/\bquestion\b/g, "gal_choice")
+        parts.push("---", "", `## ${name}`, "", body, "")
+      }
+      text = parts.join("\n")
+    } catch { /* ignore */ }
+  }
+  const map: Record<string, string> = {
+    "{worldDir}": WORLD,
+    "{modulesDir}": MODULES_DIR,
+    "{roomDir}": join(WORLD, "room"),
+    "{stickerDir}": join(WORLD, "表情包"),
+    "{identityDir}": join(WORLD, "identity"),
+    "{diaryDir}": join(WORLD, "diary"),
+    "{planDir}": join(WORLD, "plan"),
+    "{conversationsDir}": join(WORLD, "conversations"),
+    "{selfFile}": join(WORLD, "identity/我是谁.md"),
+    "{profileFile}": join(WORLD, "identity/用户画像.md"),
+    "{moodFile}": join(WORLD, "identity/心情.md"),
+    "{planFile}": join(WORLD, "plan/YYYY-MM-DD.md"),
+  }
+  for (const [key, value] of Object.entries(map)) text = text.split(key).join(value)
+  if (text && !text.includes(WORLD_MARK)) text = `${WORLD_MARK}\n${text}`
+  promptCache = text
+  return text
+}
+
 export default function (pi: ExtensionAPI) {
   piRef = pi
   if (JUDGE) return // 判官：不注入、不注册工具
@@ -472,13 +516,18 @@ export default function (pi: ExtensionAPI) {
 
   let hydrated = false
 
+  pi.on("session_start", async () => { hydrated = false })
+
   pi.on("before_agent_start", async (event: any) => {
     if (hydrated) return
-    if (event?.messageType === "custom") return
     hydrated = true
+    const world = worldPromptText()
     const memory = memoryBlock()
-    if (!memory) return
-    return { message: { customType: "life-world-memory", content: memory, display: false } }
+    const patch: any = {}
+    const current = String(event?.systemPrompt || "")
+    if (world && !current.includes(WORLD_MARK)) patch.systemPrompt = `${current}\n\n${world}`
+    if (memory) patch.message = { customType: "life-world-memory", content: memory, display: false }
+    if (patch.systemPrompt || patch.message) return patch
   })
 
   pi.on("input", async (event: any) => {

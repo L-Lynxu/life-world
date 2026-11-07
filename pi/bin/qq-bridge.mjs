@@ -30,7 +30,6 @@ const SESSION_DIR = join(ROOT, "pi-sessions")
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PI_BIN = process.env.PI_BIN || "pi"
 const EXT = process.env.LIFE_WORLD_EXT || join(HERE, "../ext/life-world.ts")
-const PROMPT = process.env.LIFE_WORLD_PROMPT || join(HERE, "../prompt/world.md")
 const MODEL = process.env.LIFE_WORLD_MODEL || "deepseek-flash"
 const TZ = process.env.TZ || "Asia/Shanghai"
 
@@ -312,7 +311,7 @@ class PiSession {
   }
   start() {
     if (this.child) return
-    const args = ["--mode", "rpc", "--model", MODEL, "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-extensions", "-e", EXT, "--append-system-prompt", PROMPT, "--session-dir", SESSION_DIR]
+    const args = ["--mode", "rpc", "--model", MODEL, "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-extensions", "-e", EXT, "--session-dir", SESSION_DIR]
     if (this.sessionFile) args.push("--session", this.sessionFile)
     else args.push("--name", this.name)
     log("pi start", this.name, this.sessionFile || "(new)")
