@@ -51,13 +51,13 @@ QQ ←→ OneBot v11 正向 WS（SnowLuma / NapCat …）
 
 关键设计：
 
-- **静态世界规则**：`pi/prompt/world.md`（由 `pi/build-prompt.mjs` 从仓库 `modules/*.md` 生成），扩展在 `before_agent_start` 首轮注入一次；
+- **静态世界规则**：`pi/prompt/world.md`（由 `pi/build-prompt.mjs` 从仓库 `modules/*.md` 生成），扩展在 `before_agent_start` 每轮确保在场（pi 的强制 system prompt 只对单次 run 生效）；
 - **动态状态**：`before_agent_start` 用隐藏消息（`display: false`）注入「本地时间 + 心情 + 桥接状态」，不改 system，保护缓存；
 - **工具**：`pi.registerTool`，模型直接可见，不需要 opencode 的 `execute` 绕路；
 - **归档**：`message_end` 写 `conversations/YYYY-MM-DD.jsonl`；
 - **定时器**：只在 `LIFE_WORLD_ROLE=home` 的进程跑，用 `pi.sendMessage(triggerTurn)` 唤醒；
 - **子代理**：`delegate` 起独立 `pi -p` 子进程，深度限制 1 层，零第三方；
-- **模型热切换**：`switch_model` 让角色自己决定用本地还是在线模型；模型无响应立即切，工具连续失败两次切云端；脚本探活兜底，不依赖模型自己判断。切云端前，之前的对话与机密文件收进本地 `机密抽屉/`，`用户画像-私密.md` 只给本地模型看；没配本地模型则抽屉不启用。`plan_next` 可为任务指定到点用哪个模型；
+- **模型热切换**：`switch_model` 让角色自己决定用本地还是在线模型；模型无响应立即切，工具连续失败两次切云端；脚本探活兜底，不依赖模型自己判断。切云端前，之前的对话与机密文件收进本地 `机密抽屉/`；云端模式禁止访问该目录（read/ls/grep/edit/bash 命中即拦），私密画像不预加载、本地需要时自己读；没配本地模型则抽屉不启用。`plan_next` 可为任务指定到点用哪个模型；
 - **联网搜索**：`web_search` 工具走 TinyFish 的 keyless 模式，不填 API Key 也能搜（opencode 版同源能力）。
 
 ## 和 main（opencode 版）的区别

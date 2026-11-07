@@ -71,7 +71,7 @@ const MODEL_RULES_MARK = "## 模型使用规范"
 const AUTH_FILE = join(homedir(), ".pi/agent/auth.json")
 /** 机密抽屉：切到云端前把这段对话（含机密文件内容）收起来，切回本地再打开 */
 const DRAWER_DIR = join(WORLD, "机密抽屉")
-const DRAWER_FILE = join(DRAWER_DIR, "state.json")
+const DRAWER_SESSIONS = join(DRAWER_DIR, "sessions")
 
 function log(text: string): void {
   try {
@@ -762,34 +762,57 @@ let toolFailures = 0
 const modelHealthCache = new Map<string, { at: number; up: boolean }>()
 
 interface DrawerState { active: boolean; cutoff: number; hidden: number; stashed?: boolean }
-function readDrawer(): DrawerState {
-  return readJson<DrawerState>(DRAWER_FILE, { active: false, cutoff: 0, hidden: 0 })
+/** 抽屉按会话隔离：一个进程合抽屉不影响另一个云端会话 */
+function sessionKey(ctx: any): string {
+  const id = ctx?.sessionManager?.getSessionId?.()
+  return String(id || `proc-${process.pid}`).replace(/[^A-Za-z0-9_.-]/g, "_")
+}
+function drawerFile(key: string): string { return join(DRAWER_SESSIONS, `${key}.json`) }
+function readDrawer(key: string): DrawerState {
+  const file = drawerFile(key)
+  if (!existsSync(file)) return { active: false, cutoff: 0, hidden: 0 }
+  try { return JSON.parse(readFileSync(file, "utf8")) as DrawerState }
+  catch {
+    // 读不出来就按“开着”处理，宁可多挡也不漏
+    log(`drawer state unreadable, fail-closed · ${key}`)
+    return { active: true, cutoff: Date.now(), hidden: 0, stashed: true }
+  }
 }
 /** 抽屉的实体：被挡下的原文按天存在机密抽屉目录里（云端看不到） */
 function drawerLogPath(): string { return join(DRAWER_DIR, `${dayOf()}.jsonl`) }
-/** 私密画像：只给本地模型看，切云端不注入 */
-const PRIVATE_PROFILE_FILE = join(DRAWER_DIR, "用户画像-私密.md")
-const PRIVATE_PROFILE_MARK = "## 私密画像（仅本地）"
-function writeDrawer(state: DrawerState): void {
+/** 私密资料提示（不预加载内容，本地需要自己看） */
+const PRIVATE_HINT_MARK = "## 私密资料"
+function writeDrawer(key: string, state: DrawerState): boolean {
   try {
-    mkdirSync(DRAWER_DIR, { recursive: true, mode: 0o700 })
-    atomicWrite(DRAWER_FILE, JSON.stringify(state, null, 2))
-  } catch (e) { log(`writeDrawer failed ${String(e)}`) }
+    mkdirSync(DRAWER_SESSIONS, { recursive: true, mode: 0o700 })
+    atomicWrite(drawerFile(key), JSON.stringify(state, null, 2))
+    return true
+  } catch (e) {
+    log(`writeDrawer failed ${String(e)}`)
+    return false
+  }
 }
-/** 切到云端：把此刻之前的私密对话收进抽屉（只对云端屏蔽，不改原会话） */
-function openDrawer(): void {
+/** 切到云端：把此刻之前的对话收进抽屉（只对云端屏蔽，不改原会话） */
+function openDrawer(ctx: any): boolean {
   // 没配本地模型就谈不上“私密”，抽屉不启用
-  if (!config().models.local) return
-  const d = readDrawer()
-  writeDrawer({ active: true, cutoff: Date.now(), hidden: d.hidden, stashed: false })
-  log("privacy drawer opened")
+  if (!config().models.local) return true
+  const key = sessionKey(ctx)
+  const d = readDrawer(key)
+  const now = Date.now()
+  const state: DrawerState = d.active
+    ? { ...d, active: true, cutoff: Math.min(d.cutoff || now, now) }
+    : { active: true, cutoff: now, hidden: 0, stashed: false }
+  const okWrite = writeDrawer(key, state)
+  log(`privacy drawer opened · ${key}`)
+  return okWrite
 }
 /** 切回本地：抽屉合上，原对话重新可见 */
-function closeDrawer(): void {
-  const d = readDrawer()
+function closeDrawer(ctx: any): void {
+  const key = sessionKey(ctx)
+  const d = readDrawer(key)
   if (!d.active) return
-  writeDrawer({ ...d, active: false })
-  log("privacy drawer closed")
+  writeDrawer(key, { ...d, active: false })
+  log(`privacy drawer closed · ${key}`)
 }
 
 /** 过滤后清掉配不上对的工具调用 / 结果，避免云端报 “tool 必须跟在 tool_calls 后面” */
@@ -874,10 +897,13 @@ async function switchTo(ctx: any, target: string, reason: string): Promise<strin
   lastSwitch = { at: Date.now(), from, to: target }
   modelHealthCache.delete(target)
   toolFailures = 0
-  // 隐私：去云端先把这段私密对话收进本地抽屉；回本地再打开
+  // 隐私：任何“非本地”的目标都先开抽屉；回本地再合上
   const o = config().models
-  if (o.cloud && target === o.cloud) openDrawer()
-  else if (o.local && target === o.local) closeDrawer()
+  if (o.local && target !== o.local) {
+    if (!openDrawer(ctx)) return `切不过去：机密抽屉打不开（${DRAWER_DIR}）`
+  } else if (o.local && target === o.local) {
+    closeDrawer(ctx)
+  }
   log(`model switch ${from} → ${target}${reason ? ` · ${reason}` : ""}`)
   return `已切到 ${target}${reason ? `（${reason}）` : ""}`
 }
@@ -931,7 +957,35 @@ export default function (pi: ExtensionAPI) {
 
   let hydrated = false
 
-  pi.on("session_start", async (_event: any, ctx: any) => { hydrated = false; lastCtx = ctx })
+  pi.on("session_start", async (_event: any, ctx: any) => {
+    hydrated = false
+    lastCtx = ctx
+    // 恢复的会话如果当前已经是云端（比如 /model 切过），补开抽屉
+    const o = config().models
+    if (o.local && modelIdOf(ctx) !== o.local) openDrawer(ctx)
+  })
+
+  // 手动 /model、Ctrl+P 切到云端也要开抽屉；切回本地合上
+  pi.on("model_select", async (event: any, ctx: any) => {
+    const o = config().models
+    if (!o.local) return
+    const id = `${event?.model?.provider}/${event?.model?.id}`
+    if (id === o.local) closeDrawer(ctx)
+    else openDrawer(ctx)
+  })
+
+  // 云端模式：禁碰机密抽屉（read / ls / grep / edit / bash 命中就拦）
+  pi.on("tool_call", async (event: any, ctx: any) => {
+    const o = config().models
+    if (!o.local || modelIdOf(ctx) === o.local) return
+    const name = String(event?.toolName || "")
+    if (!["read", "write", "edit", "grep", "find", "ls", "bash"].includes(name)) return
+    let blob = ""
+    try { blob = JSON.stringify(event?.input ?? {}) } catch { blob = "" }
+    if (blob.includes(DRAWER_DIR) || blob.includes("机密抽屉")) {
+      return { block: true, reason: "机密抽屉在云端模式禁读。这是机密资料，需要就切回本地模型再看。" }
+    }
+  })
 
   pi.on("before_agent_start", async (event: any, ctx: any) => {
     lastCtx = ctx
@@ -941,11 +995,10 @@ export default function (pi: ExtensionAPI) {
     const original = String(event?.systemPrompt || "")
     let prompt = original
     const first = !hydrated
-    if (first) {
-      hydrated = true
-      const world = worldPromptText()
-      if (world && !prompt.includes(WORLD_MARK)) prompt = `${prompt}\n\n${world}`
-    }
+    if (first) hydrated = true
+    // 世界规则每轮确保在场（pi 的强制 system prompt 只对本次 run 生效）
+    const world = worldPromptText()
+    if (world && !prompt.includes(WORLD_MARK)) prompt = `${prompt}\n\n${world}`
     // QQ 渠道：补上私聊 / 群聊的说话方式（压缩后可能丢，每轮确保在场）
     const style = CHANNEL === "qq"
       ? [QQ_PRIVATE_MARK, QQ_PRIVATE_BODY]
@@ -956,22 +1009,19 @@ export default function (pi: ExtensionAPI) {
       prompt = `${prompt}\n\n${style[0]}\n${style[1]}`
       log(`style injected · ${CHANNEL}`)
     }
-    // 隐私抽屉开着时（云端在岗），不注入心情、私密记忆和私密画像
-    const drawer = readDrawer()
     const o = config().models
-    // 只要当前在云端，就不注入任何私密内容（不管抽屉开没开）
-    const cloudActive = !!o.cloud && modelIdOf(ctx) === o.cloud
+    const isLocal = !!o.local && modelIdOf(ctx) === o.local
+    // 配了本地模型时：只要当前不是本地，就按云端处理（第三个模型也算）
+    const cloudActive = !!o.local && !isLocal
     // 模型使用规范：和心情一样注入（identity/模型使用规范.md，控制在 500 字内）
     const rules = readText(MODEL_RULES_FILE)
     if (rules && !prompt.includes(MODEL_RULES_MARK)) prompt = `${prompt}\n\n${MODEL_RULES_MARK}\n${rules}`
-    // 私密画像：只在本地模型在岗时注入；没配本地模型就完全不启用
-    if (o.local && !cloudActive) {
-      const priv = readText(PRIVATE_PROFILE_FILE)
-      if (priv && !prompt.includes(PRIVATE_PROFILE_MARK)) prompt = `${prompt}\n\n${PRIVATE_PROFILE_MARK}\n${priv}`
-    } else if (cloudActive) {
-      // 云端在岗：把之前注入过的私密画像从 system 里剥掉（块在末尾，直接截断）
-      const at = prompt.indexOf(`\n\n${PRIVATE_PROFILE_MARK}`)
-      if (at >= 0) prompt = prompt.slice(0, at)
+    // 私密资料：不预加载内容，只告诉它在哪；云端模式明确别碰
+    if (o.local && !prompt.includes(PRIVATE_HINT_MARK)) {
+      const hint = cloudActive
+        ? `私密资料在 ${DRAWER_DIR}。当前是云端模式：这个文件夹不许 read / ls / grep / edit，需要就切回本地。`
+        : `私密资料在 ${DRAWER_DIR}，需要时自己 read。`
+      prompt = `${prompt}\n\n${PRIVATE_HINT_MARK}\n${hint}`
     }
     if (prompt !== original) patch.systemPrompt = prompt
     const memory = first && !cloudActive ? memoryBlock() : ""
@@ -995,11 +1045,12 @@ export default function (pi: ExtensionAPI) {
     const messages = event?.messages
     if (!Array.isArray(messages)) return
     const o = config().models
-    const drawer = readDrawer()
+    const key = sessionKey(ctx)
+    const drawer = readDrawer(key)
     let filtered = false
 
     // 隐私抽屉：切到云端后，切换前的对话对云端不可见（原会话不动，切回本地自动恢复）
-    if (drawer.active && o.local && o.cloud && modelIdOf(ctx) === o.cloud) {
+    if (drawer.active && o.local && modelIdOf(ctx) !== o.local) {
       let lastUser = -1
       for (let i = 0; i < messages.length; i++) if (messages[i]?.role === "user") lastUser = i
       const kept = sanitizeToolPairs(messages.filter((m: any, i: number) => Number(m?.timestamp || 0) >= drawer.cutoff || i === lastUser))
@@ -1020,9 +1071,9 @@ export default function (pi: ExtensionAPI) {
               appendFileSync(drawerLogPath(), lines.join("\n") + "\n", { mode: 0o600 })
             }
           } catch (e) { log(`drawer stash failed ${String(e)}`) }
-          writeDrawer({ ...drawer, hidden, stashed: true })
+          writeDrawer(key, { ...drawer, hidden, stashed: true })
         } else if (hidden !== drawer.hidden) {
-          writeDrawer({ ...drawer, hidden })
+          writeDrawer(key, { ...drawer, hidden })
         }
         log(`privacy drawer · hid ${hidden} messages from cloud`)
         const stub = {

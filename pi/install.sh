@@ -21,6 +21,12 @@ ensure_world() {
   chmod 700 "$ROOT" "$ROOT/worlds/default" 2>/dev/null || true
   cp "$SRC/../data/kaomoji.json" "$ROOT/pi-kaomoji.json"
   echo "  ✓ 颜文字库 → $ROOT/pi-kaomoji.json"
+  # 配套脚本：浏览器 / 桥接 / 家会话，模块里引用的 ~/.local/share/life-world/bin 路径
+  mkdir -p "$ROOT/bin"
+  cp "$SRC"/../scripts/* "$ROOT/bin/" 2>/dev/null || true
+  cp "$SRC"/bin/*.mjs "$ROOT/bin/" 2>/dev/null || true
+  chmod +x "$ROOT/bin"/*.sh "$ROOT/bin"/*.mjs 2>/dev/null || true
+  echo "  ✓ 配套脚本 → $ROOT/bin/"
 }
 
 build_prompt() {
