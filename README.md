@@ -5,16 +5,6 @@
 
 给 [pi coding agent](https://github.com/earendil-works/pi) 里的陪伴角色一个会记得、会生活的世界：跨会话记忆与检索、自己的时间、每日回顾、心情、颜文字、QQ 桥接、语音、私聊余波和零第三方子代理。
 
-## 状态
-
-**MVP 已在 OrbStack 的 Debian 容器里跑通**（pi 1.5.0 + `deepseek-flash`）：
-
-- 扩展工具：`plan_next` / `check_alarm` / `cancel_alarm` / `reach_out` / `send_media` / `group_chat` / `kaomoji` / `memory_search` / `memory_day` / `memory_timeline` / `delegate` / `gal_choice`
-- QQ 私聊端到端、私聊余波、outbox、图片/语音发送、家会话闹钟
-- 子代理：`delegate` 起独立 `pi -p` 子进程，零第三方扩展
-
-还没铺开测试：QQ 入站图片/文件、群聊实测、余波并发矩阵、`/new`、语音实际投递、TUI/gal 的完整回归。
-
 ## 快速开始
 
 要求：**pi 1.5.0+**；只有跑 QQ 桥接/家会话时需要 **Node 22+** 和 OneBot v11 服务端。
