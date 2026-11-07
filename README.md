@@ -129,17 +129,6 @@ pi/
 | 桥接 HTTP API | pi RPC JSONL |
 | 在线子代理提示 | `delegate` 独立 `pi -p` 进程 |
 
-## 已知缺口
-
-- QQ **入站图片/文件**代码已写，未在真实 QQ 回归；
-- **群聊**基础版（攒批/判官/冷却/黑名单/群图）未在真实群实测；
-- **余波并发矩阵**、`/new`、**语音**实际投递未回归；
-- **Prompt 缓存**（静态注入 + 动态 input）未和 opencode 对比；
-- **TUI/gal**：`gal_choice` 依赖 `ctx.ui.select`，QQ/RPC 无面板；
-- **部署化**：systemd/supervisor、日志轮转、重启恢复未做。
-
-更细的实施记录见 `pi/README.md`；vault 里的评估与 worklog 在 `AI/开发中项目/`。
-
 ## 许可证
 
 MIT，见 [`LICENSE`](./LICENSE)。

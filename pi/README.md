@@ -135,17 +135,6 @@ TZ=Asia/Shanghai TEST_MS=45000 node pi/bin/qq-bridge.mjs --test-user "在吗"
 | 桥接 HTTP API | pi RPC JSONL |
 | 在线子代理提示 | `delegate` 独立 `pi -p` 进程 |
 
-## 已知缺口（分支当前状态）
-
-- QQ **入站图片/文件**：桥接已实现下载并作为 pi `images` 传入；文件以路径提示交给 `read` 工具。未在真实 QQ 上做完整回归。
-- **群聊**：基础版（攒批、@/关键词、判官、冷却、黑名单）已写；未在真实群实测。
-- **余波并发矩阵**：私聊已串行；用户中途回话 / 空正文 / 报错 / `[SILENT]` 的组合还没跑全。
-- **`/new`**：已实现（重启 pi 会话），未实测。
-- **语音**：`record` 段 + 私聊文件降级已写；未实际投递。
-- **Prompt 缓存**：静态 `--append-system-prompt` + 动态 `input` 的缓存命中还没和 opencode 对比。
-- **TUI / gal**：`gal_choice` 依赖 `ctx.ui.select`；RPC 桥接会取消 `extension_ui_request`，所以 QQ 不启用面板。
-- **部署化**：systemd/supervisor、日志轮转、重启恢复还没做。
-
 ## 文件
 
 ```
