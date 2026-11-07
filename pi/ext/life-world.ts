@@ -537,7 +537,7 @@ function tick(): void {
     // 到点闹钟
     const due = (state.alarms || []).filter((a) => Number.isFinite(Date.parse(a.at)) && Date.parse(a.at) <= Date.now())
     for (const a of due) {
-      const text = `【我的时间】${shortStamp(a.at)} 到了，说好做到这里是：${a.note}。\n先看看做完了没有；做完了就想想下一件，用 tools.plan_next 重新定。今天的计划在 ${join(PLAN_DIR, `${today}.md`)}。`
+      const text = `【我的时间】${shortStamp(a.at)} 到了，说好做到这里是：${a.note}。\n先看看做完了没有；做完了就想想下一件，用 plan_next 重新定。今天的计划在 ${join(PLAN_DIR, `${today}.md`)}。`
       if (a.model) void switchForAlarm(a).then(() => sendTime(text)).catch((e) => { log(`alarm switch failed ${String(e)}`); sendTime(text) })
       else sendTime(text)
       const fresh = readWorld()
@@ -555,7 +555,7 @@ function tick(): void {
     const [fh, fm] = c.world.fallbackWakeTime.split(":").map((x) => Number(x) || 0)
     const mins = hour * 60 + now.getMinutes()
     if (mins < fh * 60 + fm || mins >= fh * 60 + fm + 240) return
-    sendTime(`【我的时间】早上了，新的一天。先看看今天的安排：${join(PLAN_DIR, `${today}.md`)}。没有就自己拟一份大概的；挑一件现在就做的，用 tools.plan_next 排上时间。`)
+    sendTime(`【我的时间】早上了，新的一天。先看看今天的安排：${join(PLAN_DIR, `${today}.md`)}。没有就自己拟一份大概的；挑一件现在就做的，用 plan_next 排上时间。`)
     writeWorld({ ...state, lastWake: today })
   } catch (e) { log(`tick failed ${String(e)}`) }
 }
@@ -892,18 +892,25 @@ async function switchTo(ctx: any, target: string, reason: string): Promise<strin
   const model = ctx?.modelRegistry?.find?.(ref.provider, ref.id)
   if (!model) return `pi 里找不到这个模型：${target}`
   const from = modelIdOf(ctx)
+  const o = config().models
+  const goingCloud = !!o.local && target !== o.local
+  const goingLocal = !!o.local && target === o.local
+  // 隐私：先去云端先把抽屉打开；开不了就不切（fail-closed）
+  let openedNow = false
+  if (goingCloud) {
+    const key = sessionKey(ctx)
+    openedNow = !readDrawer(key).active
+    if (!openDrawer(ctx)) return `切不过去：机密抽屉打不开（${DRAWER_DIR}）`
+  }
   const success = await (piRef as any)?.setModel?.(model)
-  if (!success) return `切不过去：${target} 没有可用凭据`
+  if (!success) {
+    if (goingCloud && openedNow) closeDrawer(ctx)
+    return `切不过去：${target} 没有可用凭据`
+  }
   lastSwitch = { at: Date.now(), from, to: target }
   modelHealthCache.delete(target)
   toolFailures = 0
-  // 隐私：任何“非本地”的目标都先开抽屉；回本地再合上
-  const o = config().models
-  if (o.local && target !== o.local) {
-    if (!openDrawer(ctx)) return `切不过去：机密抽屉打不开（${DRAWER_DIR}）`
-  } else if (o.local && target === o.local) {
-    closeDrawer(ctx)
-  }
+  if (goingLocal) closeDrawer(ctx)
   log(`model switch ${from} → ${target}${reason ? ` · ${reason}` : ""}`)
   return `已切到 ${target}${reason ? `（${reason}）` : ""}`
 }
@@ -952,6 +959,7 @@ async function failoverToOther(ctx: any, reason: string, opts: { onlyToCloud?: b
 export default function (pi: ExtensionAPI) {
   piRef = pi
   if (JUDGE) return // 判官：不注入、不注册工具
+  if (!config().world.enabled) { log("life-world disabled · world.enabled=false"); return }
   ensureDirs()
   loadArchived()
 
@@ -960,9 +968,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event: any, ctx: any) => {
     hydrated = false
     lastCtx = ctx
-    // 恢复的会话如果当前已经是云端（比如 /model 切过），补开抽屉
+    // 恢复会话时按当前模型对齐抽屉：云端补开，本地补合
     const o = config().models
-    if (o.local && modelIdOf(ctx) !== o.local) openDrawer(ctx)
+    if (!o.local) return
+    if (modelIdOf(ctx) === o.local) closeDrawer(ctx)
+    else openDrawer(ctx)
   })
 
   // 手动 /model、Ctrl+P 切到云端也要开抽屉；切回本地合上
@@ -974,16 +984,40 @@ export default function (pi: ExtensionAPI) {
     else openDrawer(ctx)
   })
 
-  // 云端模式：禁碰机密抽屉（read / ls / grep / edit / bash 命中就拦）
+  // 云端模式：别碰机密抽屉（拦常见路数，剩下的靠自觉）
   pi.on("tool_call", async (event: any, ctx: any) => {
     const o = config().models
     if (!o.local || modelIdOf(ctx) === o.local) return
     const name = String(event?.toolName || "")
-    if (!["read", "write", "edit", "grep", "find", "ls", "bash"].includes(name)) return
+    const input: any = event?.input ?? {}
+    const HINT = "需要看就调用 switch_model 切回本地模型。"
+    const hitsDrawer = (s: string) => s.includes(DRAWER_DIR) || s.includes("机密抽屉")
+
+    // 写类：只看目标路径，别因为正文里提到“机密抽屉”就误拦
+    if (name === "write" || name === "edit") {
+      const path = String(input.path || input.file_path || input.file || "")
+      if (hitsDrawer(path)) return { block: true, reason: `云端模式不能读写机密抽屉。${HINT}` }
+      return
+    }
+
+    // 子代理不走本扩展的守卫，这里先拦带抽屉路径的任务
+    if (name === "delegate") {
+      if (hitsDrawer(String(input.task || ""))) return { block: true, reason: `子代理不能处理机密抽屉。${HINT}` }
+      return
+    }
+
+    if (!["read", "grep", "find", "ls", "bash"].includes(name)) return
     let blob = ""
-    try { blob = JSON.stringify(event?.input ?? {}) } catch { blob = "" }
-    if (blob.includes(DRAWER_DIR) || blob.includes("机密抽屉")) {
-      return { block: true, reason: "机密抽屉在云端模式禁读。这是机密资料，需要就切回本地模型再看。" }
+    try { blob = JSON.stringify(input) } catch { blob = "" }
+    if (hitsDrawer(blob)) return { block: true, reason: `云端模式不能打开机密抽屉。${HINT}` }
+
+    // 递归/打包整个世界目录：抽屉藏在里面，点到为止拦一下
+    if (name === "grep" || name === "find" || name === "bash") {
+      const touchesWorld = blob.includes(WORLD) || blob.includes("worlds/default")
+      const recursive = /-r|--recursive|-R|-exec|\btar\s|\bgrep\s+-[A-Za-z]*r/.test(blob)
+      if (touchesWorld && recursive) {
+        return { block: true, reason: `整个世界目录里有机密抽屉，云端模式别递归翻；点名具体文件，或切回本地。${HINT}` }
+      }
     }
   })
 

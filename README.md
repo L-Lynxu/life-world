@@ -24,7 +24,7 @@ cd life-world
 pi
 ```
 
-扩展会自动把世界规则注入首轮 system prompt；不需要 `--append-system-prompt`，也不需要改 `APPEND_SYSTEM.md`。
+扩展会在每轮开始前确保世界规则在 system 里；不需要 `--append-system-prompt`，也不需要改 `APPEND_SYSTEM.md`。
 
 卸载：
 

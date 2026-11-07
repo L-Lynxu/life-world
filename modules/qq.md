@@ -16,7 +16,7 @@ tail -20 ~/.local/share/life-world/qq-bridge.log
 日志里看 ws open / ws error / reconnect；进程没了就重启：
 
 ```bash
-setsid nohup node ~/.local/share/life-world/bin/qq-bridge.mjs >> ~/.local/share/life-world/qq-bridge.log 2>&1 < /dev/null &
+setsid nohup node ~/.local/share/life-world/bin/pi-qq-bridge.mjs >> ~/.local/share/life-world/qq-bridge.log 2>&1 < /dev/null &
 ```
 
 出现 ws open 才算接上。进程没了就是桥接掉线，不是 OneBot 服务端（NapCat / SnowLuma 等）的问题。升级后先停旧桥接再起。
