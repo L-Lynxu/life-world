@@ -1496,7 +1496,7 @@ export default function (pi: ExtensionAPI) {
   addTool(pi, {
     name: "gal_choice",
     label: "Gal choice panel",
-    description: "终端 gal 模式用：抛一个单选面板让用户选。QQ/群聊没有面板，别用；那边把选项写成正文。",
+    description: "终端 gal 模式用：抛一个单选面板让用户选；系统会自动追加「其他（自己输入）」，用户可自由改写方向。QQ/群聊没有面板，别用；那边把选项写成正文。",
     parameters: {
       type: "object",
       properties: {
@@ -1511,7 +1511,13 @@ export default function (pi: ExtensionAPI) {
       if (!ui?.select) return ok("当前会话没有选项面板；把选项写成正文。")
       const options = Array.isArray(params.options) ? params.options.map((x: any) => String(x)).slice(0, 3) : []
       if (!options.length) return ok("没有选项。")
-      const choice = await ui.select(String(params.question || "选一个"), options)
+      // 永远留一个“自己输入”的出口
+      const customLabel = "其他（自己输入）"
+      const choice = await ui.select(String(params.question || "选一个"), [...options, customLabel])
+      if (choice === customLabel) {
+        const typed = ui.input ? await ui.input("想说什么？") : ""
+        return ok(`用户选择：${String(typed || "").trim() || "（取消）"}`)
+      }
       return ok(`用户选择：${choice ?? "（取消）"}`)
     },
   })
