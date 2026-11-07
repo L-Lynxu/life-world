@@ -600,6 +600,49 @@ function worldPromptText(): string {
   return text
 }
 
+// ———————— 联网搜索（TinyFish keyless，免费；opencode websearch 同源） ————————
+const TINYFISH_ENDPOINT = "https://agent.tinyfish.ai/mcp"
+interface SearchHit { title: string; url: string; snippet?: string }
+
+async function webSearch(query: string, limit: number): Promise<SearchHit[]> {
+  const key = process.env.TINYFISH_API_KEY || ""
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+    "User-Agent": "life-world/pi",
+  }
+  if (key) headers["X-API-Key"] = key
+  else headers["X-TinyFish-Access-Mode"] = "keyless"
+  const body = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "search", arguments: { query } } })
+  const ctrl = new AbortController()
+  const timer = setTimeout(() => ctrl.abort(), 25_000)
+  try {
+    const res = await fetch(TINYFISH_ENDPOINT, { method: "POST", headers, body, signal: ctrl.signal })
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const raw = await res.text()
+    const payloads = [raw.trim()]
+    for (const line of raw.split("\n")) if (line.startsWith("data: ")) payloads.push(line.slice(6))
+    for (const payload of payloads) {
+      if (!payload.startsWith("{")) continue
+      let obj: any
+      try { obj = JSON.parse(payload) } catch { continue }
+      const text = obj?.result?.content?.find((c: any) => c?.type === "text")?.text
+      if (!text) continue
+      let data: any
+      try { data = JSON.parse(text) } catch { continue }
+      const list = Array.isArray(data?.results) ? data.results : []
+      return list.slice(0, limit).map((r: any) => ({
+        title: String(r.title || ""),
+        url: String(r.url || ""),
+        snippet: r.snippet ? String(r.snippet) : undefined,
+      }))
+    }
+    return []
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 // ———————— 本地小模型：上下文折叠 ————————
 /** 保留最近 keepTurns 轮，返回需要处理的截止下标（0 = 不需要动） */
 function turnCutoff(messages: any[], keepTurns: number): number {
@@ -898,6 +941,32 @@ export default function (pi: ExtensionAPI) {
         } catch { /* ignore */ }
       }
       return ok(picked.join("\n"))
+    },
+  })
+
+  addTool(pi, {
+    name: "web_search",
+    label: "Web search",
+    description: "联网搜索最新信息（免费，不需要 key）。返回标题、链接、摘要；要看正文再打开链接。",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "搜索词" },
+        limit: { type: "number", description: "返回几条，默认 5（最多 10）" },
+      },
+      required: ["query"],
+    },
+    async execute(_id: string, params: any) {
+      const query = String(params.query || "").trim()
+      if (!query) return ok("要搜什么？给个搜索词。")
+      const limit = Math.max(1, Math.min(10, Number(params.limit) || 5))
+      try {
+        const hits = await webSearch(query, limit)
+        if (!hits.length) return ok(`没搜到「${query}」的结果。`)
+        return ok(hits.map((h, i) => `${i + 1}. ${h.title}\n   ${h.url}${h.snippet ? `\n   ${h.snippet.replace(/\s+/g, " ").slice(0, 200)}` : ""}`).join("\n"))
+      } catch (e) {
+        return ok(`搜索失败：${String((e as any)?.message || e)}`)
+      }
     },
   })
 
