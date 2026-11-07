@@ -400,7 +400,8 @@ class PiSession {
     child.stdout.on("data", (d) => this.onData(String(d)))
     this.request("get_state").then((res) => {
       const file = res?.data?.sessionFile
-      if (file) { this.sessionFile = file; state.piSessionFile = file; saveState() }
+      // 只有私聊会话写进全局状态；群会话不能覆盖它
+      if (file) { this.sessionFile = file; if (this.channel === "qq") { state.piSessionFile = file; saveState() } }
     }).catch(() => {})
   }
   onExit() {
@@ -464,15 +465,19 @@ class PiSession {
       this.write({ id, type, ...extra })
     })
   }
-  async prompt(text, images = [], timeoutMs = 300000) {
+  // timeoutMs = 0：不限时（本地模型慢，等它说完）
+  async prompt(text, images = [], timeoutMs = 0) {
     if (this.closed || !this.child) this.start()
     if (this.running) {
       await new Promise((resolve) => this.idleWaiters.push(resolve))
     }
     this.texts = []
     const wait = new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { reject(new Error("prompt timeout")) }, timeoutMs)
-      this.waiters.push({ resolve: (v) => { clearTimeout(timer); resolve(v) }, reject: (e) => { clearTimeout(timer); reject(e) } })
+      const timer = timeoutMs > 0 ? setTimeout(() => { reject(new Error("prompt timeout")) }, timeoutMs) : null
+      this.waiters.push({
+        resolve: (v) => { if (timer) clearTimeout(timer); resolve(v) },
+        reject: (e) => { if (timer) clearTimeout(timer); reject(e) },
+      })
     })
     const body = { type: "prompt", message: text }
     if (images.length) body.images = images

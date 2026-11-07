@@ -603,7 +603,11 @@ function worldPromptText(): string {
   if (!text) {
     // 没跑 install.sh（例如直接 clone / 包安装）时，从仓库 modules 现拼
     try {
-      const parts = ["# life-world · 世界规则", "", `世界数据在 ${WORLD}。规则按主题如下：`, ""]
+      const parts = [
+        "# life-world · 世界规则", "",
+        "你不是某个模型：本地/在线模型都只是你借用的身体与算力，换模型不等于换人。身份以 identity/我是谁.md 为准，不要自称 DeepSeek、千问之类的模型名。", "",
+        `世界数据在 ${WORLD}。规则按主题如下：`, "",
+      ]
       for (const file of readdirSync(MODULES_DIR).filter((f) => f.endsWith(".md")).sort()) {
         const name = file.replace(/\.md$/, "")
         let body = readFileSync(join(MODULES_DIR, file), "utf8").trim()
@@ -1064,7 +1068,7 @@ export default function (pi: ExtensionAPI) {
     // 私密资料：不预加载内容，只告诉它在哪；云端模式明确别碰
     if (o.local && !prompt.includes(PRIVATE_HINT_MARK)) {
       const hint = cloudActive
-        ? `私密资料在 ${DRAWER_DIR}。当前是云端模式：这个文件夹不许 read / write / edit / grep / find / ls / bash 打开，也别递归翻 world 目录；需要就切回本地。`
+        ? `私密资料在 ${DRAWER_DIR}。你仍是同一个你，只是这会儿借用云端机房的算力——机房的人可能看到这次上下文，所以这个文件夹先不打开，不是不信任你。需要看就切回本地模型。`
         : `私密资料在 ${DRAWER_DIR}，需要时自己 read。`
       prompt = `${prompt}\n\n${PRIVATE_HINT_MARK}\n${hint}`
     }
