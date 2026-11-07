@@ -195,13 +195,100 @@ function sendPrivate(text) {
 }
 function sendGroup(groupId, text) {
   return enqueueSend(`group:${groupId}`, async () => {
+    const banned = (Array.isArray(groupCfg.bannedWords) ? groupCfg.bannedWords : []).map((x) => String(x || "").trim()).filter(Boolean)
     for (const line of splitMessages(text)) {
       if (/\[SILENT\]/i.test(line)) continue
-      try { await call("send_group_msg", { group_id: Number(groupId), message: line }) } catch (e) { log("send group failed", String(e)); return false }
+      if (banned.some((w) => line.includes(w))) { log("group filter blocked", line.slice(0, 40)); continue }
+      try { await call("send_group_msg", { group_id: Number(groupId), message: line }); log("sent group", line.slice(0, 40)) } catch (e) { log("send group failed", String(e)); return false }
       await sleep(900 + Math.min(2500, line.length * 45))
     }
     return true
   })
+}
+
+
+// ———————————————— 附件 ————————————————
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024
+const MAX_FILE_BYTES = 20 * 1024 * 1024
+const MAX_TOTAL_BYTES = 40 * 1024 * 1024
+function safeName(name, fallback) {
+  const s = String(name || "").replace(/[\\/:*?"<>|\r\n\t]/g, "_").replace(/\.\./g, "_").trim().slice(0, 80)
+  return s || fallback
+}
+function mimeOf(path) {
+  const ext = (String(path).match(/\.[A-Za-z0-9]+$/) || [""])[0].toLowerCase()
+  return ({ ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp" })[ext] || "image/jpeg"
+}
+function mediaParts(msg) {
+  const out = []
+  for (const p of messageParts(msg)) {
+    const d = p?.data || {}
+    if (p?.type === "image" || p?.type === "mface") {
+      out.push({ type: "image", url: /^https?:\/\//i.test(d.url || "") ? d.url : "", file: d.file || "", fileId: d.file_id || d.fileId || "", fileHash: d.file_hash || "", fileSize: Number(d.file_size) || 0, name: d.file_name || d.file || d.summary || "image.jpg" })
+    } else if (p?.type === "file") {
+      out.push({ type: "file", url: /^https?:\/\//i.test(d.url || "") ? d.url : "", file: d.file || "", fileId: d.file_id || d.fileId || "", fileHash: d.file_hash || "", fileSize: Number(d.file_size) || 0, name: d.file_name || d.name || d.file || "file" })
+    }
+  }
+  return out.slice(0, 10)
+}
+function imagePayload(path) {
+  return { type: "image", data: readFileSync(path).toString("base64"), mimeType: mimeOf(path) }
+}
+async function resolveMedia(m) {
+  const url = String(m.url || "")
+  if (url.startsWith("base64://")) return { ...m, base64: url.slice(9) }
+  if (/^data:[^;]+;base64,/i.test(url)) return { ...m, base64: url.split(",")[1] }
+  if (/^https?:\/\//i.test(url)) return m
+  if (m.type === "image") {
+    try {
+      const res = await call("get_image", m.fileId && !m.file ? { file_id: m.fileId } : { file: m.file || m.fileId || "" })
+      const d = res?.data || {}
+      const u = String(d.url || "")
+      if (/^https?:\/\//i.test(u)) return { ...m, url: u, name: d.file_name || m.name }
+      if (u.startsWith("base64://")) return { ...m, base64: u.slice(9) }
+      if (/^data:/i.test(u)) return { ...m, base64: u.split(",")[1] }
+      const raw = String(d.base64 || d.file || "")
+      if (/^https?:\/\//i.test(raw)) return { ...m, url: raw, name: d.file_name || m.name }
+      if (raw.startsWith("base64://")) return { ...m, base64: raw.slice(9) }
+      if (/^data:/i.test(raw)) return { ...m, base64: raw.split(",")[1] }
+      if (raw && existsSync(raw)) return { ...m, localPath: raw, name: d.file_name || m.name }
+    } catch (e) { log("get_image failed", String(e)) }
+    return undefined
+  }
+  try {
+    const res = await call("get_private_file_url", { user_id: ownerQQ, file_id: m.fileId || m.file || "", file_hash: m.fileHash || "" })
+    const d = res?.data || {}
+    if (/^https?:\/\//i.test(d.url || "")) return { ...m, url: d.url, name: d.file_name || m.name }
+    if (d.base64) return { ...m, base64: d.base64 }
+  } catch (e) { log("get_private_file_url failed", String(e)) }
+  return undefined
+}
+async function downloadMedia(m, maxBytes) {
+  let buf
+  if (m.base64) buf = Buffer.from(String(m.base64), "base64")
+  else if (m.localPath && existsSync(m.localPath)) buf = readFileSync(m.localPath)
+  else if (/^https?:\/\//i.test(m.url || "")) {
+    const res = await fetch(m.url, { signal: AbortSignal.timeout(15000) })
+    if (!res.ok) return undefined
+    const len = Number(res.headers.get("content-length") || 0)
+    if (len > maxBytes) return undefined
+    buf = Buffer.from(await res.arrayBuffer())
+  } else return undefined
+  if (buf.length > maxBytes) return undefined
+  mkdirSync(TMP_DIR, { recursive: true, mode: 0o700 })
+  const ext = m.type === "image"
+    ? ((String(m.name || m.url || "").match(/\.(png|jpe?g|gif|webp)/i) || [".jpg"])[0])
+    : ((String(m.name || "").match(/\.[A-Za-z0-9]{1,8}$/) || [".bin"])[0])
+  const path = join(TMP_DIR, `qq-${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`)
+  writeFileSync(path, buf, { mode: 0o600 })
+  return { path, name: m.name || basename(path) }
+}
+async function fetchAttachment(m, maxBytes) {
+  let got = await downloadMedia(m, maxBytes)
+  if (got) return got
+  const refreshed = await resolveMedia({ ...m, url: "", base64: undefined, localPath: undefined })
+  if (!refreshed) return undefined
+  return downloadMedia(refreshed, maxBytes)
 }
 
 // ———————————————— pi RPC ————————————————
@@ -378,17 +465,39 @@ async function handlePrivateNow(msg) {
   if (Number(msg.user_id) !== ownerQQ) return
   userReturned()
   const text = textOf(msg)
-  if (!text) return
+  const media = mediaParts(msg)
+  if (!text && !media.length) return
   if (text.trim() === "/new") {
     await pi.newSession()
     await call("send_private_msg", { user_id: ownerQQ, message: "新对话已开。" }).catch(() => {})
     return
   }
-  const annotated = `[私聊｜${nameOf(msg)}（QQ ${msg.user_id}）] ${text}\n（这是 QQ 私聊：按 system 里的规则回复；直接写正文，不要调用 reach_out。）`
-  log("private in", text.slice(0, 60))
+  const attachments = []
+  let budget = MAX_TOTAL_BYTES
+  for (const item of media) {
+    const max = Math.min(item.type === "image" ? MAX_IMAGE_BYTES : MAX_FILE_BYTES, budget)
+    if (max <= 0) break
+    const got = await fetchAttachment(item, max)
+    if (!got) continue
+    let size = 0
+    try { size = statSync(got.path).size } catch { /* ignore */ }
+    if (size > budget) { try { unlinkSync(got.path) } catch { /* ignore */ } continue }
+    budget -= size
+    attachments.push({ ...got, type: item.type })
+  }
+  if (!text && !attachments.length) {
+    await call("send_private_msg", { user_id: ownerQQ, message: "（附件没下载下来，再发一次试试？）" }).catch(() => {})
+    return
+  }
+  const images = attachments.filter((a) => a.type === "image").map((a) => imagePayload(a.path))
+  const notes = attachments.length
+    ? `\n（对方发来 ${attachments.length} 个附件：${attachments.map((a) => a.type === "image" ? `[图片 ${basename(a.path)}]` : `[文件 ${basename(a.path)}：${a.path}]`).join("、")}；图片已附在请求里，文件路径可直接用 read 工具读。）`
+    : (media.length ? `\n（对方发了 ${media.length} 个附件，但都没下载下来。）` : "")
+  const annotated = `[私聊｜${nameOf(msg)}（QQ ${msg.user_id}）] ${text || "（只有附件，没有文字）"}${notes}\n（这是 QQ 私聊：按 system 里的规则回复；直接写正文，不要调用 reach_out。）`
+  log("private in", text.slice(0, 60), "attachments", attachments.length)
   startTyping()
   try {
-    const texts = await pi.prompt(annotated)
+    const texts = await pi.prompt(annotated, images)
     stopTyping()
     const reply = texts.join("\n").trim()
     if (reply && !/^\[SILENT\]$/i.test(reply)) await sendPrivate(reply)
@@ -425,9 +534,18 @@ function getGroupSession(groupId) {
   }
   return s
 }
-function groupTrigger(text) {
+function isAtBot(msg) {
+  return messageParts(msg).some((p) => p?.type === "at" && String(p?.data?.qq) === String(msg.self_id))
+}
+function groupTrigger(msg, text) {
   const kws = Array.isArray(groupCfg.keywords) ? groupCfg.keywords : []
-  return kws.some((k) => String(k).trim() && text.includes(String(k).trim())) || /@/.test(text) || text.includes("小铃") || text.includes("铃")
+  return isAtBot(msg) || kws.some((k) => String(k).trim() && text.includes(String(k).trim())) || /小铃|铃儿|@铃/.test(text)
+}
+const groupStates = new Map()
+function groupState(key) {
+  let st = groupStates.get(key)
+  if (!st) { st = { lastReplyAt: 0, replies: [] }; groupStates.set(key, st) }
+  return st
 }
 async function handleGroup(msg) {
   if (!groupCfg.enabled) return
@@ -435,28 +553,53 @@ async function handleGroup(msg) {
   const groupId = Number(msg.group_id)
   if (!groupId) return
   const text = textOf(msg)
-  if (!text) return
+  const media = mediaParts(msg).filter((m) => m.type === "image")
+  if (!text && !media.length) return
   const key = String(groupId)
   const buf = groupBuffers.get(key) || []
-  buf.push({ sender: nameOf(msg), text, trigger: groupTrigger(text), at: Date.now() })
+  buf.push({ sender: nameOf(msg), text: text || "[图片]", media, trigger: groupTrigger(msg, text), at: Date.now() })
   groupBuffers.set(key, buf)
   if (buf.timer) clearTimeout(buf.timer)
   buf.timer = setTimeout(async () => {
     const batch = (groupBuffers.get(key) || []).splice(0)
     if (!batch.length) return
+    const st = groupState(key)
+    const now = Date.now()
     const triggered = batch.some((m) => m.trigger)
-    if (!triggered && Math.random() >= 0.05) return
+    const cooldown = Number(groupCfg.cooldownMs ?? 8000)
+    if (!triggered && cooldown > 0 && now - st.lastReplyAt < cooldown) { log("group cooldown"); return }
+    const cap = Number(groupCfg.maxPer10Min ?? 0)
+    st.replies = st.replies.filter((t) => now - t < 600000)
+    if (!triggered && cap > 0 && st.replies.length >= cap) { log("group rate limit"); return }
+    if (!triggered && Math.random() >= (groupCfg.interjectChance ?? 0.05)) { log("group skip probability"); return }
     const judge = await judgeGroup(key, batch)
-    if (judge !== "REPLY") return
+    if (judge !== "REPLY") { log("judge SKIP"); return }
+    const images = []
+    let budget = MAX_TOTAL_BYTES
+    for (const m of batch) {
+      for (const item of m.media || []) {
+        const got = await fetchAttachment(item, Math.min(MAX_IMAGE_BYTES, budget))
+        if (!got) continue
+        let size = 0
+        try { size = statSync(got.path).size } catch { /* ignore */ }
+        if (size > budget) { try { unlinkSync(got.path) } catch { /* ignore */ } continue }
+        budget -= size
+        images.push(imagePayload(got.path))
+      }
+    }
     const session = getGroupSession(key)
     const prompt = `[群聊｜群号 ${key}]\n最近消息：\n${batch.map((m) => `${m.sender}：${m.text}`).join("\n")}\n（这是 QQ 群聊：按 system 里的群聊规则回复；不适合接就只回 [SILENT]。）`
     try {
-      const texts = await session.prompt(prompt)
+      const texts = await session.prompt(prompt, images)
       const reply = texts.join("\n").trim()
-      if (reply && !/^\[SILENT\]$/i.test(reply)) await sendGroup(key, reply)
+      if (reply && !/^\[SILENT\]$/i.test(reply)) {
+        const ok = await sendGroup(key, reply)
+        if (ok) { st.lastReplyAt = Date.now(); st.replies.push(Date.now()) }
+      }
     } catch (e) { log("group prompt failed", String(e)) }
   }, 3000)
 }
+
 function judgeGroup(groupId, batch) {
   return new Promise((resolve) => {
     const prompt = ["你是群聊读空气判断器。只输出 REPLY 或 SKIP。", `群号：${groupId}`, "最近消息：", ...batch.map((m) => `${m.sender}：${m.trigger ? "【@/点名】" : ""}${m.text}`), "规则：@/点名/关键词倾向 REPLY；闲聊/广告/敏感 SKIP。"].join("\n")
@@ -501,8 +644,17 @@ async function sendOutboxMedia(item) {
     log("sent media", kind, item.name || basename(real), caption.slice(0, 30))
     return { ok: true }
   } catch (e) {
-    log("send media failed", String(e))
-    return { ok: false, retryable: /ws not ready/i.test(String(e)) }
+    const msg = String(e)
+    // 语音段被实现拒绝：私聊退成文件（群聊不退）
+    if (kind === "voice" && !isGroup && !/ws not ready|timeout|fetch failed|ECONN|socket/i.test(msg)) {
+      try {
+        await send([{ type: "file", data: { file: `base64://${b64}`, name: item.name || basename(real) } }])
+        log("voice fallback to file", item.name || basename(real))
+        return { ok: true }
+      } catch (e2) { log("voice fallback failed", String(e2)) }
+    }
+    log("send media failed", msg)
+    return { ok: false, retryable: /ws not ready/i.test(msg) }
   }
 }
 async function pollOutboxNow() {

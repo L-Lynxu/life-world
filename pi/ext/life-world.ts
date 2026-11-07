@@ -754,6 +754,30 @@ export default function (pi: ExtensionAPI) {
     },
   })
 
+
+  pi.registerTool({
+    name: "gal_choice",
+    label: "Gal choice panel",
+    description: "终端 gal 模式用：抛一个单选面板让用户选。QQ/群聊没有面板，别用；那边把选项写成正文。",
+    parameters: {
+      type: "object",
+      properties: {
+        question: { type: "string", description: "镜头停在哪、现在要对方做什么，只写一句" },
+        options: { type: "array", items: { type: "string" }, description: "2~3 个选项，单选" },
+      },
+      required: ["question", "options"],
+    },
+    async execute(_id: string, params: any, _signal: any, _update: any, ctx: any) {
+      if (CHANNEL !== "cli" || JUDGE) return ok("这个会话没有选项面板；把选项写成正文，让用户按数字回复。")
+      const ui = ctx?.ui
+      if (!ui?.select) return ok("当前会话没有选项面板；把选项写成正文。")
+      const options = Array.isArray(params.options) ? params.options.map((x: any) => String(x)).slice(0, 3) : []
+      if (!options.length) return ok("没有选项。")
+      const choice = await ui.select(String(params.question || "选一个"), options)
+      return ok(`用户选择：${choice ?? "（取消）"}`)
+    },
+  })
+
   // 定时器只在 home 角色跑；QQ/群聊/子代理进程不跑，避免重复
   if (ROLE === "home") {
     if (acquireTimerLock()) {
